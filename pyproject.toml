@@ -1,0 +1,44 @@
+[project]
+name = "neem"
+version = "0.1.0"
+description = "CLI to authenticate Mnemosyne MCP integrations via browser-based OAuth"
+readme = "README.md"
+authors = [
+    { name = "Vera Chambers", email = "vera@sophia-labs.com" }
+]
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+keywords = ["mnemosyne", "mcp", "oauth", "claude", "authentication"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: Other/Proprietary License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "typer>=0.9",
+    "rich>=13",
+    "httpx>=0.26",
+    "structlog>=23",
+    "pyjwt>=2.8",
+    "mcp>=0.9",
+    "aiohttp>=3.9",
+    "tomlkit>=0.12",
+    "ruamel.yaml>=0.18",
+]
+
+[project.urls]
+Homepage = "https://sophia-labs.com"
+
+[project.scripts]
+neem = "neem.cli:main"
+neem-mcp-server = "neem.mcp.server.standalone_server_stdio:run_stdio_mcp_server"
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
