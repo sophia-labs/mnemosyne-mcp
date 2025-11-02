@@ -36,16 +36,13 @@ neem logout             # Remove saved token (optional: keep config)
 neem config             # Inspect config details (with optional --show-token)
 ```
 
-## Quick Start (Claude Code)
+## Quick Start
 
 ### Step 1: Install and authenticate
 
 ```bash
 # Install the package
-pip install neem
-
-# Or for development
-uv sync
+uv pip install -e .
 
 # Authenticate with Mnemosyne
 neem init                     # Opens your browser to log in
@@ -53,45 +50,26 @@ neem init                     # Opens your browser to log in
 
 > `neem init` handles authentication only—the next steps show how to connect each MCP client manually.
 
-### Step 2: Add MCP server to Claude Code
+### Step 2: Add MCP server to your agent
 
-Using the Claude CLI (recommended):
+#### Using Claude Code:
 
 ```bash
-claude mcp add mnemosyne-graph neem-mcp-server \
-  --scope user \
+claude mcp add mnemosyne --scope user \
+  --env MNEMOSYNE_API_URL=https://api.sophia-labs.com \
+  --env LOG_LEVEL=ERROR \
+  -- uv run neem-mcp-server
+```
+
+#### Using Codex
+```bash
+codex mcp add mnemosyne -- uv run neem-mcp-server \
   --env MNEMOSYNE_API_URL=https://api.sophia-labs.com \
   --env LOG_LEVEL=ERROR
-```
-
-Or manually add to `~/.claude/settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "mnemosyne-graph": {
-      "type": "stdio",
-      "command": "neem-mcp-server",
-      "env": {
-        "MNEMOSYNE_API_URL": "https://api.sophia-labs.com",
-        "LOG_LEVEL": "ERROR"
-      }
-    }
-  }
-}
-```
-
-### Step 3: Restart Claude Code
-
-After configuration, restart Claude Code completely. You can verify the MCP server is loaded with:
-
-```
-/mcp
-```
-
+````
 ### Usage Examples
 
-Once configured, you can ask Claude Code to:
+Once configured, you can ask your agent to:
 
 - **List graphs**: "Show me all my knowledge graphs"
 - **Query data**: "Run a SPARQL query to find all entities of type Person in my personal-knowledge graph"
@@ -141,9 +119,6 @@ All tools support:
 
 - Tokens are stored at `~/.mnemosyne/config.json` (override with
   `MNEMOSYNE_CONFIG_DIR`).
-- Claude Code settings are written to `~/.claude/settings.json` (override with
-  `CLAUDE_CODE_SETTINGS_PATH`).
-- Override the API endpoint with `--api-url` or `MNEMOSYNE_API_URL`.
 
 ## Architecture
 

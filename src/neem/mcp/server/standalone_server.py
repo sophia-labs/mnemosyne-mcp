@@ -1050,6 +1050,26 @@ def create_standalone_mcp_server() -> FastMCP:
                 )
                 return error_response.to_json()
 
+    @mcp_server.resource(
+        "resource://mnemosyne/overview",
+        name="Mnemosyne MCP Overview",
+        title="Mnemosyne MCP Quickstart",
+        description="Entry point that explains how to work with the Mnemosyne knowledge graph tools.",
+        mime_type="application/json"
+    )
+    def mnemosyne_overview_resource() -> dict:
+        """Expose a small discoverable note for MCP clients."""
+        return {
+            "summary": "This MCP server connects Claude or compatible clients to Mnemosyne knowledge graphs.",
+            "quickstart": [
+                "Run the list_graphs tool to see accessible graphs and pick an ID.",
+                "Call get_graph_schema <graph_id> to inspect classes and predicates.",
+                "Use sparql_query <graph_id> <SPARQL> for data exploration; start with the sample queries from list_graphs."
+            ],
+            "authentication": "Authenticate via `neem mcp init` or set MCP_DEFAULT_TOKEN before starting the server.",
+            "support": "Provide LOG_LEVEL=DEBUG to see detailed traces if requests fail."
+        }
+
     # Store components for cleanup
     mcp_server._api_client = api_client
     mcp_server._session_manager = session_manager
