@@ -1,10 +1,13 @@
-
 # Mnemosyne MCP
 ## THIS IS A WORK IN PROGRESS AND THE DOCUMENTATION IS AI-GENERATED AND WILL BE REWRITTEN BY HUMAN BEFORE PEOPLE ARE WIDELY ENCOURAGED TO READ IT AND USE THIS CODE. THANK YOU FOR YOUR ATTENTION TO THIS MATTER XOXO VERA
 
 **AI-powered knowledge graph integration for Claude Code, Goose & Codex**
 
 The Mnemosyne MCP (`neem`) provides seamless integration between AI coding agents (Claude Code, Goose CLI, OpenAI Codex CLI) and your Mnemosyne knowledge graphs through the Model Context Protocol (MCP). It handles OAuth authentication, provides a standard MCP stdio server, and enables AI agents to query, create, and manage your knowledge graphs directly.
+
+<a href="https://glama.ai/mcp/servers/@sophia-labs/mnemosyne-mcp">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/@sophia-labs/mnemosyne-mcp/badge" alt="Mnemosyne MCP server" />
+</a>
 
 **Features:**
 - 🔐 Browser-based OAuth authentication
