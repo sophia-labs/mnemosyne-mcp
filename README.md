@@ -42,7 +42,7 @@ neem config             # Inspect config details (with optional --show-token)
 
 ```bash
 # Install the package
-uv pip install -e .
+uv tool install -e .
 
 # Authenticate with Mnemosyne
 neem init                     # Opens your browser to log in
