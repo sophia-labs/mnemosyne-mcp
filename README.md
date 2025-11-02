@@ -17,7 +17,7 @@ The Mnemosyne MCP (`neem`) provides seamless integration between AI coding agent
 ## Installation
 
 ```bash
-pip install neem
+uv pip install -e . 
 ```
 
 While developing locally with [`uv`](https://docs.astral.sh/uv/):
