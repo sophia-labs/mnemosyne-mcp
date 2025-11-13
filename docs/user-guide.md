@@ -2,6 +2,8 @@
 
 Quick guide to setting up OAuth authentication for Mnemosyne’s Claude Code integration.
 
+> **Status:** The first FastAPI-backed tool (`list_graphs`) is available and streams job updates over WebSockets. Authentication still works the same, and more tools are coming soon.
+
 ---
 
 ## First-Time Setup
@@ -29,12 +31,12 @@ This will:
 
 ### Step 2: Add the MCP server to Claude Code
 
-Use the Claude CLI (preferred) or edit the settings file yourself:
+Use the Claude CLI (preferred) or edit the settings file yourself. Before running the command, make sure the FastAPI backend is reachable (for example: `kubectl port-forward svc/mnemosyne-fastapi 8001:8000`).
 
 ```bash
 claude mcp add mnemosyne-graph neem-mcp-server \
   --scope user \
-  --env MNEMOSYNE_API_URL=https://api.sophia-labs.com \
+  --env MNEMOSYNE_FASTAPI_URL=http://127.0.0.1:8001 \
   --env LOG_LEVEL=ERROR
 ```
 
@@ -47,7 +49,7 @@ Manual alternative (`~/.claude/settings.json`):
       "type": "stdio",
       "command": "neem-mcp-server",
       "env": {
-        "MNEMOSYNE_API_URL": "https://api.sophia-labs.com",
+        "MNEMOSYNE_FASTAPI_URL": "http://127.0.0.1:8001",
         "LOG_LEVEL": "ERROR"
       }
     }
@@ -61,22 +63,19 @@ After adding the MCP server, restart Claude Code so it picks up the new configur
 
 ### Step 4: Test It Works
 
-In Claude Code, ask Claude to use any Mnemosyne tool:
-
-```
-Hey Claude, can you list my knowledge graphs?
-```
-
-Claude will use the `mcp__mnemosyne-graph__list_graphs` tool and show you your graphs.
+1. Start `neem-mcp-server`.
+2. Ask Claude/Codex: “List my knowledge graphs.”
+3. The `list_graphs` tool will submit a job, stream realtime updates from `/ws`, and return the graph metadata once the backend finishes.
 
 ---
 
 ## Daily Use
 
-Once set up, authentication is **completely automatic**. Just use Claude Code normally:
+Authentication continues to be **completely automatic**. Today you can:
 
-**Examples:**
+- “List my knowledge graphs” → calls the `list_graphs` tool.
 
+Coming soon (once new tools land):
 - “Create a new knowledge graph called 'my-research' for storing research papers”
 - “Show me what’s in my user-profiles graph”
 - “Run this SPARQL query on my research-papers graph: SELECT * WHERE { ?s ?p ?o } LIMIT 10”
@@ -127,39 +126,21 @@ This deletes your token from `~/.mnemosyne/config.json`.
 
 ## Available MCP Tools
 
-Once authenticated, Claude has access to these Mnemosyne tools:
-
-### Graph Management
-- **list_graphs** – See all your knowledge graphs
-- **create_graph** – Create a new graph
-- **get_graph_info** – Get details about a specific graph
-- **get_graph_schema** – View the structure/ontology of a graph
-- **delete_graph** – Remove a graph (requires confirmation)
-
-### Querying
-- **sparql_query** – Run SPARQL queries on your graphs
-- **get_system_health** – Check if the Mnemosyne API is working
-
-### Sessions
-- **create_session** – Create a new MCP session (usually automatic)
-
-You don’t need to know the exact tool names — just ask Claude in natural language!
+- `list_graphs` – Submits a `list_graphs` job to the FastAPI backend, streams realtime updates over `/ws`, and falls back to polling if the backend doesn’t advertise push hints. More tools will be added shortly.
 
 ---
 
 ## Troubleshooting
 
-### “Cannot connect to host localhost:8000”
+### “Cannot connect to host 127.0.0.1:8001” (or similar)
 
-**Problem:** MCP server trying to connect to the wrong API
+**Problem:** The FastAPI backend is not reachable from your workstation.
 
 **Solution:**
-1. Check that you’re on the latest `neem` package version.
-2. Restart Claude Code.
-3. If it keeps failing, override the API URL:
-   ```bash
-   neem init --api-url https://api.sophia-labs.com
-   ```
+1. Ensure `kubectl config current-context` points to the cluster that runs the FastAPI pod.
+2. Port-forward the FastAPI service (example: `kubectl port-forward svc/mnemosyne-fastapi 8001:8000`).
+3. Export `MNEMOSYNE_FASTAPI_URL=http://127.0.0.1:8001` (or use the host/port env vars) before launching `neem-mcp-server`.
+4. If you are running inside the cluster, set `MNEMOSYNE_FASTAPI_HOST` / `PORT` to the service DNS name and port instead.
 
 ### “Authentication failed” or 401/403 errors
 
@@ -171,17 +152,13 @@ neem init --force
 # Then restart Claude Code
 ```
 
-### “Graph not found”
+### “Where did the tools go?”
 
-**Problem:** Trying to access a graph that doesn’t exist
+**Problem:** Claude reports that no Mnemosyne tools exist.
 
-**Solution:**
-```bash
-neem status  # Shows all configured graphs via Claude’s tooling
-# Or ask Claude: "What graphs do I have?"
-```
+**Solution:** Ensure you restarted Claude/Codex after adding the MCP server. If it still can’t see the tools, check the MCP server logs for initialization errors.
 
-### MCP tools not showing up in Claude Code
+### MCP server never appears in Claude Code
 
 **Problem:** Claude Code not configured or not restarted
 
@@ -194,15 +171,16 @@ neem status  # Shows all configured graphs via Claude’s tooling
 
 ## Advanced Usage
 
-### Custom API URL (Developers Only)
+### Custom FastAPI URL (Developers Only)
 
-If you’re developing locally or using a different API server:
+If you’re developing against a different FastAPI instance, set the environment variables before launching the MCP server:
 
 ```bash
-neem init --api-url http://localhost:8000
+export MNEMOSYNE_FASTAPI_URL=http://localhost:9000
+uv run neem-mcp-server
 ```
 
-**Note:** Due to a Claude Code limitation, localhost URLs may be overridden to production. For local development, you might need to patch the code or use a tunnel.
+You can also supply `MNEMOSYNE_FASTAPI_HOST`, `MNEMOSYNE_FASTAPI_PORT`, and `MNEMOSYNE_FASTAPI_SCHEME` separately if that fits better with your kubectl workflow.
 
 ### Viewing Your Configuration
 
@@ -221,3 +199,14 @@ Your authentication token is stored at:
 ```
 
 **Permissions:** `0600` (only you can read/write)
+## Dev Mode (skip OAuth)
+
+When the backend runs with `MNEMOSYNE_AUTH__MODE=dev_no_auth`, you can bypass the browser flow by exporting a user id/token before starting the MCP server:
+
+```bash
+export MNEMOSYNE_DEV_USER_ID=alice
+export MNEMOSYNE_DEV_TOKEN=alice
+uv run neem-mcp-server
+```
+
+The server automatically attaches `X-User-ID: alice` and `Sec-WebSocket-Protocol: Bearer.alice` to every HTTP + WebSocket request so the backend accepts them. Remove these env vars when targeting real environments.

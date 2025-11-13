@@ -4,15 +4,15 @@
 
 **AI-powered knowledge graph integration for Claude Code, Goose & Codex**
 
-The Mnemosyne MCP (`neem`) provides seamless integration between AI coding agents (Claude Code, Goose CLI, OpenAI Codex CLI) and your Mnemosyne knowledge graphs through the Model Context Protocol (MCP). It handles OAuth authentication, provides a standard MCP stdio server, and enables AI agents to query, create, and manage your knowledge graphs directly.
+The Mnemosyne MCP (`neem`) historically exposed a full suite of graph management tools. We are currently rebuilding those tools from scratch against a new FastAPI backend that runs inside our local kubectl context.
 
-**Features:**
-- 🔐 Browser-based OAuth authentication
-- 🤖 9 MCP tools for graph operations (query, create, upload, etc.)
-- 📁 RDF file upload support (Turtle, RDF/XML, N-Triples, JSON-LD)
-- 🔍 SPARQL query execution
-- 📊 Graph schema analysis
-- ✨ Optimized responses for LLM consumption 
+> **Status:** The stdio server now focuses solely on wiring Codex/Claude to the local FastAPI backend. All MCP tools have been removed intentionally while we redesign the interface.
+
+**Current focus:**
+- 🔌 Reliable connectivity to a local FastAPI backend (via env vars or kubectl port-forward)
+- 🩺 Automatic startup health probe so you know whether the backend is reachable
+- 🔐 Browser-based OAuth authentication (`neem init`) remains unchanged
+- 🧱 Clean slate for the upcoming tool rearchitecture
 
 ## Installation
 
@@ -50,13 +50,21 @@ neem init                     # Opens your browser to log in
 
 > `neem init` handles authentication only—the next steps show how to connect each MCP client manually.
 
+Before registering the MCP server, expose the FastAPI backend from your kubectl context (adjust service/namespace/ports as needed):
+
+```bash
+kubectl port-forward svc/mnemosyne-fastapi 8001:8000
+```
+
 ### Step 2: Add MCP server to your agent
+
+Skaffold’s default profile port-forwards `mnemosyne-api` on `8080` for HTTP and `mnemosyne-ws` on `8001` for WebSockets. Point `MNEMOSYNE_FASTAPI_URL` at the HTTP port and the MCP server will automatically assume the split WebSocket port on localhost (you can override it with `MNEMOSYNE_FASTAPI_WS_PORT` or `MNEMOSYNE_FASTAPI_WS_URL` if your layout differs).
 
 #### Using Claude Code:
 
 ```bash
 claude mcp add mnemosyne --scope user \
-  --env MNEMOSYNE_API_URL=https://api.sophia-labs.com \
+  --env MNEMOSYNE_FASTAPI_URL=http://127.0.0.1:8001 \
   --env LOG_LEVEL=ERROR \
   -- uv run neem-mcp-server
 ```
@@ -64,18 +72,40 @@ claude mcp add mnemosyne --scope user \
 #### Using Codex
 ```bash
 codex mcp add mnemosyne -- uv run neem-mcp-server \
-  --env MNEMOSYNE_API_URL=https://api.sophia-labs.com \
+  --env MNEMOSYNE_FASTAPI_URL=http://127.0.0.1:8001 \
   --env LOG_LEVEL=ERROR
+
+> Dev-mode shortcut: append `--env MNEMOSYNE_DEV_TOKEN=<user>` and `--env MNEMOSYNE_DEV_USER_ID=<user>` to the commands above when the backend runs with `MNEMOSYNE_AUTH__MODE=dev_no_auth`. Both transports will impersonate that user without going through OAuth.
 ````
+
+### Dev Mode (skip OAuth)
+
+If the backend runs with `MNEMOSYNE_AUTH__MODE=dev_no_auth`, set both env vars before launching the MCP server to bypass the OAuth flow entirely:
+
+```bash
+export MNEMOSYNE_DEV_USER_ID=alice
+export MNEMOSYNE_DEV_TOKEN=alice  # many clusters treat the token string as the user id
+uv run neem-mcp-server
+```
+
+Both HTTP requests and the WebSocket handshake will send `X-User-ID: alice` plus `Sec-WebSocket-Protocol: Bearer.alice`, satisfying the backend’s dev-mode guards. Unset these envs when targeting production.
+
 ### Usage Examples
 
-Once configured, you can ask your agent to:
+After registering the server, ask your MCP client to run `list_graphs`. It submits a job, streams realtime events over `/ws`, and falls back to HTTP polling when the backend does not advertise push hints.
 
-- **List graphs**: "Show me all my knowledge graphs"
-- **Query data**: "Run a SPARQL query to find all entities of type Person in my personal-knowledge graph"
-- **Upload files**: "Upload the ontology.ttl file to my research-data graph"
-- **Create graphs**: "Create a new graph called project-notes with description 'Notes from my projects'"
-- **Get schema info**: "What types and properties exist in my personal-knowledge graph?"
+## FastAPI Backend Configuration
+
+The MCP server now assumes it should talk to the FastAPI backend that runs in your local kubectl context.
+
+1. Point `kubectl` at the desired cluster (`kubectl config use-context ...`).
+2. Port-forward the FastAPI service so it is reachable on your workstation (example: `kubectl port-forward svc/mnemosyne-fastapi 8001:8000`).
+3. Start `neem-mcp-server` with one of the supported backend configuration options:
+   - `MNEMOSYNE_FASTAPI_URL` (preferred) or the legacy `MNEMOSYNE_API_URL`.
+   - `MNEMOSYNE_FASTAPI_HOST`, `MNEMOSYNE_FASTAPI_PORT`, and optional `MNEMOSYNE_FASTAPI_SCHEME` if you want to supply host/port separately (handy for kubectl port-forward scripts).
+   - `MNEMOSYNE_FASTAPI_HEALTH_PATH` if the FastAPI app exposes a non-standard health endpoint (defaults to `/health`).
+
+If none of these environment variables are set the server defaults to `http://127.0.0.1:8001`, which lines up with the sample port-forward above. On startup we issue a lightweight health probe so you immediately know whether the backend is reachable.
 
 ### Token Management
 
@@ -83,37 +113,13 @@ Tokens expire after a day. Re-run `neem init --force` whenever you need a fresh 
 
 **Important**: Set `LOG_LEVEL=ERROR` for Codex CLI to avoid any stderr interference with the stdio protocol.
 
-## Available MCP Tools
+## Tooling Status
 
-The `neem-mcp-server` provides the following tools for any MCP client (Claude Code, Goose, etc.):
+The first push-enabled tool is available:
 
-### Session Management
-- **`create_session`** - Initialize a new MCP session with the authenticated user
+- `list_graphs` – submits a `list_graphs` job, streams realtime updates via the backend’s `/ws` gateway when available, and falls back to HTTP polling otherwise. Ask Claude/Codex to “run list_graphs” after registering the MCP server to see a proof-of-concept end-to-end.
 
-### Graph Operations
-- **`list_graphs`** - List all accessible knowledge graphs with optional stats and metadata
-- **`get_graph_schema`** - Analyze graph schema (classes, properties, relationships)
-- **`get_graph_info`** - Get comprehensive graph information and statistics
-- **`create_graph`** - Create a new knowledge graph
-- **`delete_graph`** - Delete an existing graph (requires confirmation)
-
-### Data Operations
-- **`sparql_query`** - Execute SPARQL queries against graphs
-  - Parameters: `graph_id`, `query`, `result_format` (json/csv/xml), `timeout_seconds`
-- **`upload_file_to_graph`** - Upload RDF files (Turtle, RDF/XML, N-Triples, JSON-LD) to graphs
-  - Parameters: `graph_id`, `file_path`, `rdf_format` (optional), `validation_level` (strict/lenient/none), `namespace` (optional), `replace_existing` (bool)
-  - Supports format auto-detection
-  - Configurable validation levels
-  - Progress tracking with job IDs
-
-### System Operations
-- **`get_system_health`** - Check system health and component status
-
-All tools support:
-- ✅ Automatic authentication via saved tokens
-- ✅ Session caching for performance
-- ✅ Detailed error messages with helpful suggestions
-- ✅ Structured JSON responses optimized for LLM consumption
+More graph/query tools will land once the FastAPI contract solidifies.
 
 ## Configuration
 
@@ -132,16 +138,16 @@ Located in `neem.cli`:
 
 ### 2. MCP Server (`neem-mcp-server`)
 Located in `neem.mcp.server`:
-- **Stdio transport** - Communicates with Claude Code via stdin/stdout
-- **HTTP API client** - Calls the Mnemosyne Graph API for all operations
-- **Session management** - Redis-backed session caching (optional)
-- **Structured logging** - All logs go to stderr (stdio-safe)
+- **Stdio transport** – Communicates with Claude Code via stdin/stdout
+- **Backend resolver** – Determines the FastAPI base URL from env vars or kubectl service hosts
+- **Health probe** – Pings the FastAPI backend on startup so you know whether the port-forward/context is correct
+- **Realtime job wiring** – `neem.mcp.jobs` ships a websocket-friendly client that tools can use to subscribe to job progress once the backend emits hints
+- **Structured logging** – All logs go to stderr (stdio-safe) with optional file output
 
-Key design principles:
-- **Stateless MCP server** - All state lives in the API, MCP server is just a client
-- **Token-based auth** - Tokens obtained via `neem init` are used for API authentication
-- **Clean separation** - MCP protocol handling separate from business logic
-- **Error handling** - Helpful error messages with suggestions for LLM consumption
+Key design principles for this reset:
+- **Local-first loops** – Assume developers are targeting a FastAPI pod through kubectl
+- **Minimal surface area** – Keep the server slim until the new tool contract is finalized
+- **Explicit configuration** – Prefer environment variables over hidden defaults so CLI harnesses can inject settings
 
 ## Development
 
@@ -166,7 +172,7 @@ src/neem/
 ├── cli.py                          # CLI commands
 ├── mcp/
 │   ├── server/
-│   │   ├── standalone_server.py    # Main MCP server with API client
+│   │   ├── standalone_server.py    # FastAPI backend resolver + health probe (no tools yet)
 │   │   └── standalone_server_stdio.py  # Stdio transport wrapper
 │   ├── session.py                  # Session management
 │   ├── errors.py                   # MCP-specific errors
@@ -182,15 +188,22 @@ src/neem/
 
 ### Environment Variables
 
-- `MNEMOSYNE_API_URL` - API endpoint (default: `https://api.sophia-labs.com`)
-- `MNEMOSYNE_CONFIG_DIR` - Token storage location (default: `~/.mnemosyne`)
-- `CLAUDE_CODE_SETTINGS_PATH` - Claude settings file (default: `~/.claude/settings.json`)
-- `LOG_LEVEL` - Logging verbosity (default: `INFO`)
-  - `DEBUG` - Verbose logging for troubleshooting
-  - `INFO` - Normal operational logging (default)
-  - `WARNING` - Quiet mode, only warnings and errors
-  - `ERROR` - Silent mode, only errors (recommended for Codex CLI)
-  - `CRITICAL` - Minimal logging, critical errors only
+- `MNEMOSYNE_FASTAPI_URL` – Preferred FastAPI base URL (defaults to `http://127.0.0.1:8001`). The legacy `MNEMOSYNE_API_URL` is still honored if set.
+- `MNEMOSYNE_FASTAPI_HOST`, `MNEMOSYNE_FASTAPI_PORT`, `MNEMOSYNE_FASTAPI_SCHEME` – Specify host/port separately (handy for scripted kubectl port-forwards).
+- `MNEMOSYNE_FASTAPI_HEALTH_PATH` – Alternate health-check path if your FastAPI app doesn't expose `/health`.
+- `MNEMOSYNE_FASTAPI_WS_URL` – Override the WebSocket gateway directly (defaults to `ws(s)://<host>/ws` derived from the HTTP base).
+- `MNEMOSYNE_FASTAPI_WS_PATH` – Custom path appended to the derived WebSocket URL when `MNEMOSYNE_FASTAPI_WS_URL` is unset.
+- `MNEMOSYNE_FASTAPI_WS_PORT` – Override just the WebSocket port while keeping the same host/path (useful when HTTP and WS are forwarded on different local ports).
+- `MNEMOSYNE_FASTAPI_WS_DISABLE` – Set to `true` to opt out of WebSocket streaming (falls back to HTTP polling).
+- `MNEMOSYNE_CONFIG_DIR` – Token storage location (default: `~/.mnemosyne`)
+- `MNEMOSYNE_DEV_TOKEN` – Optional dev-only override that skips the OAuth flow by injecting the provided bearer token directly (use only on trusted local stacks).
+- `CLAUDE_CODE_SETTINGS_PATH` – Claude settings file (default: `~/.claude/settings.json`)
+- `LOG_LEVEL` – Logging verbosity (default: `INFO`)
+  - `DEBUG` – Verbose logging for troubleshooting
+  - `INFO` – Normal operational logging (default)
+  - `WARNING` – Quiet mode, only warnings and errors
+  - `ERROR` – Silent mode, only errors (recommended for Codex CLI)
+  - `CRITICAL` – Minimal logging, critical errors only
 
 Sessions are stored in-memory by default; no external cache service is required.
 
@@ -212,7 +225,7 @@ Sessions are stored in-memory by default; no external cache service is required.
 2. **Verify extension is enabled**: `enabled: true` in the config
 3. **Check timeout**: Increase to 600 seconds if server is slow to start
 4. **Test in session**: Start a new Goose session and ask it to list available tools
-5. **Check environment**: Ensure `MNEMOSYNE_API_URL` is set correctly
+5. **Check environment**: Ensure `MNEMOSYNE_FASTAPI_URL` (or legacy `MNEMOSYNE_API_URL`) is set correctly
 
 **For Codex CLI:**
 

@@ -13,6 +13,9 @@ import stat
 import structlog
 import jwt
 
+DEV_TOKEN_ENV = "MNEMOSYNE_DEV_TOKEN"
+DEV_USER_ENV = "MNEMOSYNE_DEV_USER_ID"
+
 logger = structlog.get_logger(__name__)
 
 
@@ -49,6 +52,25 @@ def get_config_path() -> Path:
         base_dir = TokenConfig.DEFAULT_CONFIG_DIR
 
     return base_dir / TokenConfig.DEFAULT_CONFIG_FILE
+
+
+def get_dev_user_id() -> Optional[str]:
+    """
+    Return the dev-mode user identifier if explicitly configured.
+
+    Preference order:
+    1. MNEMOSYNE_DEV_USER_ID
+    2. MNEMOSYNE_DEV_TOKEN (many local clusters treat the token as the user id)
+    """
+    user_id = os.getenv(DEV_USER_ENV)
+    if user_id:
+        return user_id.strip()
+
+    dev_token = os.getenv(DEV_TOKEN_ENV)
+    if dev_token:
+        return dev_token.strip()
+
+    return None
 
 
 def ensure_config_dir() -> Path:
@@ -265,6 +287,14 @@ def validate_token_and_load() -> Optional[str]:
     Returns:
         Valid token if found and not expired, None otherwise
     """
+    dev_token = os.getenv(DEV_TOKEN_ENV)
+    if dev_token:
+        logger.warning(
+            "Using development token override from environment",
+            extra_context={"env_var": DEV_TOKEN_ENV},
+        )
+        return dev_token.strip()
+
     token = load_token()
 
     if not token:

@@ -16,6 +16,7 @@ from neem.utils.token_storage import (
     delete_token,
     is_token_expired,
     get_token_info,
+    get_dev_user_id,
     validate_token_and_load,
     TokenConfig,
     TokenStorageError,
@@ -260,7 +261,33 @@ class TestValidateTokenAndLoad:
 
         # Check that user-friendly message was printed
         captured = capsys.readouterr()
-        assert "expired" in captured.out.lower()
+        combined = f"{captured.out} {captured.err}".lower()
+        assert "expired" in combined
+
+    def test_validate_token_and_load_dev_override(self, temp_config_dir, monkeypatch):
+        """Allow bypassing auth flow via MNEMOSYNE_DEV_TOKEN."""
+        monkeypatch.setenv("MNEMOSYNE_DEV_TOKEN", "dev-token")
+        token = validate_token_and_load()
+        assert token == "dev-token"
+
+
+class TestDevModeHelpers:
+    """Tests for helper functions that support dev mode."""
+
+    def test_get_dev_user_id_explicit_env(self, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_DEV_USER_ID", "carol")
+        monkeypatch.delenv("MNEMOSYNE_DEV_TOKEN", raising=False)
+        assert get_dev_user_id() == "carol"
+
+    def test_get_dev_user_id_falls_back_to_dev_token(self, monkeypatch):
+        monkeypatch.delenv("MNEMOSYNE_DEV_USER_ID", raising=False)
+        monkeypatch.setenv("MNEMOSYNE_DEV_TOKEN", "alice")
+        assert get_dev_user_id() == "alice"
+
+    def test_get_dev_user_id_none(self, monkeypatch):
+        monkeypatch.delenv("MNEMOSYNE_DEV_USER_ID", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_DEV_TOKEN", raising=False)
+        assert get_dev_user_id() is None
 
 
 class TestEdgeCases:

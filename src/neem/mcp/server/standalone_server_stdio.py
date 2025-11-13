@@ -52,17 +52,6 @@ def run_stdio_mcp_server():
         logger.error(f"Server error: {e}")
         raise
     finally:
-        # Cleanup HTTP client if possible
-        try:
-            if hasattr(mcp_server, '_api_client'):
-                import asyncio
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(mcp_server._api_client.close())
-                else:
-                    asyncio.run(mcp_server._api_client.close())
-        except:
-            pass  # Best effort cleanup
         if log_level not in ["WARNING", "ERROR", "CRITICAL"]:
             logger.info("✅ MCP server shutdown complete")
 
