@@ -2,7 +2,7 @@
 
 Get up and running with Mnemosyne’s Claude Code integration in 4 steps.
 
-> **Status:** The first FastAPI-backed tool (`list_graphs`) is live and streams results over WebSockets. More tools are on the way.
+> **Status:** 10 MCP tools are available for graph management, SPARQL queries, and real-time document editing.
 
 ---
 
@@ -52,8 +52,21 @@ neem logout
 
 ## Using in Claude Code
 
-- “List my knowledge graphs” → Claude calls the `list_graphs` tool, which submits a job to FastAPI and streams realtime updates over `/ws`.
-- More graph/query tools are coming soon.
+**Graph Management:**
+- "List my knowledge graphs" → `list_graphs`
+- "Create a new graph called 'research' with title 'Research Notes'" → `create_graph`
+- "Delete the test-graph" → `delete_graph`
+
+**SPARQL Operations:**
+- "Run this SPARQL query: SELECT * WHERE { ?s ?p ?o } LIMIT 10" → `sparql_query`
+- "Insert this triple into my graph..." → `sparql_update`
+
+**Document Operations (real-time via Y.js):**
+- "What document am I looking at in Mnemosyne?" → `get_active_context`
+- "Show me the folder structure of my-graph" → `get_workspace`
+- "Read the document at /notes/meeting.md" → `read_document`
+- "Write this content to my document" → `write_document`
+- "Add a paragraph to the end of my document" → `append_to_document`
 
 ### Dev Mode (skip OAuth)
 
@@ -72,9 +85,9 @@ The MCP server will send `X-User-ID: alice` and `Sec-WebSocket-Protocol: Bearer.
 
 **Token expired?** → `neem init --force` + restart Claude Code
 
-**Tools not working?** → The new FastAPI-backed tools haven’t shipped yet 🙂 hold tight.
+**Tools not showing?** → Make sure you reinstalled after updates: `uv cache clean && uv tool install --no-cache .`
 
-**Graph not found?** → The graph tools are under reconstruction, so Claude cannot answer yet.
+**Connection refused?** → Ensure the FastAPI backend is running and port-forwarded: `kubectl port-forward svc/mnemosyne-api 8001:80`
 
 ---
 

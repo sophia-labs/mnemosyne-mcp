@@ -6,13 +6,15 @@
 
 The Mnemosyne MCP (`neem`) historically exposed a full suite of graph management tools. We are currently rebuilding those tools from scratch against a new FastAPI backend that runs inside our local kubectl context.
 
-> **Status:** The stdio server now focuses solely on wiring Codex/Claude to the local FastAPI backend. All MCP tools have been removed intentionally while we redesign the interface.
+> **Status:** The MCP server now provides 10 tools for knowledge graph management, SPARQL queries, and real-time document editing via Hocuspocus/Y.js.
 
-**Current focus:**
+**Features:**
 - 🔌 Reliable connectivity to a local FastAPI backend (via env vars or kubectl port-forward)
 - 🩺 Automatic startup health probe so you know whether the backend is reachable
-- 🔐 Browser-based OAuth authentication (`neem init`) remains unchanged
-- 🧱 Clean slate for the upcoming tool rearchitecture
+- 🔐 Browser-based OAuth authentication (`neem init`)
+- 📊 Full graph CRUD operations (create, list, delete)
+- 🔍 SPARQL query and update support
+- 📝 Real-time document editing via Y.js CRDT
 
 ## Installation
 
@@ -113,13 +115,25 @@ Tokens expire after a day. Re-run `neem init --force` whenever you need a fresh 
 
 **Important**: Set `LOG_LEVEL=ERROR` for Codex CLI to avoid any stderr interference with the stdio protocol.
 
-## Tooling Status
+## Available MCP Tools
 
-The first push-enabled tool is available:
+### Graph Management
+- `list_graphs` – List all knowledge graphs owned by the authenticated user
+- `create_graph` – Create a new knowledge graph with ID, title, and optional description
+- `delete_graph` – Permanently delete a graph and all its contents
 
-- `list_graphs` – submits a `list_graphs` job, streams realtime updates via the backend’s `/ws` gateway when available, and falls back to HTTP polling otherwise. Ask Claude/Codex to “run list_graphs” after registering the MCP server to see a proof-of-concept end-to-end.
+### SPARQL Operations
+- `sparql_query` – Execute read-only SPARQL SELECT/CONSTRUCT queries against your graphs
+- `sparql_update` – Execute SPARQL INSERT/DELETE/UPDATE operations to modify graph data
 
-More graph/query tools will land once the FastAPI contract solidifies.
+### Document Operations (via Hocuspocus/Y.js)
+- `get_active_context` – Get the currently active graph and document from the Mnemosyne UI
+- `get_workspace` – Get the folder/file structure of a graph
+- `read_document` – Read document content as markdown
+- `write_document` – Replace document content with markdown
+- `append_to_document` – Add a paragraph to an existing document
+
+All tools submit jobs to the FastAPI backend, stream realtime updates via WebSocket when available, and fall back to HTTP polling otherwise.
 
 ## Configuration
 

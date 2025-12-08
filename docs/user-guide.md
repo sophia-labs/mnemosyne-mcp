@@ -2,7 +2,7 @@
 
 Quick guide to setting up OAuth authentication for Mnemosyne’s Claude Code integration.
 
-> **Status:** The first FastAPI-backed tool (`list_graphs`) is available and streams job updates over WebSockets. Authentication still works the same, and more tools are coming soon.
+> **Status:** 10 MCP tools are available for graph management, SPARQL operations, and real-time document editing via Hocuspocus/Y.js.
 
 ---
 
@@ -71,14 +71,23 @@ After adding the MCP server, restart Claude Code so it picks up the new configur
 
 ## Daily Use
 
-Authentication continues to be **completely automatic**. Today you can:
+Authentication is **completely automatic**. Here's what you can do:
 
-- “List my knowledge graphs” → calls the `list_graphs` tool.
+**Graph Management:**
+- "List my knowledge graphs" → `list_graphs`
+- "Create a new knowledge graph called 'my-research' for storing research papers" → `create_graph`
+- "Delete the test-graph" → `delete_graph`
 
-Coming soon (once new tools land):
-- “Create a new knowledge graph called 'my-research' for storing research papers”
-- “Show me what’s in my user-profiles graph”
-- “Run this SPARQL query on my research-papers graph: SELECT * WHERE { ?s ?p ?o } LIMIT 10”
+**SPARQL Operations:**
+- "Run this SPARQL query: SELECT * WHERE { ?s ?p ?o } LIMIT 10" → `sparql_query`
+- "Insert this triple into my graph..." → `sparql_update`
+
+**Document Operations (real-time via Y.js):**
+- "What document am I looking at in Mnemosyne?" → `get_active_context`
+- "Show me the folder structure of my-graph" → `get_workspace`
+- "Read the document at /notes/meeting.md" → `read_document`
+- "Write this content to my document" → `write_document`
+- "Add a paragraph to the end of my document" → `append_to_document`
 
 ---
 
@@ -126,7 +135,23 @@ This deletes your token from `~/.mnemosyne/config.json`.
 
 ## Available MCP Tools
 
-- `list_graphs` – Submits a `list_graphs` job to the FastAPI backend, streams realtime updates over `/ws`, and falls back to polling if the backend doesn’t advertise push hints. More tools will be added shortly.
+### Graph Management
+- `list_graphs` – List all knowledge graphs owned by the authenticated user
+- `create_graph` – Create a new knowledge graph with ID, title, and optional description
+- `delete_graph` – Permanently delete a graph and all its contents
+
+### SPARQL Operations
+- `sparql_query` – Execute read-only SPARQL SELECT/CONSTRUCT queries against your graphs
+- `sparql_update` – Execute SPARQL INSERT/DELETE/UPDATE operations to modify graph data
+
+### Document Operations (via Hocuspocus/Y.js)
+- `get_active_context` – Get the currently active graph and document from the Mnemosyne UI
+- `get_workspace` – Get the folder/file structure of a graph
+- `read_document` – Read document content as markdown
+- `write_document` – Replace document content with markdown
+- `append_to_document` – Add a paragraph to an existing document
+
+All tools submit jobs to the FastAPI backend, stream realtime updates via WebSocket when available, and fall back to HTTP polling otherwise.
 
 ---
 
