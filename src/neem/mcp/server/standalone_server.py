@@ -21,6 +21,8 @@ from mcp.server.fastmcp import FastMCP
 
 from neem.mcp.jobs.realtime import RealtimeJobClient
 from neem.mcp.tools.basic import register_basic_tools
+from neem.mcp.tools.graph_ops import register_graph_ops_tools
+from neem.mcp.tools.hocuspocus import register_hocuspocus_tools
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_dev_user_id, validate_token_and_load
 
@@ -258,10 +260,25 @@ def create_standalone_mcp_server() -> FastMCP:
     backend_config = resolve_backend_config()
 
     mcp_server = FastMCP(
-        name="Mnemosyne Knowledge Graph (Standalone)",
+        name="Mnemosyne Knowledge Graph",
         instructions=(
-            "Connects Codex/Claude to the local Mnemosyne FastAPI backend. "
-            "Tooling is temporarily disabled while the next architecture is underway."
+            "This MCP server provides real-time access to Mnemosyne knowledge graphs. "
+            "Available tools:\n\n"
+            "**Graph Management:**\n"
+            "- list_graphs: List all graphs owned by the authenticated user\n"
+            "- create_graph: Create a new knowledge graph with ID, title, description\n"
+            "- delete_graph: Permanently delete a graph and all its contents\n\n"
+            "**Document Operations (via Hocuspocus/Y.js):**\n"
+            "- get_active_context: Get the currently active graph and document from UI\n"
+            "- read_document: Read document content as markdown\n"
+            "- write_document: Replace document content with markdown\n"
+            "- append_to_document: Add a paragraph to an existing document\n"
+            "- get_workspace: Get folder/file structure of a graph\n\n"
+            "**SPARQL Operations:**\n"
+            "- sparql_query: Run read-only SPARQL SELECT/CONSTRUCT queries\n"
+            "- sparql_update: Run SPARQL INSERT/DELETE/UPDATE operations\n\n"
+            "Documents are synced in real-time via Y.js CRDT, so changes appear "
+            "immediately in the Mnemosyne web UI."
         ),
         stateless_http=True,
     )
@@ -286,12 +303,13 @@ def create_standalone_mcp_server() -> FastMCP:
     verify_backend_connectivity(backend_config)
 
     register_basic_tools(mcp_server)
+    register_graph_ops_tools(mcp_server)
+    register_hocuspocus_tools(mcp_server)
 
     logger.info(
-        "Standalone MCP server created without tools",
+        "Standalone MCP server created with graph and document tools",
         extra_context={"backend_url": backend_config.base_url},
     )
-    logger.info("Tool stack intentionally removed; awaiting new design.")
 
     return mcp_server
 

@@ -15,7 +15,7 @@ from typing import Any, Dict, Optional
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
 
-from neem.mcp.jobs import JobSubmitMetadata, RealtimeJobClient
+from neem.mcp.jobs import JobSubmitMetadata, RealtimeJobClient, WebSocketConnectionError
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_dev_user_id, validate_token_and_load
 
@@ -53,8 +53,8 @@ def register_basic_tools(server: FastMCP) -> None:
         name="list_graphs",
         title="List Mnemosyne Graphs",
         description=(
-            "Lists graphs via the Mnemosyne job queue. Returns streamed WebSocket events when available "
-            "and falls back to HTTP polling otherwise."
+            "Lists all knowledge graphs owned by the authenticated user. "
+            "Returns graph metadata including IDs, titles, and timestamps."
         ),
     )
     async def list_graphs_tool(context: Context | None = None) -> str:
@@ -76,31 +76,37 @@ def register_basic_tools(server: FastMCP) -> None:
         if job_stream and metadata.links.websocket:
             events = await stream_job(job_stream, metadata, timeout=STREAM_TIMEOUT_SECONDS)
 
+        # Try to extract graphs from WebSocket events first
         if events:
             if context:
                 await context.report_progress(80, 100)
+            graphs = _extract_graphs_from_events(events)
+            if graphs is not None:
+                return _render_json({"graphs": graphs, "count": len(graphs)})
+            # Fall back to raw events if extraction failed
             return _render_json({"job_id": metadata.job_id, "events": events})
 
+        # Poll for job completion and extract result
         status_payload = (
             await poll_job_until_terminal(metadata.links.status, token)
             if metadata.links.status
             else None
         )
-        result_payload = (
-            await fetch_result(metadata.links.result, token)
-            if metadata.links.result
-            else None
-        )
-
-        response: JsonDict = {"job_id": metadata.job_id}
-        if status_payload is not None:
-            response["status"] = status_payload
-        if result_payload is not None:
-            response["result"] = result_payload
 
         if context:
             await context.report_progress(100, 100)
-        return _render_json(response)
+
+        # Extract graphs from the job's detail.result_inline field
+        graphs = _extract_graphs_from_status(status_payload)
+        if graphs is not None:
+            return _render_json({"graphs": graphs, "count": len(graphs)})
+
+        # Fallback: return error with debug info
+        return _render_json({
+            "error": "Failed to extract graph list from job result",
+            "job_id": metadata.job_id,
+            "status": status_payload.get("status") if status_payload else None,
+        })
 
 
 async def submit_job(
@@ -150,11 +156,41 @@ async def poll_job_until_terminal(
     return last_payload
 
 
-async def fetch_result(result_url: Optional[str], token: str) -> Optional[JsonDict]:
-    """Fetch the job result payload if a result URL is provided."""
-    if not result_url:
+def _extract_graphs_from_status(status_payload: Optional[JsonDict]) -> Optional[list]:
+    """Extract graph list from job status detail.result_inline field."""
+    if not status_payload:
         return None
-    return await _request_json("GET", result_url, token=token)
+
+    detail = status_payload.get("detail")
+    if not isinstance(detail, dict):
+        return None
+
+    result_inline = detail.get("result_inline")
+    if isinstance(result_inline, list):
+        return result_inline
+
+    return None
+
+
+def _extract_graphs_from_events(events: list[JsonDict]) -> Optional[list]:
+    """Extract graph list from WebSocket job events."""
+    for event in reversed(events):  # Check most recent events first
+        event_type = event.get("type", "")
+        if event_type in ("job_completed", "completed", "succeeded"):
+            # Result might be in payload.detail.result_inline or directly in payload
+            payload = event.get("payload", {})
+            if isinstance(payload, dict):
+                detail = payload.get("detail", {})
+                if isinstance(detail, dict):
+                    result_inline = detail.get("result_inline")
+                    if isinstance(result_inline, list):
+                        return result_inline
+            # Or result might be at event top level
+            if "result_inline" in event:
+                result_inline = event.get("result_inline")
+                if isinstance(result_inline, list):
+                    return result_inline
+    return None
 
 
 async def stream_job(
@@ -163,7 +199,10 @@ async def stream_job(
     *,
     timeout: float,
 ) -> Optional[list[JsonDict]]:
-    """Wait for job events from the cache and return them."""
+    """Wait for job events from the cache and return them.
+
+    Returns None if WebSocket connection fails, allowing fallback to polling.
+    """
     job_id = metadata.job_id
 
     try:
@@ -172,9 +211,15 @@ async def stream_job(
             job_client.wait_for_terminal(job_id, timeout=timeout),
             timeout=timeout,
         )
+    except WebSocketConnectionError as exc:
+        logger.warning(
+            "WebSocket connection failed; falling back to HTTP polling",
+            extra_context={"job_id": job_id, "error": str(exc)},
+        )
+        return None
     except asyncio.TimeoutError:
         logger.warning(
-            "Timed out waiting for job completion",
+            "Timed out waiting for job completion via WebSocket",
             extra_context={"job_id": job_id},
         )
         # Still try to get whatever events we have

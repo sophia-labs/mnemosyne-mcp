@@ -25,6 +25,12 @@ TokenProvider = Callable[[], Optional[str]]
 logger = LoggerFactory.get_logger("mcp.realtime_jobs")
 
 
+class WebSocketConnectionError(Exception):
+    """Raised when WebSocket connection cannot be established after max attempts."""
+
+    pass
+
+
 @dataclass
 class JobEvent:
     """Envelope emitted for everything received over the WebSocket."""
@@ -44,6 +50,7 @@ class JobCacheEntry:
     completed: asyncio.Event = field(default_factory=asyncio.Event)
     last_accessed: float = field(default_factory=time.time)
     created_at: float = field(default_factory=time.time)
+    subscribed: bool = False  # Track if we've sent subscribe for this job
 
 
 class RealtimeJobClient:
@@ -59,6 +66,7 @@ class RealtimeJobClient:
         connect_timeout: float = 10.0,
         reconnect_base_delay: float = 1.0,
         reconnect_max_delay: float = 30.0,
+        max_connect_attempts: int = 3,
         session_factory: Optional[Callable[[], aiohttp.ClientSession]] = None,
         cache_ttl_seconds: float = 3600.0,
         cache_max_size: int = 1000,
@@ -70,6 +78,7 @@ class RealtimeJobClient:
         self._connect_timeout = connect_timeout
         self._reconnect_base_delay = reconnect_base_delay
         self._reconnect_max_delay = reconnect_max_delay
+        self._max_connect_attempts = max_connect_attempts
         self._session_factory = session_factory
         self._dev_user_id = dev_user_id
         self._cache_ttl_seconds = cache_ttl_seconds
@@ -111,7 +120,39 @@ class RealtimeJobClient:
     async def wait_for_terminal(self, job_id: str, timeout: float) -> None:
         """Wait until a job reaches terminal state or timeout."""
         entry = await self._ensure_cache_entry(job_id)
+        # Ensure we're connected and subscribed
+        await self._ensure_connected()
+        await self._subscribe_to_job(job_id)
         await asyncio.wait_for(entry.completed.wait(), timeout=timeout)
+
+    async def _subscribe_to_job(self, job_id: str) -> None:
+        """Send a subscribe message for the given job_id."""
+        async with self._lock:
+            entry = self._event_cache.get(job_id)
+            if entry and entry.subscribed:
+                return  # Already subscribed
+            if entry:
+                entry.subscribed = True
+
+        if not self._ws or self._ws.closed:
+            logger.warning(
+                "Cannot subscribe to job: WebSocket not connected",
+                extra_context={"job_id": job_id},
+            )
+            return
+
+        subscribe_msg = {"type": "subscribe", "job_id": job_id}
+        try:
+            await self._ws.send_json(subscribe_msg)
+            logger.debug(
+                "Sent subscribe message for job",
+                extra_context={"job_id": job_id},
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to send subscribe message",
+                extra_context={"job_id": job_id, "error": str(exc)},
+            )
 
     def is_job_complete(self, job_id: str) -> bool:
         """Check if a job has reached terminal state."""
@@ -125,17 +166,68 @@ class RealtimeJobClient:
                 self._event_cache[job_id] = JobCacheEntry(job_id=job_id)
             return self._event_cache[job_id]
 
+    async def _resubscribe_all_jobs(self) -> None:
+        """Re-subscribe to all active (non-completed) jobs after reconnection."""
+        if not self._ws or self._ws.closed:
+            return
+
+        async with self._lock:
+            active_jobs = [
+                job_id
+                for job_id, entry in self._event_cache.items()
+                if not entry.completed.is_set()
+            ]
+            # Mark all as needing re-subscription
+            for job_id in active_jobs:
+                self._event_cache[job_id].subscribed = False
+
+        for job_id in active_jobs:
+            await self._subscribe_to_job(job_id)
+
+        if active_jobs:
+            logger.info(
+                "Re-subscribed to active jobs after reconnect",
+                extra_context={"job_count": len(active_jobs)},
+            )
+
     async def _ensure_connected(self) -> None:
-        """Establish the WebSocket connection if needed."""
+        """Establish the WebSocket connection if needed.
+
+        Raises:
+            WebSocketConnectionError: If connection cannot be established after max attempts.
+        """
         if self.is_connected:
             return
-        await self._connect_with_backoff()
+        await self._connect_with_backoff(for_initial_connect=True)
 
-    async def _connect_with_backoff(self) -> None:
-        """Attempt to connect, retrying with exponential backoff on failure."""
+    async def _connect_with_backoff(self, *, for_initial_connect: bool = False) -> None:
+        """Attempt to connect, retrying with exponential backoff on failure.
+
+        Args:
+            for_initial_connect: If True, limits retries and raises on failure.
+                                 If False (reconnection), retries indefinitely.
+        """
         attempt = 0
+        max_attempts = self._max_connect_attempts if for_initial_connect else None
+        last_error: Optional[Exception] = None
+
         while not self._stop_requested:
             attempt += 1
+
+            # Check if we've exceeded max attempts for initial connection
+            if max_attempts is not None and attempt > max_attempts:
+                logger.error(
+                    "Failed to connect to WebSocket after max attempts",
+                    extra_context={
+                        "attempts": attempt - 1,
+                        "max_attempts": max_attempts,
+                        "url": self.websocket_url,
+                    },
+                )
+                raise WebSocketConnectionError(
+                    f"Failed to connect to WebSocket at {self.websocket_url} after {max_attempts} attempts"
+                ) from last_error
+
             try:
                 token = self._token_provider()
                 if not token:
@@ -169,13 +261,22 @@ class RealtimeJobClient:
                 if not self._cleanup_task or self._cleanup_task.done():
                     self._cleanup_task = asyncio.create_task(self._cleanup_loop(), name="mnemosyne-cache-cleanup")
 
+                # Re-subscribe to any jobs we were tracking before reconnect
+                await self._resubscribe_all_jobs()
+
                 return
             except Exception as exc:
+                last_error = exc
                 logger.warning(
                     "WebSocket connection attempt failed",
                     extra_context={"attempt": attempt, "error": str(exc)},
                 )
                 await self._teardown_connection()
+
+                # Don't wait between attempts if we're about to hit the limit
+                if max_attempts is not None and attempt >= max_attempts:
+                    continue
+
                 delay = min(self._reconnect_max_delay, self._reconnect_base_delay * (2 ** (attempt - 1)))
                 await asyncio.sleep(delay)
 

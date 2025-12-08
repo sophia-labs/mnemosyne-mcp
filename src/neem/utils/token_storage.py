@@ -280,6 +280,41 @@ def get_token_info(token: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def get_user_id_from_token(token: Optional[str] = None) -> Optional[str]:
+    """
+    Extract user ID from a JWT token.
+
+    First checks for dev mode user ID, then tries to extract from token.
+
+    Args:
+        token: Optional JWT token. If not provided, loads from storage.
+
+    Returns:
+        User ID if found, None otherwise
+    """
+    # Dev mode takes priority
+    dev_user = get_dev_user_id()
+    if dev_user:
+        return dev_user
+
+    # Try to extract from token
+    if token is None:
+        token = load_token()
+    if not token:
+        return None
+
+    info = get_token_info(token)
+    if not info:
+        return None
+
+    # Common JWT claims for user ID
+    for claim in ("sub", "user_id", "uid"):
+        if claim in info:
+            return str(info[claim])
+
+    return None
+
+
 def validate_token_and_load() -> Optional[str]:
     """
     Load token and validate it's not expired.
