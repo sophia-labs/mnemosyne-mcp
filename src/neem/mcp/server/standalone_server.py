@@ -23,15 +23,17 @@ from neem.mcp.jobs.realtime import RealtimeJobClient
 from neem.mcp.tools.basic import register_basic_tools
 from neem.mcp.tools.graph_ops import register_graph_ops_tools
 from neem.mcp.tools.hocuspocus import register_hocuspocus_tools
+from neem.mcp.tools.navigation import register_navigation_tools
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_dev_user_id, validate_token_and_load
 
 logger = LoggerFactory.get_logger("mcp.standalone_server")
 
-# Defaults align with `kubectl port-forward svc/mnemosyne-fastapi 8001:8000`
-DEFAULT_LOCAL_BACKEND_URL = "http://127.0.0.1:8001"
+# Defaults align with `kubectl port-forward svc/mnemosyne-api 8080:80`
+# The mnemosyne-api service exposes port 80, targeting pod port 8000
+DEFAULT_LOCAL_BACKEND_URL = "http://127.0.0.1:8080"
 DEFAULT_WS_PATH = "/ws"
-DEFAULT_LOCAL_WS_PORT = 8001
+DEFAULT_LOCAL_WS_PORT = 8080
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "0.0.0.0"}
 LOCAL_HTTP_PORT_HINTS = {8000, 8080}
 BACKEND_URL_ENV_VARS = ("MNEMOSYNE_FASTAPI_URL", "MNEMOSYNE_API_URL")
@@ -274,6 +276,14 @@ def create_standalone_mcp_server() -> FastMCP:
             "- write_document: Replace document content with markdown\n"
             "- append_to_document: Add a paragraph to an existing document\n"
             "- get_workspace: Get folder/file structure of a graph\n\n"
+            "**Navigation & File System Operations:**\n"
+            "- create_folder: Create a new folder in the workspace\n"
+            "- move_folder: Move a folder to a new parent\n"
+            "- rename_folder: Rename a folder\n"
+            "- delete_folder: Delete a folder (with cascade option)\n"
+            "- move_artifact: Move an artifact to a different folder\n"
+            "- rename_artifact: Rename an artifact\n"
+            "- move_document: Move a document to a folder\n\n"
             "**SPARQL Operations:**\n"
             "- sparql_query: Run read-only SPARQL SELECT/CONSTRUCT queries\n"
             "- sparql_update: Run SPARQL INSERT/DELETE/UPDATE operations\n\n"
@@ -305,9 +315,10 @@ def create_standalone_mcp_server() -> FastMCP:
     register_basic_tools(mcp_server)
     register_graph_ops_tools(mcp_server)
     register_hocuspocus_tools(mcp_server)
+    register_navigation_tools(mcp_server)
 
     logger.info(
-        "Standalone MCP server created with graph and document tools",
+        "Standalone MCP server created with graph, document, and navigation tools",
         extra_context={"backend_url": backend_config.base_url},
     )
 

@@ -129,9 +129,26 @@ Tokens expire after a day. Re-run `neem init --force` whenever you need a fresh 
 ### Document Operations (via Hocuspocus/Y.js)
 - `get_active_context` – Get the currently active graph and document from the Mnemosyne UI
 - `get_workspace` – Get the folder/file structure of a graph
-- `read_document` – Read document content as markdown
-- `write_document` – Replace document content with markdown
+- `read_document` – Read document content as TipTap XML
+- `write_document` – Replace document content with TipTap XML
 - `append_to_document` – Add a paragraph to an existing document
+
+#### TipTap XML Format
+
+Documents use TipTap's XML representation with full formatting support:
+
+**Blocks:** `paragraph`, `heading` (level="1-3"), `bulletList`, `orderedList`, `blockquote`, `codeBlock` (language="..."), `taskList`, `taskItem` (checked="true"), `horizontalRule`
+
+**Marks (nestable):** `strong`, `em`, `strike`, `code`, `mark` (highlight), `a` (href="...")
+
+**Annotation Marks:** Special inline marks that reference external content:
+- `footnote` – Self-contained annotation with `data-footnote-content` attribute
+- `commentMark` – Reference annotation with `data-comment-id` attribute
+
+Example:
+```xml
+<paragraph>Text with <mark>highlight</mark> and a note<footnote data-footnote-content="This is a footnote"/></paragraph>
+```
 
 All tools submit jobs to the FastAPI backend, stream realtime updates via WebSocket when available, and fall back to HTTP polling otherwise.
 

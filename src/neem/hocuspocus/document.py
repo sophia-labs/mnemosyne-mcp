@@ -1,367 +1,779 @@
 """Document editing helpers for TipTap/ProseMirror Y.js documents.
 
 Provides high-level operations for reading and modifying collaborative documents
-stored as Y.js XmlFragment (TipTap's native format).
+stored as Y.XmlFragment("content") - TipTap's native format.
+
+Documents are exposed as XML strings, preserving full formatting fidelity
+(bold, italic, highlight, links, etc.) without lossy markdown conversion.
+
+IMPORTANT: y-prosemirror encodes marks (bold, italic, etc.) as **attributes on
+Y.XmlText nodes**, not as nested Y.XmlElement wrappers. This matches how TipTap
+and ProseMirror represent formatting internally.
+
+Example: "Hello <strong>bold</strong> world" becomes:
+  XmlElement("paragraph", contents=[
+    XmlText("Hello bold world")  # with format(6, 10, {"bold": {}})
+  ])
+
+NOT:
+  XmlElement("paragraph", contents=[
+    XmlText("Hello "),
+    XmlElement("strong", contents=[XmlText("bold")]),  # WRONG
+    XmlText(" world"),
+  ])
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Union
+import uuid
+import xml.etree.ElementTree as ET
+from typing import Any
 
-import y_py as Y  # type: ignore[import-untyped]
+import pycrdt
 
 from neem.utils.logging import LoggerFactory
 
 logger = LoggerFactory.get_logger("hocuspocus.document")
 
+# Mark names that y-prosemirror uses (maps XML element names to Y.js attributes)
+# These are represented as formatting attributes on XmlText nodes
+MARK_ELEMENTS = frozenset({
+    "strong",      # bold
+    "em",          # italic
+    "code",        # inline code
+    "strike",      # strikethrough
+    "s",           # strikethrough alt
+    "mark",        # highlight
+    "a",           # link
+    "commentMark", # comment annotation - wraps text (data-comment-id)
+})
 
-@dataclass
-class TextSpan:
-    """A span of text with optional marks (bold, italic, etc.)."""
+# Inline node elements - these become XmlElement children, NOT text marks
+# Unlike marks, these are atomic nodes that don't wrap text content
+# The frontend TipTap extensions define these with `atom: true`
+INLINE_NODE_ELEMENTS = frozenset({
+    "footnote",    # self-contained annotation (data-footnote-content)
+})
 
-    text: str
-    marks: List[str] = None  # type: ignore
+# Map XML attribute names to Y.js/TipTap internal attribute names
+# y-prosemirror passes Y.js attributes directly to TipTap, so we need
+# to store using TipTap's internal attribute names
+INLINE_NODE_ATTR_MAP: dict[str, dict[str, str]] = {
+    "footnote": {
+        "data-footnote-content": "content",  # XML attr → TipTap attr
+    },
+}
 
-    def __post_init__(self):
-        if self.marks is None:
-            self.marks = []
+# Map XML attribute names to TipTap internal attribute names for marks
+# (similar to INLINE_NODE_ATTR_MAP but for mark formatting attributes)
+MARK_ATTR_MAP: dict[str, dict[str, str]] = {
+    "commentMark": {
+        "data-comment-id": "commentId",  # XML attr → TipTap attr
+    },
+    "a": {
+        "href": "href",  # Pass through (already same)
+        "target": "target",
+    },
+}
+
+# Map HTML/XML element names to TipTap's internal mark names
+# TipTap uses different names internally than the HTML tags we accept in XML
+MARK_NAME_MAP: dict[str, str] = {
+    "strong": "bold",      # HTML <strong> → TipTap "bold" mark
+    "em": "italic",        # HTML <em> → TipTap "italic" mark
+    "s": "strike",         # HTML <s> → TipTap "strike" mark
+    "strike": "strike",    # Also accept <strike>
+    "mark": "highlight",   # HTML <mark> → TipTap "highlight" mark
+    "a": "link",           # HTML <a> → TipTap "link" mark
+    "code": "code",        # Same name
+    "commentMark": "commentMark",  # Comment annotation - same name
+}
+
+# Map XML attribute names to TipTap internal attribute names for block elements
+# y-prosemirror stores ProseMirror internal attribute names, not HTML attribute names
+BLOCK_ATTR_MAP: dict[str, dict[str, str]] = {
+    "paragraph": {
+        "data-indent": "indent",  # XML attr → TipTap attr
+    },
+    "heading": {
+        "data-indent": "indent",  # XML attr → TipTap attr
+        "level": "level",         # Pass through (same name)
+    },
+}
+
+# Block types that need data-block-id (matches TipTap's BlockId extension)
+BLOCK_TYPES = frozenset({
+    "paragraph",
+    "heading",
+    "bulletList",
+    "orderedList",
+    "listItem",
+    "blockquote",
+    "codeBlock",
+    "taskList",
+    "taskItem",
+    "horizontalRule",
+})
 
 
-@dataclass
-class Block:
-    """A document block (paragraph, heading, code block, etc.)."""
+def _generate_block_id() -> str:
+    """Generate a unique block ID matching TipTap's format."""
+    return f"block-{uuid.uuid4().hex[:8]}"
 
-    type: str
-    content: List[Union[TextSpan, "Block"]]
-    attrs: Dict[str, Any] = None  # type: ignore
 
-    def __post_init__(self):
-        if self.attrs is None:
-            self.attrs = {}
+def _map_inline_node_attrs(tag: str, attrs: dict[str, Any]) -> dict[str, Any]:
+    """Map XML attribute names to TipTap internal attribute names.
 
-    def to_text(self) -> str:
-        """Convert block content to plain text."""
-        parts = []
-        for item in self.content:
-            if isinstance(item, TextSpan):
-                parts.append(item.text)
-            elif isinstance(item, Block):
-                parts.append(item.to_text())
-        return "".join(parts)
+    y-prosemirror passes Y.js XmlElement attributes directly to TipTap,
+    so we need to store them using TipTap's internal attribute names
+    rather than the HTML/XML attribute names.
 
-    def to_markdown(self) -> str:
-        """Convert block to markdown."""
-        text = self.to_text()
+    Example:
+        <footnote data-footnote-content="note"/> in XML becomes
+        XmlElement("footnote", {"content": "note"}) in Y.js
+        which TipTap reads as node.attrs.content
+    """
+    attr_map = INLINE_NODE_ATTR_MAP.get(tag, {})
+    if not attr_map:
+        return attrs
 
-        if self.type == "heading":
-            level = int(self.attrs.get("level", 1))
-            return "#" * level + " " + text
+    result = {}
+    for key, value in attrs.items():
+        # Map the attribute name if there's a mapping, otherwise keep original
+        mapped_key = attr_map.get(key, key)
+        result[mapped_key] = value
+    return result
 
-        if self.type == "bulletList":
-            # Nested list handling
-            lines = []
-            for item in self.content:
-                if isinstance(item, Block) and item.type == "listItem":
-                    lines.append("- " + item.to_text())
-            return "\n".join(lines)
 
-        if self.type == "orderedList":
-            lines = []
-            for i, item in enumerate(self.content, 1):
-                if isinstance(item, Block) and item.type == "listItem":
-                    lines.append(f"{i}. " + item.to_text())
-            return "\n".join(lines)
+def _map_mark_attrs(tag: str, attrs: dict[str, Any]) -> dict[str, Any]:
+    """Map XML attribute names to TipTap internal attribute names for marks.
 
-        if self.type == "codeBlock":
-            lang = self.attrs.get("language", "")
-            return f"```{lang}\n{text}\n```"
+    Similar to _map_inline_node_attrs but for mark formatting attributes.
+    y-prosemirror stores mark attributes in the delta format, and TipTap
+    expects specific attribute names.
 
-        if self.type == "blockquote":
-            lines = text.split("\n")
-            return "\n".join("> " + line for line in lines)
+    Example:
+        <commentMark data-comment-id="c-123">text</commentMark> in XML becomes
+        XmlText with format {commentMark: {commentId: "c-123"}}
+        which TipTap reads as mark.attrs.commentId
+    """
+    attr_map = MARK_ATTR_MAP.get(tag, {})
+    if not attr_map:
+        return attrs
 
-        # Default: paragraph
-        return text
+    result = {}
+    for key, value in attrs.items():
+        # Map the attribute name if there's a mapping, otherwise keep original
+        mapped_key = attr_map.get(key, key)
+        result[mapped_key] = value
+    return result
+
+
+def _map_block_attrs(tag: str, attrs: dict[str, Any]) -> dict[str, Any]:
+    """Map XML attribute names to TipTap internal attribute names for blocks.
+
+    Similar to _map_inline_node_attrs but for block-level node attributes.
+    y-prosemirror stores block attributes using TipTap's internal names.
+
+    Example:
+        <paragraph data-indent="2">text</paragraph> in XML becomes
+        XmlElement("paragraph", {"indent": 2}) in Y.js
+        which TipTap reads as node.attrs.indent
+
+    Note: data-block-id is handled separately and preserved as-is since
+    the BlockId extension uses that exact attribute name.
+    """
+    attr_map = BLOCK_ATTR_MAP.get(tag, {})
+
+    result = {}
+    for key, value in attrs.items():
+        # data-block-id is special - preserve as-is
+        if key == "data-block-id":
+            result[key] = value
+            continue
+        # Map the attribute name if there's a mapping, otherwise keep original
+        mapped_key = attr_map.get(key, key)
+        # Convert indent to integer if present
+        if mapped_key == "indent" and value is not None:
+            try:
+                value = int(value)
+            except (ValueError, TypeError):
+                value = 0
+        result[mapped_key] = value
+    return result
+
+
+def extract_title_from_xml(xml_str: str) -> str | None:
+    """Extract title from first heading element in TipTap XML.
+
+    Searches for the first <heading> element and returns its text content.
+    Used to derive document titles for workspace navigation.
+
+    Args:
+        xml_str: TipTap XML content string
+
+    Returns:
+        The text content of the first heading, or None if no heading found.
+
+    Example:
+        >>> extract_title_from_xml('<heading level="1">My Title</heading><paragraph>...</paragraph>')
+        'My Title'
+    """
+    try:
+        # Wrap for parsing (handles multiple root elements)
+        wrapped = f"<root>{xml_str}</root>"
+        root = ET.fromstring(wrapped)
+
+        # Find first heading element (depth-first search)
+        def find_heading(elem: ET.Element) -> ET.Element | None:
+            if elem.tag == "heading":
+                return elem
+            for child in elem:
+                result = find_heading(child)
+                if result is not None:
+                    return result
+            return None
+
+        heading = find_heading(root)
+        if heading is not None:
+            # Get all text content (handles marks inside heading)
+            text = "".join(heading.itertext()).strip()
+            return text if text else None
+        return None
+    except ET.ParseError:
+        logger.warning("Failed to parse XML for title extraction")
+        return None
 
 
 class DocumentReader:
-    """Reads TipTap document structure from a Y.Doc."""
+    """Reads TipTap document structure from a Y.Doc.
 
-    def __init__(self, doc: Y.YDoc) -> None:
+    Uses Y.XmlFragment("content") which is the native TipTap format,
+    matching the platform backend and browser client.
+    """
+
+    def __init__(self, doc: pycrdt.Doc) -> None:
         self._doc = doc
 
-    def get_xml_element(self, name: str = "prosemirror") -> Y.YXmlElement:
-        """Get the main XmlElement containing document content.
+    def get_content_fragment(self) -> pycrdt.XmlFragment:
+        """Get the content XmlFragment for native TipTap collaboration."""
+        return self._doc.get("content", type=pycrdt.XmlFragment)
 
-        Args:
-            name: The element name (default: "prosemirror" for TipTap)
+    def has_content(self) -> bool:
+        """Check if the document has any content."""
+        try:
+            fragment = self.get_content_fragment()
+            return len(list(fragment.children)) > 0
+        except Exception:
+            return False
+
+    def to_xml(self) -> str:
+        """Return document content as TipTap XML.
+
+        Example output:
+            <paragraph>Hello <strong>bold</strong> world</paragraph>
+            <heading level="2">Section</heading>
+        """
+        fragment = self.get_content_fragment()
+        return str(fragment)
+
+    def get_comments_map(self) -> "pycrdt.Map[dict[str, Any]]":
+        """Get the comments Y.Map for this document."""
+        return self._doc.get("comments", type=pycrdt.Map)
+
+    def get_all_comments(self) -> dict[str, dict[str, Any]]:
+        """Get all comments from the Y.Map('comments').
 
         Returns:
-            The Y.js XmlElement root container
+            Dict mapping commentId to comment metadata:
+            {
+                "comment-123": {
+                    "text": "Great point here",
+                    "author": "Alice",
+                    "authorId": "user-1",
+                    "createdAt": 1699999999000,
+                    "updatedAt": 1699999999000,
+                    "resolved": false
+                },
+                ...
+            }
         """
-        return self._doc.get_xml_element(name)
-
-    def get_blocks(self) -> List[Block]:
-        """Extract blocks from the document."""
-        root = self.get_xml_element()
-
-        # If root is empty, try fallback to Y.Array named "blocks"
-        if len(root) == 0:
-            try:
-                blocks_array = self._doc.get_array("blocks")
-                return self._parse_blocks_array(blocks_array)
-            except Exception:
-                return []
-
-        return self._parse_xml_element_children(root)
-
-    def _parse_xml_element_children(self, parent: Y.YXmlElement) -> List[Block]:
-        """Parse children of an XmlElement into Block objects."""
-        blocks = []
-        child = parent.first_child
-        index = 0
-        while child is not None:
-            try:
-                if isinstance(child, Y.YXmlElement):
-                    block = self._parse_xml_element(child)
-                    if block:
-                        blocks.append(block)
-            except Exception as e:
-                logger.debug(f"Failed to parse element child {index}: {e}")
-            child = child.next_sibling
-            index += 1
-        return blocks
-
-    def _parse_xml_element(self, element: Any) -> Optional[Block]:
-        """Parse a single XmlElement into a Block."""
-        if element is None:
-            return None
-
-        # Handle Y.YXmlElement
-        if isinstance(element, Y.YXmlElement):
-            block_type = element.name
-            attrs = {}
-
-            # Extract attributes (attributes() returns (key, value) tuples)
-            for key, value in element.attributes():
-                attrs[key] = value
-
-            # Extract content by traversing children
-            content = []
-            child = element.first_child
-            while child is not None:
-                if isinstance(child, Y.YXmlElement):
-                    # Nested element
-                    nested = self._parse_xml_element(child)
-                    if nested:
-                        content.append(nested)
-                elif isinstance(child, Y.YXmlText):
-                    # Text node - convert to string
-                    text = str(child)
-                    if text:
-                        content.append(TextSpan(text=text))
-                child = child.next_sibling
-
-            return Block(type=block_type, content=content, attrs=attrs)
-
-        # Handle Y.YXmlText directly
-        if isinstance(element, Y.YXmlText):
-            text = str(element)
-            return Block(type="text", content=[TextSpan(text=text)])
-
-        # Handle plain string
-        if isinstance(element, str):
-            return Block(type="text", content=[TextSpan(text=element)])
-
-        return None
-
-    def _parse_blocks_array(self, blocks_array: Y.YArray) -> List[Block]:
-        """Parse a Y.Array of block objects (legacy format)."""
-        blocks = []
-        for item in blocks_array:
-            if isinstance(item, dict):
-                block = self._dict_to_block(item)
-                if block:
-                    blocks.append(block)
-        return blocks
-
-    def _dict_to_block(self, data: Dict[str, Any]) -> Optional[Block]:
-        """Convert a dict representation to a Block."""
-        block_type = data.get("type", "paragraph")
-        attrs = data.get("attrs", {})
-        content_data = data.get("content", [])
-
-        content = []
-        for item in content_data:
-            if isinstance(item, dict):
-                if item.get("type") == "text":
-                    text = item.get("text", "")
-                    marks = [m.get("type") for m in item.get("marks", [])]
-                    content.append(TextSpan(text=text, marks=marks))
-                else:
-                    nested = self._dict_to_block(item)
-                    if nested:
-                        content.append(nested)
-            elif isinstance(item, str):
-                content.append(TextSpan(text=item))
-
-        return Block(type=block_type, content=content, attrs=attrs)
-
-    def to_markdown(self) -> str:
-        """Convert the entire document to markdown."""
-        blocks = self.get_blocks()
-        lines = []
-        for block in blocks:
-            md = block.to_markdown()
-            if md:
-                lines.append(md)
-        return "\n\n".join(lines)
-
-    def to_plain_text(self) -> str:
-        """Convert the document to plain text."""
-        blocks = self.get_blocks()
-        return "\n".join(block.to_text() for block in blocks)
+        comments_map = self.get_comments_map()
+        return dict(comments_map.items())
 
 
 class DocumentWriter:
     """Writes content to TipTap Y.js documents.
 
-    Uses the y-py API which differs from y.js JavaScript:
-    - Elements are created via parent.push_xml_element(txn, tag)
-    - Text nodes via parent.push_xml_text(txn), then text_node.push(txn, content)
-    - No standalone constructors like Y.XmlElement("tag")
+    Uses Y.XmlFragment("content") which is the native TipTap format,
+    matching the platform backend and browser client.
+
+    IMPORTANT: Methods in this class modify the Y.Doc in place. Use with
+    HocuspocusClient.transact_document() to properly capture and broadcast
+    incremental updates:
+
+        await client.transact_document(graph_id, doc_id, lambda doc:
+            DocumentWriter(doc).append_block("<paragraph>Hello</paragraph>")
+        )
     """
 
-    def __init__(self, doc: Y.YDoc, element_name: str = "prosemirror") -> None:
+    def __init__(self, doc: pycrdt.Doc) -> None:
         self._doc = doc
-        self._element_name = element_name
+        self._pending_formats: list[tuple[pycrdt.XmlText, list[dict[str, Any]]]] = []
 
-    def _get_root(self) -> Y.YXmlElement:
-        """Get the root XML element."""
-        return self._doc.get_xml_element(self._element_name)
+    def get_content_fragment(self) -> pycrdt.XmlFragment:
+        """Get the content XmlFragment for native TipTap collaboration."""
+        return self._doc.get("content", type=pycrdt.XmlFragment)
 
-    def append_paragraph(self, text: str) -> bytes:
-        """Append a paragraph to the document.
+    # -------------------------------------------------------------------------
+    # Surgical Edit Methods (collaborative-safe)
+    # -------------------------------------------------------------------------
 
-        Returns the Y.js update bytes for broadcasting.
+    def append_block(self, xml_str: str) -> None:
+        """Append a block element to the end of the document.
+
+        This is collaborative-safe - it only adds content, never removes.
+
+        Args:
+            xml_str: TipTap XML for a single block element, e.g.:
+                     "<paragraph>Hello world</paragraph>"
+                     "<heading level=\"2\">Section</heading>"
         """
-        root = self._get_root()
+        fragment = self.get_content_fragment()
+        elem = ET.fromstring(xml_str)
 
-        with self._doc.begin_transaction() as txn:
-            para = root.push_xml_element(txn, "paragraph")
-            text_node = para.push_xml_text(txn)
-            text_node.push(txn, text)
+        with self._doc.transaction():
+            block = self._xml_to_pycrdt(elem)
+            fragment.children.append(block)
+            self._apply_pending_formats()
 
-        return Y.encode_state_as_update(self._doc)
+    def insert_block_at(self, index: int, xml_str: str) -> None:
+        """Insert a block element at a specific position.
 
-    def insert_text_at(self, position: int, text: str) -> bytes:
-        """Insert text at a position in the document.
+        This is collaborative-safe - it inserts without removing existing content.
 
-        This is a simplified implementation - full cursor-aware editing
-        would need ProseMirror position mapping.
-
-        Returns the Y.js update bytes for broadcasting.
+        Args:
+            index: Position to insert at (0 = beginning)
+            xml_str: TipTap XML for a single block element
         """
-        root = self._get_root()
+        fragment = self.get_content_fragment()
+        elem = ET.fromstring(xml_str)
 
-        if len(root) == 0:
-            return self.append_paragraph(text)
+        with self._doc.transaction():
+            block = self._xml_to_pycrdt(elem)
+            fragment.children.insert(index, block)
+            self._apply_pending_formats()
 
-        with self._doc.begin_transaction() as txn:
-            first = root.first_child
-            if first is not None:
-                # Find the text node inside the first element
-                text_child = first.first_child
-                if isinstance(text_child, Y.YXmlText):
-                    text_child.insert(txn, position, text)
+    def delete_block_at(self, index: int) -> None:
+        """Delete a block at a specific position.
 
-        return Y.encode_state_as_update(self._doc)
+        Args:
+            index: Position of the block to delete
+        """
+        fragment = self.get_content_fragment()
 
-    def clear_document(self) -> bytes:
+        with self._doc.transaction():
+            del fragment.children[index]
+
+    def get_block_count(self) -> int:
+        """Get the number of blocks in the document."""
+        fragment = self.get_content_fragment()
+        return len(list(fragment.children))
+
+    # -------------------------------------------------------------------------
+    # Destructive Methods (use with caution in collaborative contexts)
+    # -------------------------------------------------------------------------
+
+    def clear_content(self) -> None:
         """Clear all content from the document.
 
-        Returns the Y.js update bytes for broadcasting.
+        WARNING: This is destructive - it removes all existing content.
+        Concurrent edits from other clients will be lost.
         """
-        root = self._get_root()
+        fragment = self.get_content_fragment()
 
-        with self._doc.begin_transaction() as txn:
-            # Delete all children
-            while len(root) > 0:
-                root.delete(txn, 0, 1)
+        with self._doc.transaction():
+            while list(fragment.children):
+                del fragment.children[0]
 
-        return Y.encode_state_as_update(self._doc)
+    def replace_all_content(self, xml_str: str) -> None:
+        """Replace entire document content with new TipTap XML.
 
-    def set_content_from_markdown(self, markdown: str) -> bytes:
-        """Set document content from markdown.
+        WARNING: This is DESTRUCTIVE - it clears all existing content first.
+        Any concurrent edits from other clients will be lost.
 
-        This is a basic implementation - full markdown parsing would need
-        a proper markdown parser.
+        For collaborative editing, prefer surgical methods:
+        - append_block() to add content
+        - insert_block_at() to insert at position
+        - delete_block_at() to remove specific blocks
 
-        Returns the Y.js update bytes for broadcasting.
+        Args:
+            xml_str: TipTap XML content, e.g.:
+                     "<paragraph>Hello</paragraph><paragraph>World</paragraph>"
         """
-        # Clear existing content
-        self.clear_document()
+        self.clear_content()
+        fragment = self.get_content_fragment()
 
-        root = self._get_root()
+        # Wrap for parsing (handles multiple root elements)
+        wrapped = f"<root>{xml_str}</root>"
+        root = ET.fromstring(wrapped)
 
-        with self._doc.begin_transaction() as txn:
-            lines = markdown.split("\n")
-            i = 0
-            while i < len(lines):
-                line = lines[i].strip()
+        with self._doc.transaction():
+            for child in root:
+                elem = self._xml_to_pycrdt(child)
+                fragment.children.append(elem)
+            self._apply_pending_formats()
 
-                if not line:
-                    i += 1
-                    continue
+    # -------------------------------------------------------------------------
+    # Legacy API (deprecated)
+    # -------------------------------------------------------------------------
 
-                # Heading
-                if line.startswith("#"):
-                    level = 0
-                    while level < len(line) and line[level] == "#":
-                        level += 1
-                    text = line[level:].strip()
-                    heading = root.push_xml_element(txn, "heading")
-                    heading.set_attribute(txn, "level", str(level))
-                    text_node = heading.push_xml_text(txn)
-                    text_node.push(txn, text)
+    def clear_document(self) -> bytes:
+        """DEPRECATED: Use clear_content() with transact_document() instead."""
+        import warnings
 
-                # Code block
-                elif line.startswith("```"):
-                    lang = line[3:].strip()
-                    code_lines = []
-                    i += 1
-                    while i < len(lines) and not lines[i].strip().startswith("```"):
-                        code_lines.append(lines[i])
-                        i += 1
-                    code_block = root.push_xml_element(txn, "codeBlock")
-                    if lang:
-                        code_block.set_attribute(txn, "language", lang)
-                    text_node = code_block.push_xml_text(txn)
-                    text_node.push(txn, "\n".join(code_lines))
+        warnings.warn(
+            "clear_document() is deprecated. Use clear_content() with "
+            "HocuspocusClient.transact_document() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.clear_content()
+        return self._doc.get_update()
 
-                # Bullet list item
-                elif line.startswith("- ") or line.startswith("* "):
-                    text = line[2:]
-                    list_item = root.push_xml_element(txn, "listItem")
-                    para = list_item.push_xml_element(txn, "paragraph")
-                    text_node = para.push_xml_text(txn)
-                    text_node.push(txn, text)
+    def set_content_from_xml(self, xml_str: str) -> bytes:
+        """DEPRECATED: Use replace_all_content() with transact_document() instead."""
+        import warnings
 
-                # Regular paragraph
+        warnings.warn(
+            "set_content_from_xml() is deprecated. Use replace_all_content() with "
+            "HocuspocusClient.transact_document() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.replace_all_content(xml_str)
+        return self._doc.get_update()
+
+    def _xml_to_pycrdt(self, elem: ET.Element) -> pycrdt.XmlElement:
+        """Convert XML element to pycrdt XmlElement.
+
+        Handles three cases:
+        1. Block with nested blocks (list > listItem > paragraph): Recursively build children
+        2. Block with inline nodes (paragraph with footnotes): Mixed XmlText/XmlElement children
+        3. Block with only marks (paragraph with bold/italic): Single XmlText with formatting
+
+        Marks (strong, em, etc.) are encoded as formatting attributes on XmlText.
+        Inline nodes (footnote, commentMark) become XmlElement children.
+
+        Auto-assigns data-block-id to block types that need it (matches
+        TipTap's BlockId extension).
+        """
+        contents: list[Any] = []
+
+        # Check if this element has any nested block children
+        has_block_children = any(child.tag in BLOCK_TYPES for child in elem)
+
+        if has_block_children:
+            # Handle nested block structure (e.g., bulletList > listItem > paragraph)
+            # Recursively process each block child
+            for child in elem:
+                if child.tag in BLOCK_TYPES:
+                    contents.append(self._xml_to_pycrdt(child))
+                # Note: We ignore non-block children in block containers
+                # TipTap structure is always: container > block > inline content
+        else:
+            # Handle inline content (paragraph, heading with text/marks/inline nodes)
+            # This produces a list of content items: XmlText and XmlElement mixed
+            content_items = self._extract_inline_content(elem)
+            contents.extend(content_items)
+
+        # Build attributes, mapping XML names to TipTap internal names
+        attrs = _map_block_attrs(elem.tag, dict(elem.attrib))
+
+        # Add data-block-id for block types if not present
+        if elem.tag in BLOCK_TYPES and "data-block-id" not in attrs:
+            attrs["data-block-id"] = _generate_block_id()
+
+        return pycrdt.XmlElement(
+            elem.tag,
+            attrs,
+            contents=contents or None,
+        )
+
+    def _extract_text_runs(
+        self, elem: ET.Element, inherited_marks: dict[str, dict[str, Any]] | None = None
+    ) -> list[dict[str, Any]]:
+        """Extract text runs with their marks from an element.
+
+        Returns a list of dicts: [{"text": str, "marks": {mark_name: attrs}}]
+
+        Marks are accumulated through nested elements (e.g., <strong><em>text</em></strong>
+        produces a single run with both bold and italic marks).
+
+        NOTE: This method only handles MARK_ELEMENTS (bold, italic, commentMark, etc.).
+        INLINE_NODE_ELEMENTS (footnote) are handled by _extract_inline_content.
+        """
+        runs: list[dict[str, Any]] = []
+        marks = dict(inherited_marks or {})
+
+        # If this element is a mark, add it to the current marks
+        if elem.tag in MARK_ELEMENTS:
+            mark_attrs = dict(elem.attrib) if elem.attrib else {}
+            # Map XML attribute names to TipTap internal names
+            mark_attrs = _map_mark_attrs(elem.tag, mark_attrs)
+            marks[elem.tag] = mark_attrs
+
+        # Text before first child
+        if elem.text:
+            runs.append({"text": elem.text, "marks": dict(marks)})
+
+        # Process children
+        for child in elem:
+            if child.tag in MARK_ELEMENTS:
+                # Recurse into mark element, inheriting current marks
+                child_runs = self._extract_text_runs(child, marks)
+                runs.extend(child_runs)
+            elif child.tag not in INLINE_NODE_ELEMENTS:
+                # Non-mark, non-inline-node child - extract its text
+                child_runs = self._extract_text_runs(child, marks)
+                runs.extend(child_runs)
+            # Note: INLINE_NODE_ELEMENTS are skipped here - they're handled
+            # by _extract_inline_content which creates XmlElement nodes for them
+
+            # Tail text (after this child element)
+            # Use inherited_marks (not marks) because tail text is OUTSIDE the child element
+            if child.tail:
+                runs.append({"text": child.tail, "marks": dict(inherited_marks or {})})
+
+        return runs
+
+    def _apply_pending_formats(self) -> None:
+        """Apply formatting to XmlText nodes after they're integrated."""
+        for text_node, runs in self._pending_formats:
+            offset = 0
+            for run in runs:
+                text = run["text"]
+                marks = run["marks"]
+                length = len(text)
+
+                if marks:
+                    # Apply each mark as a format attribute
+                    for mark_name, mark_attrs in marks.items():
+                        # Map HTML element name to TipTap's internal mark name
+                        # e.g., "strong" → "bold", "em" → "italic"
+                        mapped_name = MARK_NAME_MAP.get(mark_name, mark_name)
+                        # y-prosemirror uses empty dict {} for marks without attrs
+                        text_node.format(offset, offset + length, {mapped_name: mark_attrs or {}})
+
+                offset += length
+
+        self._pending_formats.clear()
+
+    # -------------------------------------------------------------------------
+    # Comment Metadata Methods (stored in Y.Map('comments'))
+    # -------------------------------------------------------------------------
+
+    def get_comments_map(self) -> "pycrdt.Map[dict[str, Any]]":
+        """Get the comments Y.Map for this document.
+
+        Comments are stored as a Y.Map with commentId as key and metadata as value.
+        The metadata includes: text, author, authorId, createdAt, updatedAt, resolved.
+        """
+        return self._doc.get("comments", type=pycrdt.Map)
+
+    def set_comment(
+        self,
+        comment_id: str,
+        text: str,
+        author: str = "MCP Agent",
+        author_id: str = "mcp-agent",
+        resolved: bool = False,
+        quoted_text: str | None = None,
+    ) -> None:
+        """Set or update a comment in the Y.Map('comments').
+
+        Args:
+            comment_id: Unique ID matching data-comment-id in the document
+            text: The comment text content
+            author: Display name of the comment author
+            author_id: User ID of the author
+            resolved: Whether the comment has been resolved
+            quoted_text: The highlighted/quoted text from the document
+        """
+        import time
+
+        comments_map = self.get_comments_map()
+        now = int(time.time() * 1000)  # milliseconds timestamp like JS Date.now()
+
+        existing = comments_map.get(comment_id)
+        created_at = existing.get("createdAt", now) if existing else now
+        # Preserve existing quotedText if not provided
+        existing_quoted = existing.get("quotedText") if existing else None
+
+        comment_data: dict[str, Any] = {
+            "text": text,
+            "author": author,
+            "authorId": author_id,
+            "createdAt": created_at,
+            "updatedAt": now,
+            "resolved": resolved,
+        }
+        # Only include quotedText if provided or exists
+        if quoted_text is not None:
+            comment_data["quotedText"] = quoted_text
+        elif existing_quoted is not None:
+            comment_data["quotedText"] = existing_quoted
+
+        comments_map[comment_id] = comment_data
+
+    def delete_comment(self, comment_id: str) -> None:
+        """Delete a comment from the Y.Map('comments').
+
+        Args:
+            comment_id: ID of the comment to delete
+        """
+        comments_map = self.get_comments_map()
+        if comment_id in comments_map:
+            del comments_map[comment_id]
+
+    def get_all_comments(self) -> dict[str, dict[str, Any]]:
+        """Get all comments from the Y.Map('comments').
+
+        Returns:
+            Dict mapping commentId to comment metadata
+        """
+        comments_map = self.get_comments_map()
+        return dict(comments_map.items())
+
+    # -------------------------------------------------------------------------
+    # Internal Methods
+    # -------------------------------------------------------------------------
+
+    def _extract_inline_content(self, elem: ET.Element) -> list[Any]:
+        """Extract inline content as a list of XmlText and XmlElement items.
+
+        For blocks containing inline nodes (footnote, commentMark), we need to
+        create separate XmlText nodes around each inline XmlElement. This differs
+        from the mark-only case where all text goes into a single XmlText.
+
+        Example: "<paragraph>Text <footnote .../> more</paragraph>" becomes:
+          [XmlText("Text "), XmlElement("footnote", ...), XmlText(" more")]
+
+        Returns:
+            List of pycrdt.XmlText and pycrdt.XmlElement items
+        """
+        items: list[Any] = []
+        current_runs: list[dict[str, Any]] = []
+
+        def flush_text_runs() -> None:
+            """Convert accumulated text runs to an XmlText node."""
+            if not current_runs:
+                return
+
+            full_text = "".join(run["text"] for run in current_runs)
+            if full_text:
+                text_node = pycrdt.XmlText(full_text)
+                items.append(text_node)
+                # Store formatting info for later application
+                self._pending_formats.append((text_node, list(current_runs)))
+            current_runs.clear()
+
+        def process_element(
+            el: ET.Element,
+            inherited_marks: dict[str, dict[str, Any]] | None = None
+        ) -> None:
+            """Process an element, handling text, marks, and inline nodes."""
+            marks = dict(inherited_marks or {})
+
+            # If this is a mark element, add to current marks
+            if el.tag in MARK_ELEMENTS:
+                mark_attrs = dict(el.attrib) if el.attrib else {}
+                # Map XML attribute names to TipTap internal names
+                mark_attrs = _map_mark_attrs(el.tag, mark_attrs)
+                marks[el.tag] = mark_attrs
+
+            # If this is an inline node element, flush text and add the element
+            if el.tag in INLINE_NODE_ELEMENTS:
+                flush_text_runs()
+                # Create the inline node element (empty contents for atom nodes)
+                # Map XML attribute names to TipTap internal names
+                mapped_attrs = _map_inline_node_attrs(el.tag, dict(el.attrib))
+                inline_elem = pycrdt.XmlElement(el.tag, mapped_attrs, contents=[])
+                items.append(inline_elem)
+                # Process tail text (text after the inline node)
+                if el.tail:
+                    current_runs.append({"text": el.tail, "marks": dict(inherited_marks or {})})
+                return
+
+            # Text before first child
+            if el.text:
+                current_runs.append({"text": el.text, "marks": dict(marks)})
+
+            # Process children
+            for child in el:
+                if child.tag in INLINE_NODE_ELEMENTS:
+                    # Inline node - flush and add element
+                    flush_text_runs()
+                    mapped_attrs = _map_inline_node_attrs(child.tag, dict(child.attrib))
+                    inline_elem = pycrdt.XmlElement(child.tag, mapped_attrs, contents=[])
+                    items.append(inline_elem)
+                elif child.tag in MARK_ELEMENTS:
+                    # Mark element - recurse to extract text with marks
+                    process_element(child, marks)
                 else:
-                    para = root.push_xml_element(txn, "paragraph")
-                    text_node = para.push_xml_text(txn)
-                    text_node.push(txn, line)
+                    # Unknown element - try to extract text
+                    process_element(child, marks)
 
-                i += 1
+                # Tail text (after this child, outside the child element)
+                # Use inherited_marks, not marks, since tail is outside the child
+                if child.tail:
+                    current_runs.append({"text": child.tail, "marks": dict(inherited_marks or {})})
 
-        return Y.encode_state_as_update(self._doc)
+        # Process the root element (but don't treat the root itself as a mark)
+        if elem.text:
+            current_runs.append({"text": elem.text, "marks": {}})
+
+        for child in elem:
+            if child.tag in INLINE_NODE_ELEMENTS:
+                flush_text_runs()
+                mapped_attrs = _map_inline_node_attrs(child.tag, dict(child.attrib))
+                inline_elem = pycrdt.XmlElement(child.tag, mapped_attrs, contents=[])
+                items.append(inline_elem)
+            elif child.tag in MARK_ELEMENTS:
+                process_element(child, {})
+            else:
+                process_element(child, {})
+
+            if child.tail:
+                current_runs.append({"text": child.tail, "marks": {}})
+
+        # Flush any remaining text
+        flush_text_runs()
+
+        return items
+
+    def append_paragraph(self, text: str) -> bytes:
+        """DEPRECATED: Use append_block() with transact_document() instead.
+
+        Example:
+            await client.transact_document(graph_id, doc_id, lambda doc:
+                DocumentWriter(doc).append_block(f"<paragraph>{text}</paragraph>")
+            )
+        """
+        import warnings
+
+        warnings.warn(
+            "append_paragraph() is deprecated. Use append_block() with "
+            "HocuspocusClient.transact_document() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.append_block(f"<paragraph>{text}</paragraph>")
+        return self._doc.get_update()
 
 
 __all__ = [
-    "Block",
     "DocumentReader",
     "DocumentWriter",
-    "TextSpan",
+    "extract_title_from_xml",
 ]

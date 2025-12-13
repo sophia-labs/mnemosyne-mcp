@@ -12,13 +12,12 @@ from typing import Any, Callable, Dict, Optional
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
-import y_py as Y  # type: ignore[import-untyped]
+import pycrdt
 
 from neem.hocuspocus.protocol import (
     ProtocolDecodeError,
     ProtocolMessageType,
     decode_message,
-    encode_ping,
     encode_sync_step1,
     encode_sync_step2,
     encode_sync_update,
@@ -34,7 +33,7 @@ TokenProvider = Callable[[], Optional[str]]
 class ChannelState:
     """State for a single Y.js channel (session, workspace, or document)."""
 
-    doc: Y.YDoc = field(default_factory=Y.YDoc)
+    doc: pycrdt.Doc = field(default_factory=pycrdt.Doc)
     ws: Optional[aiohttp.ClientWebSocketResponse] = None
     synced: asyncio.Event = field(default_factory=asyncio.Event)
     receiver_task: Optional[asyncio.Task] = None
@@ -51,7 +50,7 @@ class HocuspocusClient:
 
     Usage:
         client = HocuspocusClient(
-            base_url="http://localhost:8001",
+            base_url="http://localhost:8080",
             token_provider=lambda: get_token(),
         )
 
@@ -79,7 +78,7 @@ class HocuspocusClient:
         """Initialize the Hocuspocus client.
 
         Args:
-            base_url: Base URL of the Mnemosyne API (e.g., http://localhost:8001)
+            base_url: Base URL of the Mnemosyne API (e.g., http://localhost:8080)
             token_provider: Callable that returns the current auth token
             dev_user_id: Optional dev mode user ID (bypasses OAuth)
             connect_timeout: WebSocket connection timeout in seconds
@@ -200,7 +199,7 @@ class HocuspocusClient:
             )
 
             # Send our state vector to initiate sync
-            state_vector = Y.encode_state_vector(channel.doc)
+            state_vector = channel.doc.get_state()
             await channel.ws.send_bytes(encode_sync_step1(state_vector))
 
             # Wait for sync to complete (server sends sync_step2)
@@ -264,19 +263,19 @@ class HocuspocusClient:
             message = decode_message(data)
         except ProtocolDecodeError:
             # Treat as raw Y.js update
-            Y.apply_update(channel.doc, data)
+            channel.doc.apply_update(data)
             return
 
         if message.type == ProtocolMessageType.SYNC:
             if message.subtype == "sync_step1":
                 # Server sent its state vector, respond with sync_step2
-                update = Y.encode_state_as_update(channel.doc)
+                update = channel.doc.get_update()
                 if channel.ws and not channel.ws.closed:
                     await channel.ws.send_bytes(encode_sync_step2(update))
 
             elif message.subtype == "sync_step2":
                 # Server sent us the full state diff - apply it
-                Y.apply_update(channel.doc, message.payload)
+                channel.doc.apply_update(message.payload)
                 channel.synced.set()
                 logger.debug(
                     "Received sync_step2, channel synced",
@@ -285,51 +284,148 @@ class HocuspocusClient:
 
             elif message.subtype == "sync_update":
                 # Incremental update from server
-                Y.apply_update(channel.doc, message.payload)
+                channel.doc.apply_update(message.payload)
 
         elif message.type == ProtocolMessageType.PING:
             # Respond to ping (though aiohttp heartbeat usually handles this)
-            if channel.ws and not channel.ws.closed:
-                from neem.hocuspocus.protocol import encode_ping
-                # Actually we should encode_pong, but we don't have it - ping is fine
-                pass
+            pass
 
         elif message.type == ProtocolMessageType.AWARENESS:
             # Awareness updates - ignore for now (cursor positions, etc.)
             pass
 
     # -------------------------------------------------------------------------
-    # Session State Accessors
+    # Session State Accessors (Schema V2 - per-tab state)
     # -------------------------------------------------------------------------
 
-    def get_active_graph_id(self) -> Optional[str]:
-        """Get the currently active graph ID from the session."""
+    def get_all_tab_ids(self) -> list[str]:
+        """Get all tab IDs from the session."""
         if self._session_channel is None:
-            return None
-        navigation = self._session_channel.doc.get_map("navigation")
-        return navigation.get("activeGraphId")
+            return []
+        tabs_map: pycrdt.Map = self._session_channel.doc.get("tabs", type=pycrdt.Map)
+        return list(tabs_map.keys())
 
-    def get_active_document_id(self) -> Optional[str]:
-        """Get the currently active document ID from the session."""
+    def get_most_recent_tab_id(self) -> Optional[str]:
+        """Find the tab with the highest lastActiveAt timestamp.
+
+        Returns:
+            The most recently active tab ID, or None if no tabs exist.
+        """
         if self._session_channel is None:
             return None
-        navigation = self._session_channel.doc.get_map("navigation")
-        return navigation.get("activeDocumentId")
+
+        tabs_map: pycrdt.Map = self._session_channel.doc.get("tabs", type=pycrdt.Map)
+        most_recent_id: Optional[str] = None
+        most_recent_time: int = -1
+
+        for tab_id in tabs_map.keys():
+            tab_map = tabs_map.get(tab_id)
+            if tab_map is not None and isinstance(tab_map, pycrdt.Map):
+                last_active = tab_map.get("lastActiveAt")
+                if last_active is not None and last_active > most_recent_time:
+                    most_recent_time = last_active
+                    most_recent_id = tab_id
+
+        return most_recent_id
+
+    def get_tab_state(self, tab_id: str) -> Optional[Dict[str, Any]]:
+        """Get state for a specific tab.
+
+        Args:
+            tab_id: The tab's unique identifier.
+
+        Returns:
+            Tab state dict or None if tab doesn't exist.
+        """
+        if self._session_channel is None:
+            return None
+
+        tabs_map: pycrdt.Map = self._session_channel.doc.get("tabs", type=pycrdt.Map)
+        tab_map = tabs_map.get(tab_id)
+        if tab_map is None or not isinstance(tab_map, pycrdt.Map):
+            return None
+
+        return {key: tab_map.get(key) for key in tab_map.keys()}
+
+    def get_active_graph_id(self, tab_id: Optional[str] = None) -> Optional[str]:
+        """Get the currently active graph ID from the session.
+
+        Args:
+            tab_id: Specific tab to query. If None, uses most recent tab.
+
+        Returns:
+            The active graph ID or None.
+        """
+        if self._session_channel is None:
+            return None
+
+        target_tab = tab_id or self.get_most_recent_tab_id()
+        if not target_tab:
+            return None
+
+        tabs_map: pycrdt.Map = self._session_channel.doc.get("tabs", type=pycrdt.Map)
+        tab_map = tabs_map.get(target_tab)
+        if tab_map is None or not isinstance(tab_map, pycrdt.Map):
+            return None
+
+        return tab_map.get("activeGraphId")
+
+    def get_active_document_id(self, tab_id: Optional[str] = None) -> Optional[str]:
+        """Get the currently active document ID from the session.
+
+        Args:
+            tab_id: Specific tab to query. If None, uses most recent tab.
+
+        Returns:
+            The active document ID or None.
+        """
+        if self._session_channel is None:
+            return None
+
+        target_tab = tab_id or self.get_most_recent_tab_id()
+        if not target_tab:
+            return None
+
+        tabs_map: pycrdt.Map = self._session_channel.doc.get("tabs", type=pycrdt.Map)
+        tab_map = tabs_map.get(target_tab)
+        if tab_map is None or not isinstance(tab_map, pycrdt.Map):
+            return None
+
+        return tab_map.get("activeDocumentId")
 
     def get_session_snapshot(self) -> Dict[str, Any]:
-        """Get a snapshot of the session state."""
+        """Get a snapshot of the session state (Schema V2 with tabs)."""
         if self._session_channel is None:
             return {}
 
         doc = self._session_channel.doc
 
-        def ymap_to_dict(ymap: Y.YMap) -> Dict[str, Any]:
-            return {key: ymap.get(key) for key in ymap.keys()}
+        def ymap_to_dict(ymap: pycrdt.Map) -> Dict[str, Any]:
+            result = {}
+            for key in ymap.keys():
+                value = ymap.get(key)
+                if isinstance(value, pycrdt.Map):
+                    result[key] = ymap_to_dict(value)
+                elif isinstance(value, pycrdt.Array):
+                    result[key] = list(value)
+                else:
+                    result[key] = value
+            return result
+
+        # Build tabs snapshot (Schema V2)
+        tabs_map: pycrdt.Map = doc.get("tabs", type=pycrdt.Map)
+        tabs_snapshot = {}
+        for tab_id in tabs_map.keys():
+            tab_state = tabs_map.get(tab_id)
+            if isinstance(tab_state, pycrdt.Map):
+                tabs_snapshot[tab_id] = ymap_to_dict(tab_state)
+
+        preferences_map: pycrdt.Map = doc.get("preferences", type=pycrdt.Map)
 
         return {
-            "layout": ymap_to_dict(doc.get_map("layout")),
-            "preferences": ymap_to_dict(doc.get_map("preferences")),
-            "navigation": ymap_to_dict(doc.get_map("navigation")),
+            "preferences": ymap_to_dict(preferences_map),
+            "tabs": tabs_snapshot,
+            "most_recent_tab_id": self.get_most_recent_tab_id(),
         }
 
     # -------------------------------------------------------------------------
@@ -365,22 +461,76 @@ class HocuspocusClient:
 
         doc = channel.doc
 
-        def ymap_to_dict(ymap: Y.YMap) -> Dict[str, Any]:
+        def ymap_to_dict(ymap: pycrdt.Map) -> Dict[str, Any]:
             result = {}
             for key in ymap.keys():
                 value = ymap.get(key)
-                if isinstance(value, Y.YMap):
+                if isinstance(value, pycrdt.Map):
                     result[key] = ymap_to_dict(value)
-                elif isinstance(value, Y.YArray):
+                elif isinstance(value, pycrdt.Array):
                     result[key] = list(value)
                 else:
                     result[key] = value
             return result
 
-        # The workspace structure varies - return the whole doc
+        # Workspace uses four separate YMaps: folders, artifacts, documents, ui
+        folders_map: pycrdt.Map = doc.get("folders", type=pycrdt.Map)
+        artifacts_map: pycrdt.Map = doc.get("artifacts", type=pycrdt.Map)
+        documents_map: pycrdt.Map = doc.get("documents", type=pycrdt.Map)
+        ui_map: pycrdt.Map = doc.get("ui", type=pycrdt.Map)
+
         return {
-            "filesystem": ymap_to_dict(doc.get_map("filesystem")),
+            "folders": ymap_to_dict(folders_map),
+            "artifacts": ymap_to_dict(artifacts_map),
+            "documents": ymap_to_dict(documents_map),
+            "ui": ymap_to_dict(ui_map),
         }
+
+    async def transact_workspace(
+        self,
+        graph_id: str,
+        operation: Callable[[pycrdt.Doc], None],
+    ) -> None:
+        """Execute an operation on a workspace and broadcast the incremental update.
+
+        This is the correct way to make collaborative workspace edits. It:
+        1. Captures the state vector BEFORE changes
+        2. Executes your operation (which modifies the doc)
+        3. Computes the INCREMENTAL diff (not full state)
+        4. Broadcasts only the diff to other clients
+
+        Args:
+            graph_id: The graph ID
+            operation: Callable that modifies the doc (e.g., lambda doc: WorkspaceWriter(doc).upsert_document(...))
+
+        Example:
+            await client.transact_workspace(graph_id, lambda doc:
+                WorkspaceWriter(doc).upsert_document(doc_id, "My Document")
+            )
+        """
+        channel = self._workspace_channels.get(graph_id)
+        if channel is None:
+            raise ValueError(f"Workspace channel not connected: {graph_id}")
+
+        # Capture state BEFORE changes
+        old_state = channel.doc.get_state()
+
+        # Execute the operation (modifies doc in place)
+        operation(channel.doc)
+
+        # Get INCREMENTAL update (diff from old state)
+        incremental_update = channel.doc.get_update(old_state)
+
+        # Only send if there are actual changes and connection is alive
+        if incremental_update and channel.ws and not channel.ws.closed:
+            await channel.ws.send_bytes(encode_sync_update(incremental_update))
+            logger.debug(
+                "Sent incremental workspace update",
+                extra_context={
+                    "graph_id": graph_id,
+                    "update_size": len(incremental_update),
+                },
+            )
 
     # -------------------------------------------------------------------------
     # Document Channel (per-document content)
@@ -423,22 +573,105 @@ class HocuspocusClient:
     ) -> None:
         """Apply a Y.js update to a document and broadcast to server.
 
+        DEPRECATED: This method has a bug - it double-applies updates when used
+        with DocumentWriter methods that already modify the doc. Use
+        transact_document() instead for proper incremental update handling.
+
         Args:
             graph_id: The graph ID
             doc_id: The document ID
             update: The Y.js update bytes
         """
+        import warnings
+
+        warnings.warn(
+            "apply_document_update is deprecated. Use transact_document() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         key = f"{graph_id}:{doc_id}"
         channel = self._document_channels.get(key)
         if channel is None:
             raise ValueError(f"Document channel not connected: {key}")
 
         # Apply locally
-        Y.apply_update(channel.doc, update)
+        channel.doc.apply_update(update)
 
         # Send to server
         if channel.ws and not channel.ws.closed:
             await channel.ws.send_bytes(encode_sync_update(update))
+
+    async def transact_document(
+        self,
+        graph_id: str,
+        doc_id: str,
+        operation: Callable[[pycrdt.Doc], None],
+    ) -> None:
+        """Execute an operation on a document and broadcast the incremental update.
+
+        This is the correct way to make collaborative edits. It:
+        1. Captures the state vector BEFORE changes
+        2. Executes your operation (which modifies the doc)
+        3. Computes the INCREMENTAL diff (not full state)
+        4. Broadcasts only the diff to other clients
+
+        Args:
+            graph_id: The graph ID
+            doc_id: The document ID
+            operation: Callable that modifies the doc (e.g., lambda doc: writer.append_block(...))
+
+        Example:
+            await client.transact_document(graph_id, doc_id, lambda doc:
+                DocumentWriter(doc).append_block("<paragraph>Hello</paragraph>")
+            )
+        """
+        key = f"{graph_id}:{doc_id}"
+        channel = self._document_channels.get(key)
+        if channel is None:
+            raise ValueError(f"Document channel not connected: {key}")
+
+        # Capture state and content BEFORE changes
+        old_state = channel.doc.get_state()
+        content_fragment = channel.doc.get("content", type=pycrdt.XmlFragment)
+        content_before = str(content_fragment)
+        logger.info(
+            "transact_document: BEFORE operation",
+            extra_context={
+                "graph_id": graph_id,
+                "doc_id": doc_id,
+                "content_before": content_before,
+            },
+        )
+
+        # Execute the operation (modifies doc in place)
+        operation(channel.doc)
+
+        # Log content AFTER changes
+        content_after = str(content_fragment)
+        logger.info(
+            "transact_document: AFTER operation",
+            extra_context={
+                "graph_id": graph_id,
+                "doc_id": doc_id,
+                "content_after": content_after,
+            },
+        )
+
+        # Get INCREMENTAL update (diff from old state)
+        incremental_update = channel.doc.get_update(old_state)
+
+        # Only send if there are actual changes and connection is alive
+        if incremental_update and channel.ws and not channel.ws.closed:
+            await channel.ws.send_bytes(encode_sync_update(incremental_update))
+            logger.info(
+                "transact_document: Sent incremental update",
+                extra_context={
+                    "graph_id": graph_id,
+                    "doc_id": doc_id,
+                    "update_size": len(incremental_update),
+                    "update_hex": incremental_update[:50].hex() if incremental_update else "",
+                },
+            )
 
     # -------------------------------------------------------------------------
     # Cleanup

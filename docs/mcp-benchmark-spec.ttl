@@ -1,0 +1,1186 @@
+@prefix : <http://mnemosyne.dev/ontology#> .
+@prefix task: <http://mnemosyne.dev/tasks#> .
+@prefix spec: <http://mnemosyne.dev/specs#> .
+@prefix concept: <http://mnemosyne.dev/concepts#> .
+@prefix metric: <http://mnemosyne.dev/metrics#> .
+@prefix artifact: <http://mnemosyne.dev/artifacts#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+################################################################################
+# Ontology Scaffolding
+################################################################################
+
+:Concept a rdfs:Class ;
+  rdfs:label "Concept" ;
+  rdfs:comment "High-level building block that describes an architectural element, capability, or guiding principle." .
+
+:TaskSpecification a rdfs:Class ;
+  rdfs:label "Task Specification" ;
+  rdfs:comment "Behavioral expectations or requirements for a concept, feature set, or subsystem." .
+
+:Task a rdfs:Class ;
+  rdfs:label "Delivery Task" ;
+  rdfs:comment "Concrete work item or milestone used in the phased implementation plan." .
+
+:Phase a rdfs:Class ;
+  rdfs:label "Delivery Phase" ;
+  rdfs:comment "Time-bounded grouping that constrains scope, risk tolerance, and KPIs for tasks and specifications." .
+
+:Status a rdfs:Class ;
+  rdfs:label "Status" ;
+  rdfs:comment "Enumerated lifecycle indicator for tasks (planned, in-progress, complete)." .
+
+:Metric a rdfs:Class ;
+  rdfs:label "Metric" ;
+  rdfs:comment "Quantitative measurement captured by the benchmark harness (latency, success rate, token usage, etc.)." .
+
+:Artifact a rdfs:Class ;
+  rdfs:label "Artifact" ;
+  rdfs:comment "Physical output such as scripts, documentation, or exported datasets produced by the benchmark." .
+
+:description a rdf:Property ;
+  rdfs:label "description" ;
+  rdfs:domain rdfs:Resource ;
+  rdfs:range rdfs:Literal .
+
+:objective a rdf:Property ;
+  rdfs:label "objective" ;
+  rdfs:domain :TaskSpecification ;
+  rdfs:range rdfs:Literal .
+
+:details a rdf:Property ;
+  rdfs:label "details" ;
+  rdfs:domain rdfs:Resource ;
+  rdfs:range rdfs:Literal .
+
+:dependsOn a rdf:Property ;
+  rdfs:label "depends on" ;
+  rdfs:domain :Task ;
+  rdfs:range :Task .
+
+:hasStatus a rdf:Property ;
+  rdfs:label "has status" ;
+  rdfs:domain :Task ;
+  rdfs:range :Status .
+
+:coversPhase a rdf:Property ;
+  rdfs:label "covers phase" ;
+  rdfs:domain :TaskSpecification ;
+  rdfs:range :Phase .
+
+:targetsConcept a rdf:Property ;
+  rdfs:label "targets concept" ;
+  rdfs:domain :TaskSpecification ;
+  rdfs:range :Concept .
+
+:producesArtifact a rdf:Property ;
+  rdfs:label "produces artifact" ;
+  rdfs:domain :TaskSpecification ;
+  rdfs:range :Artifact .
+
+:deliversSpecification a rdf:Property ;
+  rdfs:label "delivers specification" ;
+  rdfs:domain :Task ;
+  rdfs:range :TaskSpecification .
+
+:belongsToPhase a rdf:Property ;
+  rdfs:label "belongs to phase" ;
+  rdfs:domain :Task ;
+  rdfs:range :Phase .
+
+:capturesMetric a rdf:Property ;
+  rdfs:label "captures metric" ;
+  rdfs:domain :TaskSpecification ;
+  rdfs:range :Metric .
+
+:focusesOnMetric a rdf:Property ;
+  rdfs:label "focuses on metric" ;
+  rdfs:domain :Concept ;
+  rdfs:range :Metric .
+
+:phaseFocus a rdf:Property ;
+  rdfs:label "phase focus" ;
+  rdfs:domain :Concept ;
+  rdfs:range :Phase .
+
+:phaseOrder a rdf:Property ;
+  rdfs:label "phase order" ;
+  rdfs:domain :Phase ;
+  rdfs:range xsd:integer .
+
+:StatusPlanned a :Status ;
+  rdfs:label "Planned" .
+
+:StatusInProgress a :Status ;
+  rdfs:label "In Progress" .
+
+:StatusComplete a :Status ;
+  rdfs:label "Complete" .
+
+:Phase1 a :Phase ;
+  rdfs:label "Phase 1 (Baseline Harness)" ;
+  :phaseOrder 1 .
+
+:Phase1_5 a :Phase ;
+  rdfs:label "Phase 1.5 (Advanced Options)" ;
+  :phaseOrder 2 .
+
+:Phase2 a :Phase ;
+  rdfs:label "Phase 2 (True MCP Transport)" ;
+  :phaseOrder 3 .
+
+################################################################################
+# Mnemosyne MCP Benchmark & Stress Test Harness
+################################################################################
+#
+# Title: Multi‑User Benchmark and Stress Test for MCP Tool Flow
+# Version: 0.1.0
+# Date: 2025-11-13
+# Status: Design Specification
+# Source: neem (this repo) — reuses server/tool helpers
+# Scope: Phase 1 focuses narrowly on core tool flow under multi‑user load
+#        using dev mode. Everything non‑critical moves to Phase 1.5. Design
+#        remains ready to add true MCP transport benchmarking later.
+#
+# Objective:
+#   Provide a reusable harness to measure and visualize performance of the
+#   Mnemosyne MCP tool flows (submit job → stream/poll → result) under
+#   configurable, multi‑user load. Produce ephemeral visualizations and export
+#   raw metrics for deeper analysis.
+#
+# Guiding Principles (Phase 1):
+# - Faithful path: reuse the same HTTP + WebSocket helpers used by MCP tools.
+# - Single channel per user: one authenticated WebSocket for all that user’s jobs.
+# - Graceful fallback: robust HTTP polling when streaming is unavailable.
+# - Observability: structured metrics per call; concise summaries + charts.
+# - Extensibility: swappable client adapter to add true MCP later without
+#   refactoring the load engine.
+
+# Deferral Policy:
+# - Non‑critical features (failure injection, adaptive resources, complex
+#   workload patterns, dependent operation chains, token efficiency analysis)
+#   are explicitly deferred to Phase 1.5 and disabled by default.
+#
+################################################################################
+# Core Concepts
+################################################################################
+
+concept:BenchmarkHarness a :Concept ;
+  rdfs:label "Benchmark Harness" ;
+  :phaseFocus :Phase1 ;
+  :focusesOnMetric metric:Latency ,
+                   metric:SuccessRate ,
+                   metric:ErrorRate ;
+  :description "Async driver that generates configurable workloads across multiple logical users, collects per‑call metrics, and renders ephemeral visualizations at the end." .
+
+concept:ClientAdapter a :Concept ;
+  rdfs:label "Client Adapter Abstraction" ;
+  :phaseFocus :Phase1 ;
+  :description "Interface layer that executes tool flows. Phase 1 uses BackendToolClient (HTTP + WS via existing helpers). Phase 2 will add MCPClient to drive JSON‑RPC/stdio end‑to‑end." .
+
+concept:BackendToolClient a :Concept ;
+  rdfs:label "BackendToolClient" ;
+  :phaseFocus :Phase1 ;
+  :focusesOnMetric metric:Latency ,
+                   metric:BackendProcessingTime ,
+                   metric:HttpStatus ;
+  :description "Adapter that calls the same helper functions as our MCP tools (submit_job, wait_for_job_status, fetch_result) and optionally consumes RealtimeJobClient for push events." .
+
+concept:MCPClient a :Concept ;
+  rdfs:label "MCPClient (Future)" ;
+  :phaseFocus :Phase2 ;
+  :focusesOnMetric metric:TransportOverhead ,
+                   metric:Latency ;
+  :description "Adapter that shells out to neem‑mcp‑server and invokes tools via MCP JSON‑RPC/stdio, capturing transport overhead in addition to backend timings." .
+
+concept:UserModel a :Concept ;
+  rdfs:label "User Model" ;
+  :phaseFocus :Phase1 ;
+  :focusesOnMetric metric:ActiveUsers ,
+                   metric:WsHealth ;
+  :description "N logical users per run. Each user maintains one authenticated WebSocket stream and issues concurrent tool calls. Dev mode can synthesize users via MNEMOSYNE_DEV_USER_ID/TOKEN." .
+
+concept:WorkloadModel a :Concept ;
+  rdfs:label "Workload Model" ;
+  :phaseFocus :Phase1 ;
+  :focusesOnMetric metric:Throughput ,
+                   metric:Concurrency ;
+  :description "Weighted mix of tool actions executed by async workers with optional per‑worker RPS pacing and a global in‑flight concurrency limit." .
+
+concept:WorkloadPatterns a :Concept ;
+  rdfs:label "Workload Patterns (Phase 1.5)" ;
+  :phaseFocus :Phase1_5 ;
+  :focusesOnMetric metric:PatternStability ;
+  :description """Deferred. Phase 1 runs a steady, weighted mix only. Additional patterns (burst, ramp, diurnal, dependent chains) are introduced in Phase 1.5 as optional schedulers not used in baselines.""" .
+
+concept:DependentOperations a :Concept ;
+  rdfs:label "Dependent Operations (Phase 1.5)" ;
+  :phaseFocus :Phase1_5 ;
+  :focusesOnMetric metric:PatternStability ;
+  :description "Deferred. Chain create/query/update/delete sequences are valuable for realism but not required to answer ‘does this work?’ under load." .
+
+concept:StreamingIntegration a :Concept ;
+  rdfs:label "WebSocket Streaming Integration" ;
+  :phaseFocus :Phase1 ;
+  :focusesOnMetric metric:TTFB ;
+  :description "Use one RealtimeJobClient per user. Wait for terminal status via per‑user stream; record time‑to‑first‑event (TTFB) when available; fall back to HTTP polling when necessary." .
+
+concept:PollingFallback a :Concept ;
+  rdfs:label "Polling Fallback" ;
+  :phaseFocus :Phase1 ;
+  :focusesOnMetric metric:PollAttempts ,
+                   metric:Latency ;
+  :description "HTTP status polling with configurable wait_ms; used when streaming is unavailable or times out." .
+
+concept:MetricsModel a :Concept ;
+  rdfs:label "Metrics Model" ;
+  :phaseFocus :Phase1 ;
+  :focusesOnMetric metric:Latency ,
+                   metric:BackendProcessingTime ,
+                   metric:TTFB ,
+                   metric:PollAttempts ,
+                   metric:HttpStatus ;
+  :description "Per‑call record capturing tool, user_id, start/end, latency_ms, ok/error, backend_status, backend_processing_time_ms, ttfb_ms (if WS), path=stream|poll, poll_attempts, http_status, and token efficiency metrics (request_tokens, response_raw_tokens, response_filtered_tokens, token_reduction_percent, response_bytes)." .
+
+concept:TokenMetrics a :Concept ;
+  rdfs:label "Token Efficiency Metrics" ;
+  :phaseFocus :Phase1_5 ;
+  :focusesOnMetric metric:RequestTokens ,
+                   metric:ResponseRawTokens ,
+                   metric:ResponseFilteredTokens ,
+                   metric:TokenReductionPercent ,
+                   metric:ResponseBytes ;
+  :description "Token usage tracking per tool call to measure data efficiency and bandwidth optimization. Captures request_tokens (estimated from request payload), response_raw_tokens (full backend response), response_filtered_tokens (after MCP tool filtering/transformation), token_reduction_percent (efficiency gain from filtering), and response_bytes (actual network payload size). Enables analysis of token overhead, compression ratios, and data transfer efficiency across different tools and query types." .
+
+concept:Visualization a :Concept ;
+  rdfs:label "Visualization" ;
+  :phaseFocus :Phase1 ;
+  :focusesOnMetric metric:P50Latency ,
+                   metric:P95Latency ,
+                   metric:P99Latency ,
+                   metric:SuccessRate ,
+                   metric:ErrorRate ;
+  :description "Ephemeral Matplotlib charts: per‑tool latency histograms, time‑series scatter, and optional CDF. Summaries show p50/p95/p99, success/error counts." .
+
+concept:DataExport a :Concept ;
+  rdfs:label "Data Export" ;
+  :phaseFocus :Phase1 ;
+  :focusesOnMetric metric:ExportVolume ,
+                   metric:Latency ;
+  :description "Optional JSON and NDJSON outputs of raw call records for offline analysis and dashboard ingestion." .
+
+concept:ErrorModel a :Concept ;
+  rdfs:label "Error Categorization" ;
+  :phaseFocus :Phase1 ;
+  :focusesOnMetric metric:ErrorRate ,
+                   metric:HttpStatus ;
+  :description "Classify failures as http_4xx, http_5xx, timeout, ws_unavailable, auth_missing, unknown; no automatic retries by default." .
+
+concept:FailureInjection a :Concept ;
+  rdfs:label "Failure Injection (Phase 1.5)" ;
+  :phaseFocus :Phase1_5 ;
+  :focusesOnMetric metric:ErrorRate ,
+                   metric:RecoveryTime ,
+                   metric:FallbackActivations ;
+  :description "Deferred. Useful for resilience testing; excluded from Phase 1 baselines to keep comparability and a clear ‘does this work?’ answer." .
+
+concept:Observability a :Concept ;
+  rdfs:label "Observability" ;
+  :phaseFocus :Phase1 ;
+  :focusesOnMetric metric:ProgressHealth ,
+                   metric:ErrorRate ;
+  :description "Log harness configuration (without secrets), periodic progress lines, and final summaries; avoid verbose per‑call logging by default." .
+
+concept:ResourceLimits a :Concept ;
+  rdfs:label "Resource Limits" ;
+  :phaseFocus :Phase1 ;
+  :focusesOnMetric metric:ResourcePressure ,
+                   metric:Concurrency ;
+  :description "Bound WS cache (TTL, size), global concurrency, and polling cadence to avoid overload and OOM during tests." .
+
+concept:AdaptiveResourceManagement a :Concept ;
+  rdfs:label "Adaptive Resource Management (Phase 1.5)" ;
+  :description "Deferred. Phase 1 uses static WS cache and fixed polling wait_ms to keep measurements stable and repeatable." ;
+  :phaseFocus :Phase1_5 ;
+  :focusesOnMetric metric:ResourcePressure ,
+                   metric:ErrorRate ;
+  :features """
+- Dynamic cache size adjustment based on eviction rates
+- Adaptive polling intervals based on error rates
+- Automatic resource scaling during benchmark runs
+- Feedback loops for resource optimization
+""" ;
+  :adjustmentAlgorithms """
+  Cache Management:
+- Cache eviction rate >10%: increase cache size by 50%
+- Cache eviction rate <1%: decrease cache size by 20%
+- Minimum cache size: --cache-min (default: 10)
+- Maximum cache size: --cache-max (default: 10000)
+
+Polling Interval Adjustment:
+- Error rate >20%: double polling interval (exponential backoff)
+- Error rate <5%: decrease polling interval by 20% (optimize latency)
+- Minimum polling interval: 100ms (hardcoded safety limit)
+- Maximum polling interval: 30000ms (30s, hardcoded safety limit)
+
+Evaluation Window:
+- Metrics evaluated every 10 completed requests per user
+- Rolling window of last 100 requests for rate calculations
+- Adjustments applied gradually to avoid oscillation
+""" ;
+  :feedbackLoop """
+1. Collect metrics: cache hits/misses, evictions, error rates, latencies
+2. Compute rates: eviction_rate = evictions / (hits + misses), error_rate = errors / total
+3. Apply thresholds: compare against configured bounds
+4. Adjust resources: modify cache_size and wait_ms per adjustment algorithms
+5. Log adjustments: record all resource changes to metrics output
+6. Repeat: continuous monitoring throughout benchmark run
+""" .
+
+concept:Extensibility a :Concept ;
+  rdfs:label "Extensibility" ;
+  :phaseFocus :Phase2 ;
+  :focusesOnMetric metric:TransportOverhead ;
+  :description "Clean ClientAdapter boundary enables adding true MCP transport benchmarking later with minimal changes to orchestrator, workload, and metrics." .
+
+################################################################################
+# File Layout (Planned)
+################################################################################
+
+concept:FileLayout a :Concept ;
+  rdfs:label "File Layout" ;
+  :phaseFocus :Phase1 ;
+  :description """
+scripts/bench_mcp.py           # CLI entry for the benchmark harness (Phase 1)
+docs/mcp-benchmark-spec.ttl    # This specification
+tests/test_bench_ws_poll.py    # Simulated WS + polling integration tests (later)
+""" .
+
+################################################################################
+# Metrics Catalog
+################################################################################
+
+metric:Latency a :Metric ;
+  rdfs:label "End-to-End Latency" ;
+  :description "Wall-clock duration between tool submission and terminal completion (ms)." ;
+  :details "Primary KPI; computed per call and aggregated across percentiles for each tool and mix." .
+
+metric:BackendProcessingTime a :Metric ;
+  rdfs:label "Backend Processing Time" ;
+  :description "Duration reported by backend jobs exclusive of client/transport overhead." ;
+  :details "Extracted from job status payload; consumes server-provided `processing_ms` when available." .
+
+metric:TTFB a :Metric ;
+  rdfs:label "Time to First Byte/Event" ;
+  :description "Elapsed time from submission to first WebSocket event arrival." ;
+  :details "Captured only when streaming is enabled and at least one realtime event arrives before terminal state." .
+
+metric:HttpStatus a :Metric ;
+  rdfs:label "HTTP Status Code" ;
+  :description "Status code observed on submission/polling APIs." ;
+  :details "Used to power the Error Model and categorize 4xx vs 5xx responses for post-run triage." .
+
+metric:SuccessRate a :Metric ;
+  rdfs:label "Success Rate" ;
+  :description "Percentage of tool calls completing with backend_status == succeeded." ;
+  :details "Calculated per tool and overall using counts of ok vs error outcomes." .
+
+metric:ErrorRate a :Metric ;
+  rdfs:label "Error Rate" ;
+  :description "Percentage of calls classified into error categories (http_4xx, timeout, etc.)." ;
+  :details "Derived from the Error Model taxonomy; complements Success Rate for resilience tracking." .
+
+metric:P50Latency a :Metric ;
+  rdfs:label "P50 Latency" ;
+  :description "Median latency per tool/mix." ;
+  :details "Rendered in summaries and histogram annotations." .
+
+metric:P95Latency a :Metric ;
+  rdfs:label "P95 Latency" ;
+  :description "95th percentile latency per tool/mix." ;
+  :details "Highlights tail amplification during heavier load phases." .
+
+metric:P99Latency a :Metric ;
+  rdfs:label "P99 Latency" ;
+  :description "99th percentile latency per tool/mix." ;
+  :details "Used to guard against pathological spikes and define acceptance thresholds." .
+
+metric:Throughput a :Metric ;
+  rdfs:label "Throughput (RPS)" ;
+  :description "Effective requests per second achieved by the harness." ;
+  :details "Computed from completed calls divided by elapsed run time; compared against target RPS inputs." .
+
+metric:Concurrency a :Metric ;
+  rdfs:label "In-Flight Concurrency" ;
+  :description "Number of concurrent tool calls allowed by the global semaphore." ;
+  :details "Logged for guardrail checks and to validate worker pacing." .
+
+metric:ActiveUsers a :Metric ;
+  rdfs:label "Active Users" ;
+  :description "Count of logical users connected (WS+auth) at any time." ;
+  :details "Ensures MNEMOSYNE_DEV_USER allocations are respected and isolates per-user reporting." .
+
+metric:WsHealth a :Metric ;
+  rdfs:label "WebSocket Health" ;
+  :description "Status of per-user RealtimeJobClient connections." ;
+  :details "Tracks reconnects, drops, and average uptime for streaming reliability." .
+
+metric:ProgressHealth a :Metric ;
+  rdfs:label "Progress Heartbeat" ;
+  :description "Periodic progress snapshot combining throughput, latency, and error rate." ;
+  :details "Surfaced every ~5s to show live state during long runs." .
+
+metric:PollAttempts a :Metric ;
+  rdfs:label "Poll Attempts" ;
+  :description "Number of HTTP poll retries per job when streaming is unavailable." ;
+  :details "Used to tune wait_ms defaults and keep backend load predictable." .
+
+metric:ExportVolume a :Metric ;
+  rdfs:label "Export Volume" ;
+  :description "Number of records written to JSON/NDJSON artifacts." ;
+  :details "Guards against truncated exports and validates ≥10k record requirement." .
+
+metric:ResourcePressure a :Metric ;
+  rdfs:label "Resource Pressure" ;
+  :description "Composite score capturing WS cache utilization, memory footprint, and CPU saturation." ;
+  :details "Used to justify guardrail defaults and future adaptive management." .
+
+metric:RecoveryTime a :Metric ;
+  rdfs:label "Recovery Time" ;
+  :description "Time between injected failure onset and successful recovery." ;
+  :details "Key KPI for resilience scenarios in failure injection mode." .
+
+metric:FallbackActivations a :Metric ;
+  rdfs:label "Fallback Activations" ;
+  :description "Count of stream→poll fallbacks triggered per run." ;
+  :details "Ensures HTTP polling fallback remains healthy when WS is unstable." .
+
+metric:RequestTokens a :Metric ;
+  rdfs:label "Request Tokens" ;
+  :description "Estimated tokens contained in request payloads." ;
+  :details "Uses 4 chars/token heuristic until Phase 2 introduces precise tokenizers." .
+
+metric:ResponseRawTokens a :Metric ;
+  rdfs:label "Response Raw Tokens" ;
+  :description "Estimated tokens in backend responses before MCP filtering." ;
+  :details "Supports compression ratios and tool efficiency calculations." .
+
+metric:ResponseFilteredTokens a :Metric ;
+  rdfs:label "Response Filtered Tokens" ;
+  :description "Estimated tokens after MCP filtering/transformation." ;
+  :details "Shows delivered payload size and relative savings." .
+
+metric:TokenReductionPercent a :Metric ;
+  rdfs:label "Token Reduction Percent" ;
+  :description "Percentage delta between raw and filtered token counts." ;
+  :details "Positive values indicate useful filtering; negative indicates amplification." .
+
+metric:ResponseBytes a :Metric ;
+  rdfs:label "Response Bytes" ;
+  :description "Actual serialized response size (bytes)." ;
+  :details "Used for bandwidth and storage planning." .
+
+metric:TransportOverhead a :Metric ;
+  rdfs:label "Transport Overhead" ;
+  :description "Additional latency introduced by MCP transport relative to backend-only adapter." ;
+  :details "Captured in Phase 2 when comparing MCPClient vs BackendToolClient." .
+
+metric:PatternStability a :Metric ;
+  rdfs:label "Pattern Stability" ;
+  :description "Variance of achieved vs scheduled request rates for advanced workload patterns." ;
+  :details "Ensures optional pattern scheduler behaves predictably (Phase 1.5+)." .
+
+################################################################################
+# Artifacts
+################################################################################
+
+artifact:bench_script a :Artifact ;
+  rdfs:label "Benchmark CLI Script" ;
+  :description "Executable entrypoint (scripts/bench_mcp.py) that runs the harness." .
+
+artifact:visual_report a :Artifact ;
+  rdfs:label "Ephemeral Visual Report" ;
+  :description "Matplotlib figures summarizing latency histograms, scatter plots, and optional CDFs." .
+
+artifact:metrics_export a :Artifact ;
+  rdfs:label "Metrics Export" ;
+  :description "JSON/NDJSON outputs capturing raw per-call measurements." .
+
+artifact:run_log a :Artifact ;
+  rdfs:label "Run Log" ;
+  :description "Structured log stream containing config, heartbeats, and shutdown notes." .
+
+artifact:baseline_recipe a :Artifact ;
+  rdfs:label "Baseline Recipe" ;
+  :description "Documented combination of flags/envs representing the canonical Phase 1 workload." .
+
+artifact:failure_report a :Artifact ;
+  rdfs:label "Failure Injection Report" ;
+  :description "Narrative + metrics export highlighting recovery paths during chaos runs." .
+
+artifact:acceptance_report a :Artifact ;
+  rdfs:label "Acceptance Report" ;
+  :description "Checklist demonstrating that Phase 1 acceptance criteria were met." .
+
+artifact:usage_snippets a :Artifact ;
+  rdfs:label "Usage Snippets" ;
+  :description "Copy/paste ready CLI invocations for common scenarios." .
+
+artifact:validation_plan a :Artifact ;
+  rdfs:label "Validation Plan" ;
+  :description "Test cases and scripted checks that verify WS, polling, and export behavior." .
+
+artifact:mcp_trace a :Artifact ;
+  rdfs:label "MCP Trace Dataset" ;
+  :description "Telemetry captured from neem-mcp-server stdio sessions for Phase 2 transport benchmarking." .
+################################################################################
+# CLI & Configuration
+################################################################################
+
+spec:bench-cli a :TaskSpecification ;
+  rdfs:label "Benchmark CLI" ;
+  :objective "Provide ergonomic flags to shape load, user count, transport mode, and outputs." ;
+  :coversPhase :Phase1 ;
+  :targetsConcept concept:BenchmarkHarness ,
+                  concept:ClientAdapter ,
+                  concept:Visualization ,
+                  concept:DataExport ;
+  :producesArtifact artifact:bench_script ;
+  :capturesMetric metric:Latency ,
+                  metric:SuccessRate ;
+  :details """
+Flags (Phase 1 – Baseline):
+- --duration <sec>           # total run time
+- --users <N>                # logical users (1..N)
+- --concurrency <N>          # max in‑flight across all users
+- --workers <N>              # load‑generating coroutines per user
+- --rps <float>              # target requests/sec per worker (0 = unpaced)
+- --mix "list_graphs:0.8,query_graph:0.2"
+- --sparql "SELECT ..."      # for query_graph
+- --no-ws                    # force HTTP polling
+- --wait-ms <int>            # polling wait_ms
+- --ws-ttl <sec>             # WS cache TTL per user
+- --ws-cache-size <N>        # WS cache size per user
+- --visualize                # show Matplotlib charts
+- --output results.json      # JSON array of call records
+- --ndjson results.ndjson    # NDJSON stream of call records
+- --log-level INFO|DEBUG
+Flags (Phase 1.5 – Optional/Off by default):
+- --inject-failures <mode>   # network_flaky|ws_disconnect|auth_expire|backend_slow|backend_error|mixed
+- --failure-rate <percent>   # % of requests affected (default: 10)
+- --failure-duration <sec>   # duration of each failure event (default: 5)
+- --pattern <type>           # workload pattern: steady|burst|ramp|diurnal|dependent (default: steady)
+- --chain-depth <N>          # depth for dependent chains (default: 4)
+- --adaptive-resources       # enable dynamic cache/poll tuning
+- --cache-min <N>            # min cache size (default: 10)
+- --cache-max <N>            # max cache size (default: 10000)
+- --adaptive-threshold <float> # sensitivity (0.0-1.0, default: 0.5)
+- --inject-failures <mode>   # failure injection mode: network_flaky, ws_disconnect, auth_expire, backend_slow, backend_error, or mixed
+- --failure-rate <percent>   # percentage of requests to inject failures (0-100, default: 10)
+- --failure-duration <sec>   # duration of each failure event in seconds (default: 5)
+- --pattern <type>           # workload pattern: steady|burst|ramp|diurnal|dependent (default: steady)
+- --chain-depth <N>          # depth of dependent operation chains (default: 4, used with --pattern dependent)
+- --adaptive-resources       # enable adaptive resource management (dynamic cache/polling adjustment)
+- --cache-min <N>            # minimum cache size for adaptive scaling (default: 10)
+- --cache-max <N>            # maximum cache size for adaptive scaling (default: 10000)
+- --adaptive-threshold <float> # sensitivity threshold for adaptive adjustments (0.0-1.0, default: 0.5)
+
+Environment:
+- Backends resolved via existing resolve_backend_config()
+- Auth via validate_token_and_load(); dev mode via MNEMOSYNE_DEV_USER_ID/TOKEN
+""" .
+
+################################################################################
+# Specifications (Behavior)
+################################################################################
+
+spec:backend-adapter a :TaskSpecification ;
+  rdfs:label "BackendToolClient Adapter" ;
+  :objective "Execute tool flows using existing helpers and optional per‑user RealtimeJobClient." ;
+  :coversPhase :Phase1 ;
+  :targetsConcept concept:BackendToolClient ,
+                  concept:StreamingIntegration ,
+                  concept:PollingFallback ,
+                  concept:MetricsModel ;
+  :capturesMetric metric:Latency ,
+                  metric:BackendProcessingTime ,
+                  metric:TTFB ,
+                  metric:HttpStatus ;
+  :details """
+Operations:
+- list_graphs: submit_job(type=list_graphs) → (stream to terminal | poll) → optional fetch_result
+- query_graph: POST /graphs/query → (stream to terminal | poll /graphs/jobs/{id})
+
+Metrics captured per call (Phase 1):
+- latency_ms (submit → terminal)
+- backend_processing_time_ms (from status payload when present)
+- ttfb_ms (first WS event arrival) when WS enabled
+- path (stream|poll), poll_attempts
+- ok/error, backend_status, http_status
+""" .
+
+spec:metrics-schema a :TaskSpecification ;
+  rdfs:label "Metrics Schema & Export Contract" ;
+  :objective "Define the canonical JSON/NDJSON schema for per-call metrics and summaries." ;
+  :coversPhase :Phase1 ;
+  :targetsConcept concept:MetricsModel ,
+                  concept:DataExport ;
+  :capturesMetric metric:Latency ,
+                  metric:BackendProcessingTime ,
+                  metric:TTFB ,
+                  metric:SuccessRate ,
+                  metric:ErrorRate ,
+                  metric:PollAttempts ,
+                  metric:ExportVolume ;
+  :producesArtifact artifact:metrics_export ;
+  :details """
+Export schema:
+- job_id (str)
+- tool (enum: list_graphs|query_graph|...)
+- user_id (str, redacted hash when anonymized)
+- start_ts / end_ts (ISO timestamps)
+- latency_ms (float)
+- backend_processing_time_ms (float|null)
+- ttfb_ms (float|null)
+- path (stream|poll)
+- poll_attempts (int)
+- backend_status (str)
+- http_status (int)
+- error_category (enum from ErrorModel)
+- request_tokens / response_raw_tokens / response_filtered_tokens / token_reduction_percent / response_bytes (nullable until Phase 1.5)
+
+Serialization rules:
+- JSON array for --output
+- NDJSON lines for --ndjson
+- UTF-8 encoded, newline-delimited, no BOM
+- Schema version header injected as first record when NDJSON is used
+""" .
+
+spec:ttfb-definition a :TaskSpecification ;
+  rdfs:label "TTFB Measurement" ;
+  :objective "Define TTFB measurement without server-stamped timestamps." ;
+  :coversPhase :Phase1 ;
+  :targetsConcept concept:StreamingIntegration ;
+  :capturesMetric metric:TTFB ;
+  :details """
+TTFB is measured as wall-clock time from submit start to arrival of the first
+WebSocket event at the client (arrival time recorded on receipt). If no events
+arrive before terminal, TTFB is omitted.
+""" .
+
+spec:token-efficiency-tracking a :TaskSpecification ;
+  rdfs:label "Token Efficiency Tracking (Phase 1.5)" ;
+  :objective "Deferred. Implement optional token metrics after baseline latency benchmarking is complete." ;
+  :coversPhase :Phase1_5 ;
+  :targetsConcept concept:TokenMetrics ;
+  :capturesMetric metric:RequestTokens ,
+                  metric:ResponseRawTokens ,
+                  metric:ResponseFilteredTokens ,
+                  metric:TokenReductionPercent ,
+                  metric:ResponseBytes ;
+  :details """
+Token Metrics (deferred):
+
+1. request_tokens (integer):
+   - Estimated tokens in the request payload sent to backend
+   - Includes SPARQL query, parameters, headers, and metadata
+   - Estimation: payload_size_bytes / 4 (1 token ≈ 4 characters)
+   - Measured before network transmission
+
+2. response_raw_tokens (integer):
+   - Estimated tokens in the raw response from backend
+   - Full unfiltered response including all triples, metadata, timestamps
+   - Estimation: raw_response_bytes / 4
+   - Measured after backend processing, before MCP tool filtering
+
+3. response_filtered_tokens (integer):
+   - Estimated tokens after MCP tool filtering/transformation
+   - Only data returned to the MCP client (filtered results)
+   - Estimation: filtered_response_bytes / 4
+   - Measured after tool processing, before JSON-RPC serialization
+
+4. token_reduction_percent (float):
+   - Percentage reduction from filtering: ((raw - filtered) / raw) × 100
+   - Positive value indicates efficient filtering
+   - Zero or negative indicates no filtering benefit
+   - Key metric for evaluating tool transformation effectiveness
+
+5. response_bytes (integer):
+   - Actual network payload size in bytes
+   - Final serialized response size sent over the wire
+   - Used for bandwidth analysis and cost estimation
+
+Token Estimation Methodology:
+- Heuristic: 1 token ≈ 4 characters (OpenAI standard approximation)
+- Applied consistently across request/response for fair comparison
+- Character count includes whitespace, punctuation, and control characters
+- UTF-8 encoding assumed; multi-byte characters count by byte size
+- More precise tokenization (tiktoken) deferred to Phase 2 for performance
+
+Comparison Analysis:
+- Raw vs Filtered: measures filtering effectiveness per tool
+- Request vs Response: measures data amplification/reduction
+- Per-tool aggregation: identifies tools with high token overhead
+- Time-series analysis: tracks efficiency trends under load
+
+Integration:
+- When enabled, add token fields to per-call metrics and exports; disabled by default.
+
+Implementation Notes:
+- Use size-only mode for large responses to avoid excessive memory.
+
+Use Cases:
+- Identify tools that benefit most from response filtering
+- Quantify bandwidth savings from MCP tool layer
+- Detect inefficient queries generating excessive response data
+- Compare token efficiency across different SPARQL query patterns
+- Estimate cost implications for token-based billing scenarios
+""" .
+
+spec:workload-generator a :TaskSpecification ;
+  rdfs:label "Workload Generator" ;
+  :objective "Generate weighted mixes with optional RPS pacing and global concurrency limits across users." ;
+  :coversPhase :Phase1 ;
+  :targetsConcept concept:WorkloadModel ,
+                  concept:ResourceLimits ,
+                  concept:UserModel ;
+  :capturesMetric metric:Throughput ,
+                  metric:Concurrency ;
+  :details """
+Model:
+- Duration‑based run
+- Global semaphore for in‑flight limit
+- Per‑user workers: choose next tool by weighted choice; honor pacing if RPS > 0
+- Closed‑loop scheduling per worker (sleep until next slot)
+""" .
+
+spec:multi-user a :TaskSpecification ;
+  rdfs:label "Multi‑User Model" ;
+  :objective "Maintain one WS client per user; isolate event streams; support synthetic dev users for parallelism." ;
+  :coversPhase :Phase1 ;
+  :targetsConcept concept:UserModel ,
+                  concept:StreamingIntegration ;
+  :capturesMetric metric:ActiveUsers ,
+                  metric:WsHealth ;
+  :details """
+UserContext fields:
+- user_id, token
+- job_stream (RealtimeJobClient) with cache_ttl_seconds and cache_max_size
+- adapter (BackendToolClient)
+""" .
+
+spec:metrics-visuals a :TaskSpecification ;
+  rdfs:label "Metrics + Visualizations" ;
+  :objective "Aggregate per‑tool latency distributions and show summaries + charts." ;
+  :coversPhase :Phase1 ;
+  :targetsConcept concept:Visualization ,
+                  concept:MetricsModel ,
+                  concept:DataExport ;
+  :producesArtifact artifact:visual_report ,
+                    artifact:metrics_export ;
+  :capturesMetric metric:P50Latency ,
+                  metric:P95Latency ,
+                  metric:P99Latency ,
+                  metric:SuccessRate ,
+                  metric:ErrorRate ;
+  :details """
+Summaries:
+- p50/p95/p99 latency per tool
+- success/error counts per tool
+
+Visuals:
+- Per‑tool latency histogram
+- Per‑tool latency over time (scatter)
+- Optional CDF per tool (Phase 1.5)
+""" .
+
+spec:validation-suite a :TaskSpecification ;
+  rdfs:label "Validation & Smoke Suite" ;
+  :objective "Provide scripted checks that ensure streaming, polling, and exports remain healthy." ;
+  :coversPhase :Phase1 ;
+  :targetsConcept concept:Observability ,
+                  concept:StreamingIntegration ,
+                  concept:PollingFallback ,
+                  concept:DataExport ;
+  :producesArtifact artifact:validation_plan ,
+                    artifact:run_log ;
+  :capturesMetric metric:WsHealth ,
+                  metric:PollAttempts ,
+                  metric:SuccessRate ,
+                  metric:ExportVolume ;
+  :details """
+Checks:
+- WS happy path: simulate list_graphs with realtime events, ensuring TTFB recorded
+- Poll-only fallback: run with --no-ws and verify poll_attempts stays within expected bounds
+- Export integrity: run 100 calls and confirm JSON + NDJSON produce identical record counts/hashes
+- RPS pacing sanity: with --rps > 0 confirm measured throughput tracks the configured value within ±10%
+- Graceful shutdown: send SIGINT and ensure run_log flushes last heartbeat
+
+Execution:
+- Implemented as pytest module (tests/test_bench_ws_poll.py) with uv loop fixtures
+- Runs in CI with mocked backend endpoints; no real cluster dependency
+""" .
+
+spec:observability-safety a :TaskSpecification ;
+  rdfs:label "Observability & Safety" ;
+  :objective "Provide progress heartbeat, clean shutdown, and guardrails against overload." ;
+  :coversPhase :Phase1 ;
+  :targetsConcept concept:Observability ,
+                  concept:ResourceLimits ;
+  :capturesMetric metric:ErrorRate ,
+                  metric:ProgressHealth ;
+  :producesArtifact artifact:run_log ;
+  :details """
+Behaviors:
+- Progress log every ~5s: started/finished, error rate, current p50
+- SIGINT/SIGTERM: cancel workers, close streams, flush results
+- Guardrails: static defaults for wait_ms and WS cache in Phase 1; tuning flags available but unchanged mid‑run
+
+spec:baseline-profile a :TaskSpecification ;
+  rdfs:label "Baseline Profile (Phase 1)" ;
+  :objective "Define the canonical test conditions to answer ‘does this work?’" ;
+  :coversPhase :Phase1 ;
+  :targetsConcept concept:BenchmarkHarness ,
+                  concept:UserModel ,
+                  concept:WorkloadModel ,
+                  concept:StreamingIntegration ;
+  :capturesMetric metric:Latency ,
+                  metric:TTFB ,
+                  metric:SuccessRate ;
+  :producesArtifact artifact:baseline_recipe ;
+  :details """
+Defaults:
+- Users: N (1..X) via dev mode (MNEMOSYNE_DEV_USER_ID/TOKEN), one WS stream per user
+- Tools: list_graphs + query_graph only
+- Scheduling: steady weighted mix, fixed RPS (or unpaced), fixed global concurrency
+- Transport: WS enabled with HTTP polling fallback
+- WS cache: static size/TTL for entire run
+- Polling: fixed wait_ms
+- Metrics: latency, backend_processing_time_ms, TTFB, path, outcome
+- Visuals: latency histogram + scatter
+Excluded:
+- Failure injection, adaptive resources, dependent chains, token metrics
+""" .
+""" .
+
+spec:reporting-flow a :TaskSpecification ;
+  rdfs:label "Reporting Flow" ;
+  :objective "Describe how raw metrics turn into summaries, charts, and decision-ready artifacts." ;
+  :coversPhase :Phase1 ;
+  :targetsConcept concept:Visualization ,
+                  concept:DataExport ,
+                  concept:Observability ;
+  :capturesMetric metric:P50Latency ,
+                  metric:P95Latency ,
+                  metric:P99Latency ,
+                  metric:SuccessRate ,
+                  metric:ErrorRate ;
+  :producesArtifact artifact:visual_report ,
+                    artifact:acceptance_report ,
+                    artifact:failure_report ;
+  :details """
+Workflow:
+1. Harness run completes with --visualize/--output flags enabled
+2. Summaries (p50/p95/p99, success/error counts) logged to stdout and appended to acceptance report
+3. Matplotlib renders histograms + scatter to the screen; optional save-as PNG hook planned for later
+4. When --inject-failures is active, annotate plots with failure windows and include recovery commentary
+5. Export JSON/NDJSON zipped with run metadata for auditing; include git SHA + backend config hash
+6. For long-running experiments, tail-run_data.md collects highlights for PHASE1_RESULTS.md
+""" .
+
+spec:failure-injection-testing a :TaskSpecification ;
+  rdfs:label "Failure Injection Testing" ;
+  :objective "Enable controlled failure injection to test resilience, recovery behavior, and system stability under degraded conditions." ;
+  :coversPhase :Phase1_5 ;
+  :targetsConcept concept:FailureInjection ,
+                  concept:Observability ,
+                  concept:MetricsModel ;
+  :capturesMetric metric:ErrorRate ,
+                  metric:RecoveryTime ,
+                  metric:FallbackActivations ;
+  :producesArtifact artifact:failure_report ;
+  :details """
+Failure Injection Modes:
+
+1. network_flaky:
+   - Simulates unreliable network conditions
+   - Randomly injects packet loss (5-20% of packets)
+   - Adds artificial network delays (50-500ms)
+   - Implementation: wrap HTTP client with delay/timeout injector
+   - Triggers: applied at socket/connection level
+
+2. ws_disconnect:
+   - Forces WebSocket connection drops mid-stream
+   - Simulates infrastructure failures, load balancer resets, NAT timeouts
+   - Implementation: close WebSocket connection during job streaming
+   - Expected behavior: system should fallback to HTTP polling
+   - Metrics: measure fallback latency, polling overhead, recovery success rate
+
+3. auth_expire:
+   - Simulates token expiration during active requests
+   - Implementation: temporarily return 401 responses for affected requests
+   - Expected behavior: graceful error handling, clear error categorization
+   - Metrics: track auth failure rate, retry behavior if implemented
+
+4. backend_slow:
+   - Injects artificial processing delays in backend responses
+   - Simulates database contention, heavy computational load
+   - Implementation: add configurable delay (100ms-5s) before responding
+   - Metrics: measure impact on p95/p99 latencies, timeout rates
+
+5. backend_error:
+   - Returns random 5xx errors (500, 502, 503, 504)
+   - Simulates backend service degradation
+   - Implementation: intercept responses and replace with error status
+   - Metrics: track error rates, cascading failure prevention
+
+6. mixed:
+   - Randomly selects from all failure modes
+   - Provides realistic chaos testing scenario
+   - Distribution: weighted by operational likelihood
+
+Triggering Mechanism:
+- Failures triggered based on --failure-rate percentage
+- Per-request decision: random.random() < (failure_rate / 100)
+- Duration controls how long each failure event persists
+- Deterministic seed option for reproducible chaos tests
+
+Metrics During Failure Scenarios:
+- Standard metrics (latency, success/error) segmented by:
+  * failure_injected: bool (was this request affected)
+  * failure_mode: str (which mode was active)
+  * recovery_path: str (stream→poll fallback, retry, abort)
+- Additional resilience metrics:
+  * recovery_time_ms: time from failure injection to successful completion
+  * fallback_activated: bool (did WS→HTTP fallback occur)
+  * cascade_detected: bool (did failure cause downstream failures)
+
+Safety Mechanisms:
+- Maximum failure rate capped at 50% to maintain partial system availability
+- Failures never injected during benchmark initialization or shutdown
+- Circuit breaker pattern: disable failure injection if error rate > 80%
+- Per-user failure isolation: failures to one user don't cascade to others
+- Graceful degradation: failed requests still contribute to metrics
+- Emergency stop: SIGTERM during failure test immediately disables injection
+
+Visualization Enhancements:
+- Failure periods marked on time-series charts
+- Separate histograms for clean vs. failure-affected requests
+- Recovery time distribution charts
+- Before/after comparison when --inject-failures is used
+
+Implementation Notes:
+- Failure injection layer sits between workload generator and client adapter
+- Uses async context managers for deterministic cleanup
+- Failures logged with structured context for post-mortem analysis
+- Compatible with both BackendToolClient and future MCPClient adapters
+""" .
+
+spec:advanced-patterns a :TaskSpecification ;
+  rdfs:label "Advanced Workload Patterns" ;
+  :objective "Introduce optional burst/ramp/diurnal/dependent-chain schedulers for Phase 1.5 experiments." ;
+  :coversPhase :Phase1_5 ;
+  :targetsConcept concept:WorkloadPatterns ,
+                  concept:DependentOperations ,
+                  concept:WorkloadModel ;
+  :capturesMetric metric:Throughput ,
+                  metric:PatternStability ,
+                  metric:Latency ;
+  :producesArtifact artifact:baseline_recipe ;
+  :details """
+Capabilities:
+- --pattern burst: alternating high/low RPS windows with configurable duty cycle
+- --pattern ramp: linear ramp from min_rps to max_rps across duration
+- --pattern diurnal: sine-wave RPS modulation (24h normalized)
+- --pattern dependent: executes chain-depth sized sequences with state hand-off between steps
+
+Controls:
+- --pattern-mode disabled (default Phase 1), optional Phase 1.5 flag to engage scheduler
+- Deterministic RNG seeds for reproducible mixes
+- Back-pressure integration: scheduler consults global semaphore before dispatching next op
+""" .
+
+spec:adaptive-resources a :TaskSpecification ;
+  rdfs:label "Adaptive Resource Management Spec" ;
+  :objective "Define how dynamic cache sizing and polling adjustments behave when the optional --adaptive-resources flag is enabled." ;
+  :coversPhase :Phase1_5 ;
+  :targetsConcept concept:AdaptiveResourceManagement ,
+                  concept:ResourceLimits ;
+  :capturesMetric metric:ResourcePressure ,
+                  metric:ErrorRate ,
+                  metric:PollAttempts ;
+  :producesArtifact artifact:run_log ;
+  :details """
+Modes:
+- Cache auto-sizing honors --cache-min/--cache-max bounds with additive increase, multiplicative decrease tuning
+- Poll interval auto-tuning uses thresholds derived from error_rate window (10/100 requests) and clamps within safety limits
+
+Logging:
+- Every adjustment emits JSON log line: {"component": "adaptive", "resource": "cache_size", "old": 100, "new": 150, "reason": "eviction_rate>0.1"}
+- Run summaries include number of adjustments and final steady-state values
+
+Safety:
+- Adaptive path disabled by default; explicitly opt-in via --adaptive-resources
+- Cooldown timer (5s) between adjustments per resource to avoid oscillation
+""" .
+
+################################################################################
+# Risks & Mitigations
+################################################################################
+
+spec:risks a :TaskSpecification ;
+  rdfs:label "Risks & Mitigations" ;
+  :objective "Anticipate overload and correctness pitfalls under high concurrency." ;
+  :coversPhase :Phase1 ;
+  :targetsConcept concept:ResourceLimits ,
+                  concept:Observability ,
+                  concept:StreamingIntegration ;
+  :capturesMetric metric:ErrorRate ,
+                  metric:ResourcePressure ;
+  :details """
+Risks:
+- WS cache eviction under heavy load → expose --ws-cache-size/--ws-ttl; recommend size ≥ 2× concurrent jobs/user
+- Backend overload via polling → encourage WS; default wait_ms conservative; allow --no-ws only for comparison
+- Token churn/expiry → dev mode for multi‑user; instruct real‑token runs to use distinct users
+- Mixed clients on same user channel → prefer unique users for clean attribution
+""" .
+
+################################################################################
+# Acceptance Criteria (Phase 1)
+################################################################################
+
+spec:acceptance a :TaskSpecification ;
+  rdfs:label "Acceptance Criteria (Phase 1)" ;
+  :objective "Define completion gates for initial delivery." ;
+  :coversPhase :Phase1 ;
+  :targetsConcept concept:BenchmarkHarness ;
+  :capturesMetric metric:Latency ,
+                  metric:TTFB ,
+                  metric:SuccessRate ,
+                  metric:ExportVolume ;
+  :producesArtifact artifact:acceptance_report ;
+  :details """
+Must‑have:
+- Runs with --users 1..N (dev mode supported) and produces summaries
+- Records per‑call metrics including latency_ms, backend_status, path
+- WS enabled: measures TTFB; WS disabled: polling works; both paths stable
+- Ephemeral charts render via Matplotlib when --visualize is set
+- Optional JSON/NDJSON export works for ≥10k records
+- Produces a clear, repeatable baseline that answers “does this work?” under multi‑user load with realistic numbers
+""" .
+
+################################################################################
+# Phased Work Plan (Tasks)
+################################################################################
+
+task:bench-p1a-foundation a :Task ;
+  rdfs:label "P1A: Harness Foundations" ;
+  :description "Scaffold scripts/bench_mcp.py, CLI parsing, backend config + auth, single‑user single‑worker loop, basic metrics collection." ;
+  :hasStatus :StatusPlanned ;
+  :belongsToPhase :Phase1 ;
+  :deliversSpecification spec:bench-cli ,
+                          spec:backend-adapter ,
+                          spec:workload-generator .
+
+task:bench-p1b-concurrency a :Task ;
+  rdfs:label "P1B: Concurrency + Multi‑User" ;
+  :description "Add global concurrency semaphore, per‑user workers, weighted mixes, RPS pacing, and per‑user RealtimeJobClient." ;
+  :hasStatus :StatusPlanned ;
+  :dependsOn task:bench-p1a-foundation ;
+  :belongsToPhase :Phase1 ;
+  :deliversSpecification spec:multi-user ,
+                          spec:workload-generator ,
+                          spec:baseline-profile .
+
+task:bench-p1c-metrics a :Task ;
+  rdfs:label "P1C: Summaries + Visualization" ;
+  :description "Implement percentile summaries, JSON/NDJSON export, and Matplotlib histograms/time‑series." ;
+  :hasStatus :StatusPlanned ;
+  :dependsOn task:bench-p1b-concurrency ;
+  :belongsToPhase :Phase1 ;
+  :deliversSpecification spec:metrics-visuals ,
+                          spec:usage ,
+                          spec:bench-cli ,
+                          spec:metrics-schema ,
+                          spec:reporting-flow .
+
+task:bench-p1d-hardening a :Task ;
+  rdfs:label "P1D: Hardening & Guardrails" ;
+  :description "SIGINT/SIGTERM shutdown, progress heartbeat, WS cache/poll tuning flags, smoke tests with simulated WS + polling." ;
+  :hasStatus :StatusPlanned ;
+  :dependsOn task:bench-p1c-metrics ;
+  :belongsToPhase :Phase1 ;
+  :deliversSpecification spec:observability-safety ,
+                          spec:risks ,
+                          spec:baseline-profile ,
+                          spec:validation-suite ,
+                          spec:reporting-flow .
+
+task:bench-p2-mcp a :Task ;
+  rdfs:label "P2: True MCP Adapter" ;
+  :description "Add MCPClient adapter that spawns neem‑mcp‑server (stdio) and invokes tools via JSON‑RPC. Capture transport round‑trip and compare with backend adapter." ;
+  :hasStatus :StatusPlanned ;
+  :dependsOn task:bench-p1d-hardening ;
+  :belongsToPhase :Phase2 ;
+  :deliversSpecification spec:mcp-adapter .
+
+task:bench-p1_5-advanced a :Task ;
+  rdfs:label "P1.5: Advanced Features (Optional)" ;
+  :description "Introduce optional workload patterns, dependent chains, failure injection, adaptive resources, and token efficiency metrics; all disabled by default and excluded from baselines." ;
+  :hasStatus :StatusPlanned ;
+  :dependsOn task:bench-p1d-hardening ;
+  :belongsToPhase :Phase1_5 ;
+  :deliversSpecification spec:failure-injection-testing ,
+                          spec:token-efficiency-tracking ,
+                          spec:baseline-profile ,
+                          spec:advanced-patterns ,
+                          spec:adaptive-resources .
+
+################################################################################
+# Notes & Usage Examples
+################################################################################
+
+spec:usage a :TaskSpecification ;
+  rdfs:label "Usage Examples" ;
+  :objective "Reference invocations for common scenarios." ;
+  :coversPhase :Phase1 ;
+  :targetsConcept concept:BenchmarkHarness ,
+                  concept:WorkloadModel ;
+  :producesArtifact artifact:usage_snippets ;
+  :capturesMetric metric:Latency ,
+                  metric:Throughput ;
+  :details """
+Dev mode (two synthetic users, WS on):
+  uv run scripts/bench_mcp.py \
+    --duration 30 --users 2 --workers 2 --concurrency 16 \
+    --mix "list_graphs:0.7,query_graph:0.3" --visualize
+
+Polling only (compare vs WS):
+  uv run scripts/bench_mcp.py --duration 20 --users 1 --no-ws --mix "list_graphs:1.0"
+
+High‑volume export (no charts):
+  uv run scripts/bench_mcp.py --duration 60 --users 4 --workers 4 \
+    --concurrency 64 --rps 2.5 --output results.json --ndjson results.ndjson
+""" .
+
+spec:mcp-adapter a :TaskSpecification ;
+  rdfs:label "MCP Transport Adapter" ;
+  :objective "Extend the harness with an MCPClient that measures stdio/JSON-RPC overhead end-to-end." ;
+  :coversPhase :Phase2 ;
+  :targetsConcept concept:MCPClient ,
+                  concept:Extensibility ,
+                  concept:MetricsModel ;
+  :capturesMetric metric:TransportOverhead ,
+                  metric:Latency ,
+                  metric:SuccessRate ;
+  :producesArtifact artifact:mcp_trace ,
+                    artifact:metrics_export ;
+  :details """
+Requirements:
+- Spawn neem-mcp-server as subprocess with configurable env vars (backend URL, tokens, log level)
+- Drive MCP tools via JSON-RPC/stdio, mirroring flows used by MCP clients (Claude, Codex, Goose)
+- Record transport timings: stdio round trip, JSON serialization overhead, context window costs
+- Compare MCPClient vs BackendToolClient metrics in summaries; highlight deltas exceeding 10%
+- Provide trace export (--mcp-trace out.ndjson) capturing every MCP request/response envelope
+""" .

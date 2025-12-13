@@ -24,7 +24,7 @@ dependencies = [
     "aiohttp>=3.9",
     "tomlkit>=0.12",
     "ruamel.yaml>=0.18",
-    "y-py>=0.6.0",
+    "pycrdt>=0.10.0",
 ]
 
 [project.urls]

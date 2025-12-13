@@ -12,7 +12,8 @@ from typing import Any, Dict, Optional, Union
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from neem.hocuspocus import HocuspocusClient, DocumentReader, DocumentWriter
+from neem.hocuspocus import HocuspocusClient, DocumentReader, DocumentWriter, WorkspaceWriter
+from neem.hocuspocus.document import extract_title_from_xml
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_dev_user_id, get_user_id_from_token, validate_token_and_load
 
@@ -94,17 +95,18 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
     @server.tool(
         name="read_document",
         title="Read Document Content",
-        description=(
-            "Reads the content of a document and returns it as markdown. "
-            "Connects to the document via Y.js for real-time synchronization."
-        ),
+        description="""Reads document content as TipTap XML with full formatting.
+
+Blocks: paragraph, heading (level="1-3"), bulletList, orderedList, blockquote, codeBlock (language="..."), taskList (taskItem checked="true"), horizontalRule
+Marks (nestable): strong, em, strike, code, mark (highlight), a (href="..."), footnote (data-footnote-content="..."), commentMark (data-comment-id="...")
+Lists: <bulletList><listItem><paragraph>item</paragraph></listItem></bulletList>""",
     )
     async def read_document_tool(
         graph_id: str,
         document_id: str,
         context: Context | None = None,
     ) -> str:
-        """Read document content as markdown."""
+        """Read document content as TipTap XML."""
         token = validate_token_and_load()
         if not token:
             raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
@@ -119,22 +121,14 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
                 raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
 
             reader = DocumentReader(channel.doc)
-            markdown = reader.to_markdown()
-            blocks = reader.get_blocks()
+            xml_content = reader.to_xml()
+            comments = reader.get_all_comments()
 
             result = {
                 "graph_id": graph_id,
                 "document_id": document_id,
-                "content": markdown,
-                "block_count": len(blocks),
-                "blocks": [
-                    {
-                        "type": block.type,
-                        "text": block.to_text()[:200],  # Truncate for summary
-                        "attrs": block.attrs,
-                    }
-                    for block in blocks
-                ],
+                "content": xml_content,
+                "comments": comments,
             }
             return _render_json(result)
 
@@ -152,48 +146,79 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
     @server.tool(
         name="write_document",
         title="Write Document Content",
-        description=(
-            "Writes content to a document. The content should be provided as markdown. "
-            "This will replace the entire document content with the provided markdown."
-        ),
+        description="""Replaces document content with TipTap XML. Syncs to UI in real-time.
+
+WARNING: This REPLACES all content. For collaborative editing, prefer append_to_document.
+
+Blocks: paragraph, heading (level="1-3"), bulletList, orderedList, blockquote, codeBlock (language="..."), taskList (taskItem checked="true"), horizontalRule
+Marks (nestable): strong, em, strike, code, mark (highlight), a (href="..."), footnote (data-footnote-content="..."), commentMark (data-comment-id="...")
+Example: <paragraph>Text with <mark>highlight</mark> and a note<footnote data-footnote-content="This is a footnote"/></paragraph>
+
+Comments: Pass a dict mapping comment IDs to metadata. Comment IDs must match data-comment-id attributes in the content.
+Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}""",
     )
     async def write_document_tool(
         graph_id: str,
         document_id: str,
         content: str,
+        comments: Optional[Dict[str, Any]] = None,
         context: Context | None = None,
     ) -> str:
-        """Write markdown content to a document."""
+        """Write TipTap XML content to a document."""
         token = validate_token_and_load()
         if not token:
             raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
 
         try:
-            # Connect to the document channel
+            # 1. Write document content and comments
             await hp_client.connect_document(graph_id, document_id)
 
-            # Get the channel
+            def write_content_and_comments(doc: Any) -> None:
+                writer = DocumentWriter(doc)
+                writer.replace_all_content(content)
+                # Write comments if provided
+                if comments:
+                    for comment_id, comment_data in comments.items():
+                        writer.set_comment(
+                            comment_id=comment_id,
+                            text=comment_data.get("text", ""),
+                            author=comment_data.get("author", "MCP Agent"),
+                            author_id=comment_data.get("authorId", "mcp-agent"),
+                            resolved=comment_data.get("resolved", False),
+                            quoted_text=comment_data.get("quotedText"),
+                        )
+
+            await hp_client.transact_document(
+                graph_id,
+                document_id,
+                write_content_and_comments,
+            )
+
+            # 2. Update workspace navigation so document appears in file tree
+            # Extract title from first heading, fallback to document_id
+            title = extract_title_from_xml(content) or document_id
+            await hp_client.connect_workspace(graph_id)
+            await hp_client.transact_workspace(
+                graph_id,
+                lambda doc: WorkspaceWriter(doc).upsert_document(document_id, title),
+            )
+
+            # 3. Read back document content and comments to confirm
             channel = hp_client.get_document_channel(graph_id, document_id)
             if channel is None:
                 raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
 
-            # Write the content
-            writer = DocumentWriter(channel.doc)
-            update = writer.set_content_from_markdown(content)
-
-            # Broadcast the update to the server
-            await hp_client.apply_document_update(graph_id, document_id, update)
-
-            # Read back to confirm
             reader = DocumentReader(channel.doc)
-            blocks = reader.get_blocks()
+            xml_content = reader.to_xml()
+            result_comments = reader.get_all_comments()
 
             result = {
                 "success": True,
                 "graph_id": graph_id,
                 "document_id": document_id,
-                "bytes_written": len(update),
-                "block_count": len(blocks),
+                "title": title,
+                "content": xml_content,
+                "comments": result_comments,
             }
             return _render_json(result)
 
@@ -231,23 +256,23 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
             # Connect to the document channel
             await hp_client.connect_document(graph_id, document_id)
 
-            # Get the channel
-            channel = hp_client.get_document_channel(graph_id, document_id)
-            if channel is None:
-                raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
+            # Escape XML special characters in the text
+            import html
+            escaped_text = html.escape(text)
 
-            # Append the paragraph
-            writer = DocumentWriter(channel.doc)
-            update = writer.append_paragraph(text)
-
-            # Broadcast the update
-            await hp_client.apply_document_update(graph_id, document_id, update)
+            # Use transact_document for proper incremental update handling
+            await hp_client.transact_document(
+                graph_id,
+                document_id,
+                lambda doc: DocumentWriter(doc).append_block(
+                    f"<paragraph>{escaped_text}</paragraph>"
+                ),
+            )
 
             result = {
                 "success": True,
                 "graph_id": graph_id,
                 "document_id": document_id,
-                "bytes_written": len(update),
             }
             return _render_json(result)
 
