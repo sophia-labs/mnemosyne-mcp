@@ -23,5 +23,5 @@ ENV LOG_LEVEL=INFO
 # Expose MCP HTTP port
 EXPOSE 8003
 
-# Run the HTTP transport server
-CMD ["uv", "run", "python", "-m", "neem.mcp.server.standalone_server"]
+# Run the HTTP transport server (--frozen prevents runtime sync of dev deps)
+CMD ["uv", "run", "--frozen", "python", "-m", "neem.mcp.server.standalone_server"]
