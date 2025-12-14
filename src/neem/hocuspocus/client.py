@@ -200,6 +200,14 @@ class HocuspocusClient:
 
             # Send our state vector to initiate sync
             state_vector = channel.doc.get_state()
+            logger.info(
+                "Sending sync_step1 with our state vector",
+                extra_context={
+                    "channel": channel_name,
+                    "state_vector_size": len(state_vector),
+                    "state_vector_hex": state_vector.hex() if state_vector else "",
+                },
+            )
             await channel.ws.send_bytes(encode_sync_step1(state_vector))
 
             # Wait for sync to complete (server sends sync_step2)
@@ -259,40 +267,104 @@ class HocuspocusClient:
         channel_name: str,
     ) -> None:
         """Handle an incoming WebSocket message."""
+        logger.debug(
+            "Received WebSocket message",
+            extra_context={
+                "channel": channel_name,
+                "data_size": len(data),
+                "data_hex_preview": data[:30].hex() if data else "",
+            },
+        )
+
         try:
             message = decode_message(data)
-        except ProtocolDecodeError:
+        except ProtocolDecodeError as e:
             # Treat as raw Y.js update
+            logger.warning(
+                "Failed to decode as protocol message, treating as raw update",
+                extra_context={
+                    "channel": channel_name,
+                    "error": str(e),
+                    "data_size": len(data),
+                },
+            )
             channel.doc.apply_update(data)
             return
+
+        logger.info(
+            "Decoded protocol message",
+            extra_context={
+                "channel": channel_name,
+                "msg_type": message.type.value,
+                "msg_subtype": message.subtype,
+                "payload_size": len(message.payload),
+            },
+        )
 
         if message.type == ProtocolMessageType.SYNC:
             if message.subtype == "sync_step1":
                 # Server sent its state vector, respond with sync_step2
                 update = channel.doc.get_update()
+                logger.info(
+                    "Responding to sync_step1 with sync_step2",
+                    extra_context={
+                        "channel": channel_name,
+                        "our_update_size": len(update),
+                        "our_update_hex_preview": update[:50].hex() if update else "",
+                    },
+                )
                 if channel.ws and not channel.ws.closed:
                     await channel.ws.send_bytes(encode_sync_step2(update))
 
             elif message.subtype == "sync_step2":
                 # Server sent us the full state diff - apply it
+                # Log content BEFORE applying
+                content_fragment = channel.doc.get("content", type=pycrdt.XmlFragment)
+                content_before = str(content_fragment) if content_fragment else "(no content)"
+
                 channel.doc.apply_update(message.payload)
                 channel.synced.set()
-                logger.debug(
-                    "Received sync_step2, channel synced",
-                    extra_context={"channel": channel_name},
+
+                # Log content AFTER applying
+                content_after = str(content_fragment) if content_fragment else "(no content)"
+                logger.info(
+                    "Applied sync_step2, channel synced",
+                    extra_context={
+                        "channel": channel_name,
+                        "payload_size": len(message.payload),
+                        "content_before": content_before[:500],
+                        "content_after": content_after[:500],
+                    },
                 )
 
             elif message.subtype == "sync_update":
                 # Incremental update from server
+                content_fragment = channel.doc.get("content", type=pycrdt.XmlFragment)
+                content_before = str(content_fragment) if content_fragment else "(no content)"
+
                 channel.doc.apply_update(message.payload)
+
+                content_after = str(content_fragment) if content_fragment else "(no content)"
+                logger.info(
+                    "Applied sync_update from server",
+                    extra_context={
+                        "channel": channel_name,
+                        "payload_size": len(message.payload),
+                        "content_before": content_before[:500],
+                        "content_after": content_after[:500],
+                    },
+                )
 
         elif message.type == ProtocolMessageType.PING:
             # Respond to ping (though aiohttp heartbeat usually handles this)
-            pass
+            logger.debug("Received ping", extra_context={"channel": channel_name})
 
         elif message.type == ProtocolMessageType.AWARENESS:
             # Awareness updates - ignore for now (cursor positions, etc.)
-            pass
+            logger.debug(
+                "Received awareness update (ignored)",
+                extra_context={"channel": channel_name, "payload_size": len(message.payload)},
+            )
 
     # -------------------------------------------------------------------------
     # Session State Accessors (Schema V2 - per-tab state)
@@ -632,44 +704,99 @@ class HocuspocusClient:
 
         # Capture state and content BEFORE changes
         old_state = channel.doc.get_state()
-        content_fragment = channel.doc.get("content", type=pycrdt.XmlFragment)
+        content_fragment: pycrdt.XmlFragment = channel.doc.get("content", type=pycrdt.XmlFragment)
         content_before = str(content_fragment)
+        block_count_before = len(list(content_fragment.children)) if content_fragment else 0
+
         logger.info(
             "transact_document: BEFORE operation",
             extra_context={
                 "graph_id": graph_id,
                 "doc_id": doc_id,
-                "content_before": content_before,
+                "block_count": block_count_before,
+                "state_vector_size": len(old_state),
+                "content_preview": content_before[:500] if content_before else "(empty)",
             },
         )
 
         # Execute the operation (modifies doc in place)
-        operation(channel.doc)
+        try:
+            operation(channel.doc)
+        except Exception as e:
+            logger.error(
+                "transact_document: operation FAILED",
+                extra_context={
+                    "graph_id": graph_id,
+                    "doc_id": doc_id,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
+            )
+            raise
 
         # Log content AFTER changes
         content_after = str(content_fragment)
+        block_count_after = len(list(content_fragment.children)) if content_fragment else 0
+
         logger.info(
             "transact_document: AFTER operation",
             extra_context={
                 "graph_id": graph_id,
                 "doc_id": doc_id,
-                "content_after": content_after,
+                "block_count_before": block_count_before,
+                "block_count_after": block_count_after,
+                "content_preview": content_after[:500] if content_after else "(empty)",
             },
         )
 
         # Get INCREMENTAL update (diff from old state)
         incremental_update = channel.doc.get_update(old_state)
+        new_state = channel.doc.get_state()
+
+        logger.info(
+            "transact_document: computed incremental update",
+            extra_context={
+                "graph_id": graph_id,
+                "doc_id": doc_id,
+                "old_state_size": len(old_state),
+                "new_state_size": len(new_state),
+                "incremental_update_size": len(incremental_update) if incremental_update else 0,
+            },
+        )
 
         # Only send if there are actual changes and connection is alive
         if incremental_update and channel.ws and not channel.ws.closed:
-            await channel.ws.send_bytes(encode_sync_update(incremental_update))
+            encoded_message = encode_sync_update(incremental_update)
             logger.info(
-                "transact_document: Sent incremental update",
+                "transact_document: sending encoded sync_update",
+                extra_context={
+                    "graph_id": graph_id,
+                    "doc_id": doc_id,
+                    "raw_update_size": len(incremental_update),
+                    "encoded_message_size": len(encoded_message),
+                    "encoded_hex_preview": encoded_message[:50].hex(),
+                    "ws_closed": channel.ws.closed,
+                },
+            )
+            await channel.ws.send_bytes(encoded_message)
+            logger.info(
+                "transact_document: SENT to server",
                 extra_context={
                     "graph_id": graph_id,
                     "doc_id": doc_id,
                     "update_size": len(incremental_update),
-                    "update_hex": incremental_update[:50].hex() if incremental_update else "",
+                },
+            )
+        else:
+            logger.warning(
+                "transact_document: NOT sending update",
+                extra_context={
+                    "graph_id": graph_id,
+                    "doc_id": doc_id,
+                    "has_update": bool(incremental_update),
+                    "update_size": len(incremental_update) if incremental_update else 0,
+                    "has_ws": channel.ws is not None,
+                    "ws_closed": channel.ws.closed if channel.ws else True,
                 },
             )
 

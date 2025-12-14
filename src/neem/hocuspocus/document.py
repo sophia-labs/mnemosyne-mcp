@@ -570,15 +570,47 @@ class DocumentWriter:
                      "<heading level=\"2\">Section</heading>"
                      "<bulletList><listItem><paragraph>Item</paragraph></listItem></bulletList>"
         """
+        logger.info(
+            "append_block: starting",
+            extra_context={"xml_str": xml_str[:200]},
+        )
+
         fragment = self.get_content_fragment()
+        block_count_before = len(list(fragment.children))
         elem = ET.fromstring(xml_str)
+
+        logger.info(
+            "append_block: parsed XML",
+            extra_context={
+                "elem_tag": elem.tag,
+                "elem_attribs": dict(elem.attrib),
+                "block_count_before": block_count_before,
+            },
+        )
 
         with self._doc.transaction():
             # Process element - may return multiple blocks for list containers
             blocks = self._process_element(elem)
+            logger.info(
+                "append_block: processed element into blocks",
+                extra_context={
+                    "num_blocks": len(blocks),
+                    "block_tags": [b.tag for b in blocks] if blocks else [],
+                },
+            )
             for block in blocks:
                 fragment.children.append(block)
             self._apply_pending_formats()
+
+        block_count_after = len(list(fragment.children))
+        logger.info(
+            "append_block: completed",
+            extra_context={
+                "block_count_before": block_count_before,
+                "block_count_after": block_count_after,
+                "content_after": str(fragment)[:500],
+            },
+        )
 
     def insert_block_at(self, index: int, xml_str: str) -> None:
         """Insert a block element at a specific position.
@@ -791,12 +823,25 @@ class DocumentWriter:
         Raises:
             ValueError: If reference block not found.
         """
+        logger.info(
+            "insert_block_after_id: starting",
+            extra_context={
+                "after_block_id": after_block_id,
+                "xml_str": xml_str[:200],
+            },
+        )
+
         result = self.find_block_by_id(after_block_id)
         if result is None:
+            logger.error(
+                "insert_block_after_id: reference block not found",
+                extra_context={"after_block_id": after_block_id},
+            )
             raise ValueError(f"Block not found: {after_block_id}")
 
         index, _ = result
         fragment = self.get_content_fragment()
+        block_count_before = len(list(fragment.children))
         elem = ET.fromstring(xml_str)
 
         # Pre-generate block ID if not already set
@@ -805,13 +850,41 @@ class DocumentWriter:
             new_block_id = _generate_block_id()
             elem.set("data-block-id", new_block_id)
 
+        logger.info(
+            "insert_block_after_id: inserting at position",
+            extra_context={
+                "insert_after_index": index,
+                "new_block_id": new_block_id,
+                "elem_tag": elem.tag,
+            },
+        )
+
         with self._doc.transaction():
             blocks = self._process_element(elem)
+
+            logger.info(
+                "insert_block_after_id: processed into blocks",
+                extra_context={
+                    "num_blocks": len(blocks),
+                    "block_tags": [b.tag for b in blocks],
+                },
+            )
 
             for i, block in enumerate(blocks):
                 fragment.children.insert(index + 1 + i, block)
 
             self._apply_pending_formats()
+
+        block_count_after = len(list(fragment.children))
+        logger.info(
+            "insert_block_after_id: completed",
+            extra_context={
+                "new_block_id": new_block_id,
+                "block_count_before": block_count_before,
+                "block_count_after": block_count_after,
+                "content_after": str(fragment)[:500],
+            },
+        )
 
         return new_block_id
 
