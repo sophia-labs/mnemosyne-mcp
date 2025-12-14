@@ -15,7 +15,7 @@ from neem.hocuspocus.protocol import (
     encode_sync_step2,
     encode_sync_update,
 )
-from neem.hocuspocus.workspace import WorkspaceWriter
+from neem.hocuspocus.workspace import WorkspaceReader, WorkspaceWriter
 
 __all__ = [
     "DocumentReader",
@@ -24,6 +24,7 @@ __all__ = [
     "ProtocolDecodeError",
     "ProtocolMessage",
     "ProtocolMessageType",
+    "WorkspaceReader",
     "WorkspaceWriter",
     "decode_message",
     "encode_sync_step1",

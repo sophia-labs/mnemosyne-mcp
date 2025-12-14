@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional, Union
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from neem.hocuspocus import HocuspocusClient, DocumentReader, DocumentWriter, WorkspaceWriter
+from neem.hocuspocus import HocuspocusClient, DocumentReader, DocumentWriter, WorkspaceWriter, WorkspaceReader
 from neem.hocuspocus.document import extract_title_from_xml
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_dev_user_id, get_user_id_from_token, validate_token_and_load
@@ -327,7 +327,500 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             )
             raise RuntimeError(f"Failed to get workspace: {e}")
 
-    logger.info("Registered hocuspocus document tools")
+    # -------------------------------------------------------------------------
+    # Folder Operations (Y.js-based, replacing HTTP job-based navigation.py)
+    # -------------------------------------------------------------------------
+
+    @server.tool(
+        name="create_folder",
+        title="Create Folder",
+        description=(
+            "Create a new folder in the workspace. "
+            "Use parent_id to nest inside another folder (null for root level). "
+            "The section parameter determines which sidebar section the folder appears in."
+        ),
+    )
+    async def create_folder_tool(
+        graph_id: str,
+        folder_id: str,
+        label: str,
+        parent_id: Optional[str] = None,
+        order: Optional[float] = None,
+        section: str = "documents",
+        context: Context | None = None,
+    ) -> str:
+        """Create a new folder in the workspace via Y.js."""
+        token = validate_token_and_load()
+        if not token:
+            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required and cannot be empty")
+        if not folder_id or not folder_id.strip():
+            raise ValueError("folder_id is required and cannot be empty")
+        if not label or not label.strip():
+            raise ValueError("label is required and cannot be empty")
+        if section not in ("documents", "artifacts"):
+            raise ValueError("section must be 'documents' or 'artifacts'")
+
+        try:
+            await hp_client.connect_workspace(graph_id.strip())
+
+            # Create folder via Y.js transact
+            await hp_client.transact_workspace(
+                graph_id.strip(),
+                lambda doc: WorkspaceWriter(doc).upsert_folder(
+                    folder_id.strip(),
+                    label.strip(),  # 'label' param → 'name' in Y.js
+                    parent_id=parent_id.strip() if parent_id else None,
+                    section=section,
+                    order=order,
+                ),
+            )
+
+            # Return workspace snapshot for confirmation
+            snapshot = hp_client.get_workspace_snapshot(graph_id.strip())
+
+            result = {
+                "success": True,
+                "folder_id": folder_id.strip(),
+                "graph_id": graph_id.strip(),
+                "label": label.strip(),
+                "parent_id": parent_id.strip() if parent_id else None,
+                "section": section,
+                "workspace": snapshot,
+            }
+            return _render_json(result)
+
+        except Exception as e:
+            logger.error(
+                "Failed to create folder",
+                extra_context={
+                    "graph_id": graph_id,
+                    "folder_id": folder_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to create folder: {e}")
+
+    @server.tool(
+        name="move_folder",
+        title="Move Folder",
+        description=(
+            "Move a folder to a new parent folder. "
+            "Set new_parent_id to null to move to root level. "
+            "Optionally update the order for positioning among siblings."
+        ),
+    )
+    async def move_folder_tool(
+        graph_id: str,
+        folder_id: str,
+        new_parent_id: Optional[str] = None,
+        new_order: Optional[float] = None,
+        context: Context | None = None,
+    ) -> str:
+        """Move a folder to a new parent via Y.js."""
+        token = validate_token_and_load()
+        if not token:
+            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required and cannot be empty")
+        if not folder_id or not folder_id.strip():
+            raise ValueError("folder_id is required and cannot be empty")
+
+        try:
+            await hp_client.connect_workspace(graph_id.strip())
+
+            # Read current folder state from Y.js
+            channel = hp_client._workspace_channels.get(graph_id.strip())
+            if channel is None:
+                raise RuntimeError(f"Workspace not connected: {graph_id}")
+
+            reader = WorkspaceReader(channel.doc)
+            current = reader.get_folder(folder_id.strip())
+
+            if not current:
+                raise RuntimeError(f"Folder '{folder_id}' not found in graph '{graph_id}'")
+
+            # Update folder with new parent/order via Y.js
+            await hp_client.transact_workspace(
+                graph_id.strip(),
+                lambda doc: WorkspaceWriter(doc).update_folder(
+                    folder_id.strip(),
+                    parent_id=new_parent_id.strip() if new_parent_id else None,
+                    order=new_order,
+                ),
+            )
+
+            snapshot = hp_client.get_workspace_snapshot(graph_id.strip())
+
+            result = {
+                "success": True,
+                "folder_id": folder_id.strip(),
+                "graph_id": graph_id.strip(),
+                "new_parent_id": new_parent_id.strip() if new_parent_id else None,
+                "workspace": snapshot,
+            }
+            return _render_json(result)
+
+        except Exception as e:
+            logger.error(
+                "Failed to move folder",
+                extra_context={
+                    "graph_id": graph_id,
+                    "folder_id": folder_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to move folder: {e}")
+
+    @server.tool(
+        name="rename_folder",
+        title="Rename Folder",
+        description="Rename a folder's display label.",
+    )
+    async def rename_folder_tool(
+        graph_id: str,
+        folder_id: str,
+        new_label: str,
+        context: Context | None = None,
+    ) -> str:
+        """Rename a folder via Y.js."""
+        token = validate_token_and_load()
+        if not token:
+            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required and cannot be empty")
+        if not folder_id or not folder_id.strip():
+            raise ValueError("folder_id is required and cannot be empty")
+        if not new_label or not new_label.strip():
+            raise ValueError("new_label is required and cannot be empty")
+
+        try:
+            await hp_client.connect_workspace(graph_id.strip())
+
+            # Verify folder exists
+            channel = hp_client._workspace_channels.get(graph_id.strip())
+            if channel is None:
+                raise RuntimeError(f"Workspace not connected: {graph_id}")
+
+            reader = WorkspaceReader(channel.doc)
+            current = reader.get_folder(folder_id.strip())
+
+            if not current:
+                raise RuntimeError(f"Folder '{folder_id}' not found in graph '{graph_id}'")
+
+            # Update folder name via Y.js
+            await hp_client.transact_workspace(
+                graph_id.strip(),
+                lambda doc: WorkspaceWriter(doc).update_folder(
+                    folder_id.strip(),
+                    name=new_label.strip(),
+                ),
+            )
+
+            snapshot = hp_client.get_workspace_snapshot(graph_id.strip())
+
+            result = {
+                "success": True,
+                "folder_id": folder_id.strip(),
+                "graph_id": graph_id.strip(),
+                "new_label": new_label.strip(),
+                "workspace": snapshot,
+            }
+            return _render_json(result)
+
+        except Exception as e:
+            logger.error(
+                "Failed to rename folder",
+                extra_context={
+                    "graph_id": graph_id,
+                    "folder_id": folder_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to rename folder: {e}")
+
+    @server.tool(
+        name="delete_folder",
+        title="Delete Folder",
+        description=(
+            "Delete a folder from the workspace. "
+            "Set cascade=true to delete all contents (subfolders, documents, artifacts). "
+            "Without cascade, deletion fails if the folder has children."
+        ),
+    )
+    async def delete_folder_tool(
+        graph_id: str,
+        folder_id: str,
+        cascade: bool = False,
+        context: Context | None = None,
+    ) -> str:
+        """Delete a folder via Y.js."""
+        token = validate_token_and_load()
+        if not token:
+            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required and cannot be empty")
+        if not folder_id or not folder_id.strip():
+            raise ValueError("folder_id is required and cannot be empty")
+
+        try:
+            await hp_client.connect_workspace(graph_id.strip())
+
+            # Delete folder via Y.js
+            await hp_client.transact_workspace(
+                graph_id.strip(),
+                lambda doc: WorkspaceWriter(doc).delete_folder(folder_id.strip(), cascade=cascade),
+            )
+
+            snapshot = hp_client.get_workspace_snapshot(graph_id.strip())
+
+            result = {
+                "success": True,
+                "deleted": True,
+                "folder_id": folder_id.strip(),
+                "graph_id": graph_id.strip(),
+                "cascade": cascade,
+                "workspace": snapshot,
+            }
+            return _render_json(result)
+
+        except ValueError as ve:
+            # Cascade error - folder has children
+            raise RuntimeError(str(ve))
+        except Exception as e:
+            logger.error(
+                "Failed to delete folder",
+                extra_context={
+                    "graph_id": graph_id,
+                    "folder_id": folder_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to delete folder: {e}")
+
+    # -------------------------------------------------------------------------
+    # Artifact Operations
+    # -------------------------------------------------------------------------
+
+    @server.tool(
+        name="move_artifact",
+        title="Move Artifact",
+        description=(
+            "Move an artifact to a different folder. "
+            "Set new_parent_id to null to move to root level."
+        ),
+    )
+    async def move_artifact_tool(
+        graph_id: str,
+        artifact_id: str,
+        new_parent_id: Optional[str] = None,
+        new_order: Optional[float] = None,
+        context: Context | None = None,
+    ) -> str:
+        """Move an artifact to a different folder via Y.js."""
+        token = validate_token_and_load()
+        if not token:
+            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required and cannot be empty")
+        if not artifact_id or not artifact_id.strip():
+            raise ValueError("artifact_id is required and cannot be empty")
+
+        try:
+            await hp_client.connect_workspace(graph_id.strip())
+
+            # Read current artifact state from Y.js
+            channel = hp_client._workspace_channels.get(graph_id.strip())
+            if channel is None:
+                raise RuntimeError(f"Workspace not connected: {graph_id}")
+
+            reader = WorkspaceReader(channel.doc)
+            current = reader.get_artifact(artifact_id.strip())
+
+            if not current:
+                raise RuntimeError(f"Artifact '{artifact_id}' not found in graph '{graph_id}'")
+
+            # Update artifact with new parent/order via Y.js
+            await hp_client.transact_workspace(
+                graph_id.strip(),
+                lambda doc: WorkspaceWriter(doc).update_artifact(
+                    artifact_id.strip(),
+                    parent_id=new_parent_id.strip() if new_parent_id else None,
+                    order=new_order,
+                ),
+            )
+
+            snapshot = hp_client.get_workspace_snapshot(graph_id.strip())
+
+            result = {
+                "success": True,
+                "artifact_id": artifact_id.strip(),
+                "graph_id": graph_id.strip(),
+                "new_parent_id": new_parent_id.strip() if new_parent_id else None,
+                "workspace": snapshot,
+            }
+            return _render_json(result)
+
+        except Exception as e:
+            logger.error(
+                "Failed to move artifact",
+                extra_context={
+                    "graph_id": graph_id,
+                    "artifact_id": artifact_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to move artifact: {e}")
+
+    @server.tool(
+        name="rename_artifact",
+        title="Rename Artifact",
+        description="Rename an artifact's display label.",
+    )
+    async def rename_artifact_tool(
+        graph_id: str,
+        artifact_id: str,
+        new_label: str,
+        context: Context | None = None,
+    ) -> str:
+        """Rename an artifact via Y.js."""
+        token = validate_token_and_load()
+        if not token:
+            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required and cannot be empty")
+        if not artifact_id or not artifact_id.strip():
+            raise ValueError("artifact_id is required and cannot be empty")
+        if not new_label or not new_label.strip():
+            raise ValueError("new_label is required and cannot be empty")
+
+        try:
+            await hp_client.connect_workspace(graph_id.strip())
+
+            # Verify artifact exists
+            channel = hp_client._workspace_channels.get(graph_id.strip())
+            if channel is None:
+                raise RuntimeError(f"Workspace not connected: {graph_id}")
+
+            reader = WorkspaceReader(channel.doc)
+            current = reader.get_artifact(artifact_id.strip())
+
+            if not current:
+                raise RuntimeError(f"Artifact '{artifact_id}' not found in graph '{graph_id}'")
+
+            # Update artifact name via Y.js
+            await hp_client.transact_workspace(
+                graph_id.strip(),
+                lambda doc: WorkspaceWriter(doc).update_artifact(
+                    artifact_id.strip(),
+                    name=new_label.strip(),
+                ),
+            )
+
+            snapshot = hp_client.get_workspace_snapshot(graph_id.strip())
+
+            result = {
+                "success": True,
+                "artifact_id": artifact_id.strip(),
+                "graph_id": graph_id.strip(),
+                "new_label": new_label.strip(),
+                "workspace": snapshot,
+            }
+            return _render_json(result)
+
+        except Exception as e:
+            logger.error(
+                "Failed to rename artifact",
+                extra_context={
+                    "graph_id": graph_id,
+                    "artifact_id": artifact_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to rename artifact: {e}")
+
+    # -------------------------------------------------------------------------
+    # Document Navigation Operations
+    # -------------------------------------------------------------------------
+
+    @server.tool(
+        name="move_document",
+        title="Move Document",
+        description=(
+            "Move a document to a folder. "
+            "Set new_parent_id to null to move to root level (unfiled). "
+            "Note: This updates the document's folder assignment in workspace navigation."
+        ),
+    )
+    async def move_document_tool(
+        graph_id: str,
+        document_id: str,
+        new_parent_id: Optional[str] = None,
+        context: Context | None = None,
+    ) -> str:
+        """Move a document to a folder via Y.js."""
+        token = validate_token_and_load()
+        if not token:
+            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required and cannot be empty")
+        if not document_id or not document_id.strip():
+            raise ValueError("document_id is required and cannot be empty")
+
+        try:
+            await hp_client.connect_workspace(graph_id.strip())
+
+            # Verify document exists in workspace
+            channel = hp_client._workspace_channels.get(graph_id.strip())
+            if channel is None:
+                raise RuntimeError(f"Workspace not connected: {graph_id}")
+
+            reader = WorkspaceReader(channel.doc)
+            current = reader.get_document(document_id.strip())
+
+            if not current:
+                raise RuntimeError(f"Document '{document_id}' not found in workspace '{graph_id}'")
+
+            # Update document parent via Y.js
+            await hp_client.transact_workspace(
+                graph_id.strip(),
+                lambda doc: WorkspaceWriter(doc).update_document(
+                    document_id.strip(),
+                    parent_id=new_parent_id.strip() if new_parent_id else None,
+                ),
+            )
+
+            snapshot = hp_client.get_workspace_snapshot(graph_id.strip())
+
+            result = {
+                "success": True,
+                "document_id": document_id.strip(),
+                "graph_id": graph_id.strip(),
+                "new_parent_id": new_parent_id.strip() if new_parent_id else None,
+                "workspace": snapshot,
+            }
+            return _render_json(result)
+
+        except Exception as e:
+            logger.error(
+                "Failed to move document",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to move document: {e}")
+
+    logger.info("Registered hocuspocus tools (documents and navigation)")
 
 
 def _render_json(payload: JsonDict) -> str:

@@ -23,7 +23,6 @@ from neem.mcp.jobs.realtime import RealtimeJobClient
 from neem.mcp.tools.basic import register_basic_tools
 from neem.mcp.tools.graph_ops import register_graph_ops_tools
 from neem.mcp.tools.hocuspocus import register_hocuspocus_tools
-from neem.mcp.tools.navigation import register_navigation_tools
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_dev_user_id, validate_token_and_load
 
@@ -315,7 +314,6 @@ def create_standalone_mcp_server() -> FastMCP:
     register_basic_tools(mcp_server)
     register_graph_ops_tools(mcp_server)
     register_hocuspocus_tools(mcp_server)
-    register_navigation_tools(mcp_server)
 
     logger.info(
         "Standalone MCP server created with graph, document, and navigation tools",
