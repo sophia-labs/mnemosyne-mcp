@@ -235,10 +235,12 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
 
     @server.tool(
         name="append_to_document",
-        title="Append Paragraph to Document",
+        title="Append Block to Document",
         description=(
-            "Appends a new paragraph to the end of a document. "
-            "Use this for incremental additions without replacing existing content."
+            "Appends a block to the end of a document. Accepts TipTap XML for any block type. "
+            "Use this for incremental additions without replacing existing content. "
+            "For plain text, wrap in <paragraph>text</paragraph>. For structured content, "
+            "provide full XML like <heading level=\"2\">Title</heading> or <listItem listType=\"bullet\">...</listItem>."
         ),
     )
     async def append_to_document_tool(
@@ -247,32 +249,61 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         text: str,
         context: Context | None = None,
     ) -> str:
-        """Append a paragraph to a document."""
+        """Append a block to a document.
+
+        Args:
+            graph_id: The graph containing the document
+            document_id: The document to append to
+            text: TipTap XML content. If it doesn't start with '<', it's wrapped in <paragraph>.
+        """
         token = validate_token_and_load()
         if not token:
             raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
 
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required")
+        if not document_id or not document_id.strip():
+            raise ValueError("document_id is required")
+        if not text:
+            raise ValueError("text is required")
+
         try:
             # Connect to the document channel
-            await hp_client.connect_document(graph_id, document_id)
+            await hp_client.connect_document(graph_id.strip(), document_id.strip())
 
-            # Escape XML special characters in the text
-            import html
-            escaped_text = html.escape(text)
+            # Determine if text is XML or plain text
+            content = text.strip()
+            if not content.startswith("<"):
+                # Plain text - escape and wrap in paragraph
+                import html
+                escaped_text = html.escape(content)
+                content = f"<paragraph>{escaped_text}</paragraph>"
 
-            # Use transact_document for proper incremental update handling
+            new_block_id: str = ""
+
+            def perform_append(doc: Any) -> None:
+                nonlocal new_block_id
+                writer = DocumentWriter(doc)
+                writer.append_block(content)
+                # Get the last block's ID
+                reader = DocumentReader(doc)
+                count = reader.get_block_count()
+                if count > 0:
+                    block = reader.get_block_at(count - 1)
+                    if block and hasattr(block, "attributes"):
+                        new_block_id = block.attributes.get("data-block-id", "")
+
             await hp_client.transact_document(
-                graph_id,
-                document_id,
-                lambda doc: DocumentWriter(doc).append_block(
-                    f"<paragraph>{escaped_text}</paragraph>"
-                ),
+                graph_id.strip(),
+                document_id.strip(),
+                perform_append,
             )
 
             result = {
                 "success": True,
-                "graph_id": graph_id,
-                "document_id": document_id,
+                "graph_id": graph_id.strip(),
+                "document_id": document_id.strip(),
+                "new_block_id": new_block_id,
             }
             return _render_json(result)
 
@@ -820,7 +851,391 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             )
             raise RuntimeError(f"Failed to move document: {e}")
 
-    logger.info("Registered hocuspocus tools (documents and navigation)")
+    # -------------------------------------------------------------------------
+    # Block-Level Document Operations
+    # -------------------------------------------------------------------------
+
+    @server.tool(
+        name="get_block",
+        title="Get Block by ID",
+        description=(
+            "Read a specific block by its data-block-id. Returns detailed info including "
+            "the block's XML content, attributes, text content, and context (prev/next block IDs). "
+            "Use this for targeted reads without fetching the entire document."
+        ),
+    )
+    async def get_block_tool(
+        graph_id: str,
+        document_id: str,
+        block_id: str,
+        context: Context | None = None,
+    ) -> str:
+        """Get detailed information about a block by its ID."""
+        token = validate_token_and_load()
+        if not token:
+            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required")
+        if not document_id or not document_id.strip():
+            raise ValueError("document_id is required")
+        if not block_id or not block_id.strip():
+            raise ValueError("block_id is required")
+
+        try:
+            await hp_client.connect_document(graph_id.strip(), document_id.strip())
+
+            channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip())
+            if channel is None:
+                raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
+
+            reader = DocumentReader(channel.doc)
+            block_info = reader.get_block_info(block_id.strip())
+
+            if block_info is None:
+                raise RuntimeError(f"Block not found: {block_id}")
+
+            result = {
+                "graph_id": graph_id.strip(),
+                "document_id": document_id.strip(),
+                "block": block_info,
+            }
+            return _render_json(result)
+
+        except Exception as e:
+            logger.error(
+                "Failed to get block",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "block_id": block_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to get block: {e}")
+
+    @server.tool(
+        name="query_blocks",
+        title="Query Blocks",
+        description=(
+            "Search for blocks matching specific criteria. Filter by block type, indent level, "
+            "list type, checked state, or text content. Returns a list of matching block summaries. "
+            "Use this to find blocks without reading the entire document."
+        ),
+    )
+    async def query_blocks_tool(
+        graph_id: str,
+        document_id: str,
+        block_type: Optional[str] = None,
+        indent: Optional[int] = None,
+        indent_gte: Optional[int] = None,
+        indent_lte: Optional[int] = None,
+        list_type: Optional[str] = None,
+        checked: Optional[bool] = None,
+        text_contains: Optional[str] = None,
+        limit: int = 50,
+        context: Context | None = None,
+    ) -> str:
+        """Query blocks matching specific criteria."""
+        token = validate_token_and_load()
+        if not token:
+            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required")
+        if not document_id or not document_id.strip():
+            raise ValueError("document_id is required")
+
+        try:
+            await hp_client.connect_document(graph_id.strip(), document_id.strip())
+
+            channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip())
+            if channel is None:
+                raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
+
+            reader = DocumentReader(channel.doc)
+            matches = reader.query_blocks(
+                block_type=block_type,
+                indent=indent,
+                indent_gte=indent_gte,
+                indent_lte=indent_lte,
+                list_type=list_type,
+                checked=checked,
+                text_contains=text_contains,
+                limit=limit,
+            )
+
+            result = {
+                "graph_id": graph_id.strip(),
+                "document_id": document_id.strip(),
+                "count": len(matches),
+                "blocks": matches,
+            }
+            return _render_json(result)
+
+        except Exception as e:
+            logger.error(
+                "Failed to query blocks",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to query blocks: {e}")
+
+    @server.tool(
+        name="update_block",
+        title="Update Block",
+        description=(
+            "Update a block by its ID. Can update attributes (indent, checked, listType) "
+            "without changing content, or replace the entire block content. "
+            "This is the most surgical edit - only modifies what you specify."
+        ),
+    )
+    async def update_block_tool(
+        graph_id: str,
+        document_id: str,
+        block_id: str,
+        attributes: Optional[Dict[str, Any]] = None,
+        xml_content: Optional[str] = None,
+        context: Context | None = None,
+    ) -> str:
+        """Update a block's attributes or content.
+
+        Args:
+            graph_id: The graph containing the document
+            document_id: The document containing the block
+            block_id: The block to update
+            attributes: Dict of attributes to update (indent, checked, listType, collapsed)
+            xml_content: If provided, replaces the entire block content (preserves block_id)
+        """
+        token = validate_token_and_load()
+        if not token:
+            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required")
+        if not document_id or not document_id.strip():
+            raise ValueError("document_id is required")
+        if not block_id or not block_id.strip():
+            raise ValueError("block_id is required")
+        if attributes is None and xml_content is None:
+            raise ValueError("Either attributes or xml_content must be provided")
+
+        try:
+            await hp_client.connect_document(graph_id.strip(), document_id.strip())
+
+            def perform_update(doc: Any) -> None:
+                writer = DocumentWriter(doc)
+                if xml_content:
+                    # Full content replacement (preserves block_id)
+                    writer.replace_block_by_id(block_id.strip(), xml_content)
+                if attributes:
+                    # Surgical attribute update
+                    writer.update_block_attributes(block_id.strip(), attributes)
+
+            await hp_client.transact_document(
+                graph_id.strip(),
+                document_id.strip(),
+                perform_update,
+            )
+
+            # Read back the updated block
+            channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip())
+            if channel is None:
+                raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
+
+            reader = DocumentReader(channel.doc)
+            block_info = reader.get_block_info(block_id.strip())
+
+            result = {
+                "success": True,
+                "graph_id": graph_id.strip(),
+                "document_id": document_id.strip(),
+                "block": block_info,
+            }
+            return _render_json(result)
+
+        except Exception as e:
+            logger.error(
+                "Failed to update block",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "block_id": block_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to update block: {e}")
+
+    @server.tool(
+        name="insert_block",
+        title="Insert Block",
+        description=(
+            "Insert a new block relative to an existing block. Use position='after' or 'before' "
+            "to specify where to insert. Returns the new block's generated ID. "
+            "For appending to the end, use append_to_document instead."
+        ),
+    )
+    async def insert_block_tool(
+        graph_id: str,
+        document_id: str,
+        reference_block_id: str,
+        xml_content: str,
+        position: str = "after",
+        context: Context | None = None,
+    ) -> str:
+        """Insert a new block before or after a reference block.
+
+        Args:
+            graph_id: The graph containing the document
+            document_id: The document to insert into
+            reference_block_id: The block to insert relative to
+            xml_content: TipTap XML for the new block
+            position: 'after' or 'before' the reference block
+        """
+        token = validate_token_and_load()
+        if not token:
+            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required")
+        if not document_id or not document_id.strip():
+            raise ValueError("document_id is required")
+        if not reference_block_id or not reference_block_id.strip():
+            raise ValueError("reference_block_id is required")
+        if not xml_content or not xml_content.strip():
+            raise ValueError("xml_content is required")
+        if position not in ("after", "before"):
+            raise ValueError("position must be 'after' or 'before'")
+
+        try:
+            await hp_client.connect_document(graph_id.strip(), document_id.strip())
+
+            new_block_id: str = ""
+
+            def perform_insert(doc: Any) -> None:
+                nonlocal new_block_id
+                writer = DocumentWriter(doc)
+                if position == "after":
+                    new_block_id = writer.insert_block_after_id(
+                        reference_block_id.strip(), xml_content.strip()
+                    )
+                else:
+                    new_block_id = writer.insert_block_before_id(
+                        reference_block_id.strip(), xml_content.strip()
+                    )
+
+            await hp_client.transact_document(
+                graph_id.strip(),
+                document_id.strip(),
+                perform_insert,
+            )
+
+            # Read back the new block
+            channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip())
+            if channel is None:
+                raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
+
+            reader = DocumentReader(channel.doc)
+            block_info = reader.get_block_info(new_block_id) if new_block_id else None
+
+            result = {
+                "success": True,
+                "graph_id": graph_id.strip(),
+                "document_id": document_id.strip(),
+                "new_block_id": new_block_id,
+                "block": block_info,
+            }
+            return _render_json(result)
+
+        except Exception as e:
+            logger.error(
+                "Failed to insert block",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "reference_block_id": reference_block_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to insert block: {e}")
+
+    @server.tool(
+        name="delete_block",
+        title="Delete Block",
+        description=(
+            "Delete a block by its ID. Use cascade=true to also delete all subsequent blocks "
+            "with higher indent (indent-based children). Returns the list of deleted block IDs."
+        ),
+    )
+    async def delete_block_tool(
+        graph_id: str,
+        document_id: str,
+        block_id: str,
+        cascade: bool = False,
+        context: Context | None = None,
+    ) -> str:
+        """Delete a block and optionally its indent-children.
+
+        Args:
+            graph_id: The graph containing the document
+            document_id: The document containing the block
+            block_id: The block to delete
+            cascade: If True, also delete indent-children
+        """
+        token = validate_token_and_load()
+        if not token:
+            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required")
+        if not document_id or not document_id.strip():
+            raise ValueError("document_id is required")
+        if not block_id or not block_id.strip():
+            raise ValueError("block_id is required")
+
+        try:
+            await hp_client.connect_document(graph_id.strip(), document_id.strip())
+
+            deleted_ids: list[str] = []
+
+            def perform_delete(doc: Any) -> None:
+                nonlocal deleted_ids
+                writer = DocumentWriter(doc)
+                deleted_ids = writer.delete_block_by_id(
+                    block_id.strip(), cascade_children=cascade
+                )
+
+            await hp_client.transact_document(
+                graph_id.strip(),
+                document_id.strip(),
+                perform_delete,
+            )
+
+            result = {
+                "success": True,
+                "graph_id": graph_id.strip(),
+                "document_id": document_id.strip(),
+                "deleted_block_ids": deleted_ids,
+                "cascade": cascade,
+            }
+            return _render_json(result)
+
+        except Exception as e:
+            logger.error(
+                "Failed to delete block",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "block_id": block_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to delete block: {e}")
+
+    logger.info("Registered hocuspocus tools (documents, navigation, and block operations)")
 
 
 def _render_json(payload: JsonDict) -> str:

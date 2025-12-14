@@ -99,26 +99,60 @@ BLOCK_ATTR_MAP: dict[str, dict[str, str]] = {
         "data-indent": "indent",  # XML attr → TipTap attr
         "level": "level",         # Pass through (same name)
     },
+    "listItem": {
+        "data-indent": "indent",  # XML attr → TipTap attr
+        "listType": "listType",   # Pass through (bullet/ordered/task)
+        "checked": "checked",     # Pass through (for task items)
+    },
 }
 
 # Block types that need data-block-id (matches TipTap's BlockId extension)
+# Note: bulletList, orderedList, taskList are NOT block types - they're converted
+# to flat listItem blocks with listType attribute during XML processing.
 BLOCK_TYPES = frozenset({
     "paragraph",
     "heading",
-    "bulletList",
-    "orderedList",
-    "listItem",
+    "listItem",      # Flat list item with listType attribute (bullet/ordered/task)
     "blockquote",
     "codeBlock",
-    "taskList",
-    "taskItem",
     "horizontalRule",
+})
+
+# List container elements that should be flattened to listItem blocks
+LIST_CONTAINER_TYPES = frozenset({
+    "bulletList",
+    "orderedList",
+    "taskList",
 })
 
 
 def _generate_block_id() -> str:
     """Generate a unique block ID matching TipTap's format."""
     return f"block-{uuid.uuid4().hex[:8]}"
+
+
+def _get_attr_safe(attrs: Any, key: str, default: Any = None) -> Any:
+    """Safely get an attribute from XmlAttributesView or dict.
+
+    pycrdt's XmlAttributesView.get() doesn't accept a default value,
+    so we need this wrapper.
+    """
+    try:
+        if key in attrs:
+            return attrs[key]
+        return default
+    except (TypeError, KeyError):
+        return default
+
+
+def _get_list_type_from_container(tag: str) -> str:
+    """Map list container tag to listType attribute value."""
+    mapping = {
+        "bulletList": "bullet",
+        "orderedList": "ordered",
+        "taskList": "task",
+    }
+    return mapping.get(tag, "bullet")
 
 
 def _map_inline_node_attrs(tag: str, attrs: dict[str, Any]) -> dict[str, Any]:
@@ -277,6 +311,199 @@ class DocumentReader:
         fragment = self.get_content_fragment()
         return str(fragment)
 
+    def get_block_count(self) -> int:
+        """Get the number of top-level blocks in the document."""
+        fragment = self.get_content_fragment()
+        return len(list(fragment.children))
+
+    def find_block_by_id(self, block_id: str) -> tuple[int, Any] | None:
+        """Find a block by its data-block-id attribute.
+
+        Args:
+            block_id: The block ID to search for (e.g., "block-abc12345")
+
+        Returns:
+            Tuple of (index, XmlElement) if found, None otherwise.
+        """
+        fragment = self.get_content_fragment()
+        for i, child in enumerate(fragment.children):
+            if hasattr(child, "attributes"):
+                if child.attributes.get("data-block-id") == block_id:
+                    return (i, child)
+        return None
+
+    def get_block_at(self, index: int) -> Any | None:
+        """Get the block at a specific index.
+
+        Args:
+            index: The index of the block (0-based)
+
+        Returns:
+            The XmlElement at that index, or None if out of bounds.
+        """
+        fragment = self.get_content_fragment()
+        children = list(fragment.children)
+        if 0 <= index < len(children):
+            return children[index]
+        return None
+
+    def get_block_info(self, block_id: str) -> dict[str, Any] | None:
+        """Get detailed information about a block by its ID.
+
+        Args:
+            block_id: The block ID to search for
+
+        Returns:
+            Dict with block info, or None if not found:
+            {
+                "block_id": "block-abc123",
+                "index": 3,
+                "type": "paragraph",
+                "xml": "<paragraph ...>content</paragraph>",
+                "attributes": {"indent": 1, ...},
+                "text_content": "Plain text content",
+                "context": {
+                    "total_blocks": 15,
+                    "prev_block_id": "block-xyz",
+                    "next_block_id": "block-def"
+                }
+            }
+        """
+        result = self.find_block_by_id(block_id)
+        if result is None:
+            return None
+
+        index, elem = result
+        fragment = self.get_content_fragment()
+        children = list(fragment.children)
+        total = len(children)
+
+        # Get prev/next block IDs
+        prev_id = None
+        next_id = None
+        if index > 0:
+            prev_elem = children[index - 1]
+            if hasattr(prev_elem, "attributes"):
+                prev_id = prev_elem.attributes.get("data-block-id")
+        if index < total - 1:
+            next_elem = children[index + 1]
+            if hasattr(next_elem, "attributes"):
+                next_id = next_elem.attributes.get("data-block-id")
+
+        # Extract attributes
+        attrs = dict(elem.attributes) if hasattr(elem, "attributes") else {}
+
+        # Get text content
+        text_content = str(elem) if elem else ""
+        # Strip XML tags for plain text (simple extraction)
+        import re
+        plain_text = re.sub(r"<[^>]+>", "", text_content)
+
+        return {
+            "block_id": block_id,
+            "index": index,
+            "type": elem.tag if hasattr(elem, "tag") else "unknown",
+            "xml": str(elem),
+            "attributes": attrs,
+            "text_content": plain_text.strip(),
+            "context": {
+                "total_blocks": total,
+                "prev_block_id": prev_id,
+                "next_block_id": next_id,
+            },
+        }
+
+    def query_blocks(
+        self,
+        block_type: str | None = None,
+        indent: int | None = None,
+        indent_gte: int | None = None,
+        indent_lte: int | None = None,
+        list_type: str | None = None,
+        checked: bool | None = None,
+        text_contains: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Query blocks matching specific criteria.
+
+        Args:
+            block_type: Filter by block type (paragraph, heading, listItem, etc.)
+            indent: Filter by exact indent level
+            indent_gte: Filter by indent >= value
+            indent_lte: Filter by indent <= value
+            list_type: For listItems, filter by listType (bullet, ordered, task)
+            checked: For task items, filter by checked state
+            text_contains: Filter by text content containing this string
+            limit: Maximum number of results to return
+
+        Returns:
+            List of matching block summaries.
+        """
+        fragment = self.get_content_fragment()
+        matches = []
+        import re
+
+        for i, child in enumerate(fragment.children):
+            if len(matches) >= limit:
+                break
+
+            if not hasattr(child, "attributes"):
+                continue
+
+            attrs = dict(child.attributes)
+            tag = child.tag if hasattr(child, "tag") else "unknown"
+
+            # Filter by type
+            if block_type and tag != block_type:
+                continue
+
+            # Filter by indent
+            elem_indent = attrs.get("indent", 0)
+            if isinstance(elem_indent, str):
+                try:
+                    elem_indent = int(elem_indent)
+                except ValueError:
+                    elem_indent = 0
+
+            if indent is not None and elem_indent != indent:
+                continue
+            if indent_gte is not None and elem_indent < indent_gte:
+                continue
+            if indent_lte is not None and elem_indent > indent_lte:
+                continue
+
+            # Filter by listType
+            if list_type and attrs.get("listType") != list_type:
+                continue
+
+            # Filter by checked
+            if checked is not None:
+                elem_checked = attrs.get("checked", False)
+                if isinstance(elem_checked, str):
+                    elem_checked = elem_checked.lower() == "true"
+                if elem_checked != checked:
+                    continue
+
+            # Filter by text content
+            text = str(child)
+            plain_text = re.sub(r"<[^>]+>", "", text).strip()
+            if text_contains and text_contains.lower() not in plain_text.lower():
+                continue
+
+            # Build match summary
+            matches.append({
+                "block_id": attrs.get("data-block-id"),
+                "index": i,
+                "type": tag,
+                "text_preview": plain_text[:100] + ("..." if len(plain_text) > 100 else ""),
+                "attributes": {
+                    k: v for k, v in attrs.items()
+                    if k not in ("data-block-id",)  # Exclude redundant fields
+                },
+            })
+
+        return matches
+
     def get_comments_map(self) -> "pycrdt.Map[dict[str, Any]]":
         """Get the comments Y.Map for this document."""
         return self._doc.get("comments", type=pycrdt.Map)
@@ -334,23 +561,31 @@ class DocumentWriter:
 
         This is collaborative-safe - it only adds content, never removes.
 
+        Note: List containers (bulletList, orderedList, taskList) are automatically
+        flattened to individual listItem blocks with listType attributes.
+
         Args:
             xml_str: TipTap XML for a single block element, e.g.:
                      "<paragraph>Hello world</paragraph>"
                      "<heading level=\"2\">Section</heading>"
+                     "<bulletList><listItem><paragraph>Item</paragraph></listItem></bulletList>"
         """
         fragment = self.get_content_fragment()
         elem = ET.fromstring(xml_str)
 
         with self._doc.transaction():
-            block = self._xml_to_pycrdt(elem)
-            fragment.children.append(block)
+            # Process element - may return multiple blocks for list containers
+            blocks = self._process_element(elem)
+            for block in blocks:
+                fragment.children.append(block)
             self._apply_pending_formats()
 
     def insert_block_at(self, index: int, xml_str: str) -> None:
         """Insert a block element at a specific position.
 
         This is collaborative-safe - it inserts without removing existing content.
+
+        Note: List containers are flattened, so multiple blocks may be inserted.
 
         Args:
             index: Position to insert at (0 = beginning)
@@ -360,8 +595,11 @@ class DocumentWriter:
         elem = ET.fromstring(xml_str)
 
         with self._doc.transaction():
-            block = self._xml_to_pycrdt(elem)
-            fragment.children.insert(index, block)
+            # Process element - may return multiple blocks for list containers
+            blocks = self._process_element(elem)
+            # Insert in order at the specified position
+            for i, block in enumerate(blocks):
+                fragment.children.insert(index + i, block)
             self._apply_pending_formats()
 
     def delete_block_at(self, index: int) -> None:
@@ -379,6 +617,240 @@ class DocumentWriter:
         """Get the number of blocks in the document."""
         fragment = self.get_content_fragment()
         return len(list(fragment.children))
+
+    # -------------------------------------------------------------------------
+    # Block-by-ID Operations (collaborative-safe, targeted updates)
+    # -------------------------------------------------------------------------
+
+    def find_block_by_id(self, block_id: str) -> tuple[int, Any] | None:
+        """Find a block by its data-block-id attribute.
+
+        Args:
+            block_id: The block ID to search for (e.g., "block-abc12345")
+
+        Returns:
+            Tuple of (index, XmlElement) if found, None otherwise.
+        """
+        fragment = self.get_content_fragment()
+        for i, child in enumerate(fragment.children):
+            if hasattr(child, "attributes"):
+                if child.attributes.get("data-block-id") == block_id:
+                    return (i, child)
+        return None
+
+    def delete_block_by_id(self, block_id: str, cascade_children: bool = False) -> list[str]:
+        """Delete a block by its ID, optionally cascading to indent-children.
+
+        Args:
+            block_id: The block ID to delete
+            cascade_children: If True, also delete all subsequent blocks with
+                             higher indent (indent-based children)
+
+        Returns:
+            List of deleted block IDs.
+
+        Raises:
+            ValueError: If block not found.
+        """
+        result = self.find_block_by_id(block_id)
+        if result is None:
+            raise ValueError(f"Block not found: {block_id}")
+
+        index, elem = result
+        deleted_ids = [block_id]
+
+        fragment = self.get_content_fragment()
+
+        with self._doc.transaction():
+            if cascade_children:
+                # Find children by indent
+                parent_indent = _get_attr_safe(elem.attributes, "indent", 0)
+                if isinstance(parent_indent, str):
+                    try:
+                        parent_indent = int(parent_indent)
+                    except ValueError:
+                        parent_indent = 0
+
+                children = list(fragment.children)
+                # Collect indices to delete (in reverse order to maintain positions)
+                indices_to_delete = [index]
+
+                for i in range(index + 1, len(children)):
+                    child = children[i]
+                    if not hasattr(child, "attributes"):
+                        break
+                    child_indent = _get_attr_safe(child.attributes, "indent", 0)
+                    if isinstance(child_indent, str):
+                        try:
+                            child_indent = int(child_indent)
+                        except ValueError:
+                            child_indent = 0
+
+                    if child_indent <= parent_indent:
+                        break  # No longer a child
+
+                    indices_to_delete.append(i)
+                    child_id = _get_attr_safe(child.attributes, "data-block-id", None)
+                    if child_id:
+                        deleted_ids.append(child_id)
+
+                # Delete in reverse order to maintain indices
+                for idx in reversed(indices_to_delete):
+                    del fragment.children[idx]
+            else:
+                del fragment.children[index]
+
+        return deleted_ids
+
+    def update_block_attributes(self, block_id: str, attributes: dict[str, Any]) -> None:
+        """Update specific attributes on a block without replacing its content.
+
+        This is the most surgical update - it only modifies the specified
+        attributes, leaving content and other attributes untouched.
+
+        Args:
+            block_id: The block ID to update
+            attributes: Dict of attributes to set. Common attributes:
+                       - indent: int (0-6)
+                       - checked: bool (for task items)
+                       - listType: str (bullet/ordered/task)
+                       - collapsed: bool (for outliner)
+
+        Raises:
+            ValueError: If block not found.
+        """
+        result = self.find_block_by_id(block_id)
+        if result is None:
+            raise ValueError(f"Block not found: {block_id}")
+
+        index, elem = result
+
+        with self._doc.transaction():
+            for key, value in attributes.items():
+                # Handle special cases
+                if key == "indent" and value is not None:
+                    value = int(value)
+                elif key == "checked":
+                    value = bool(value)
+
+                elem.attributes[key] = value
+
+    def replace_block_by_id(self, block_id: str, xml_str: str) -> str:
+        """Replace a block's content entirely while preserving its block ID.
+
+        The new block will keep the same data-block-id as the original.
+
+        Args:
+            block_id: The block ID to replace
+            xml_str: New TipTap XML for the block
+
+        Returns:
+            The block_id (unchanged).
+
+        Raises:
+            ValueError: If block not found.
+        """
+        result = self.find_block_by_id(block_id)
+        if result is None:
+            raise ValueError(f"Block not found: {block_id}")
+
+        index, _ = result
+        fragment = self.get_content_fragment()
+
+        # Parse new content
+        elem = ET.fromstring(xml_str)
+
+        # Override the block ID in the XML so _process_element uses it
+        elem.set("data-block-id", block_id)
+
+        with self._doc.transaction():
+            # Delete old block
+            del fragment.children[index]
+
+            # Process new element (handles list container flattening)
+            blocks = self._process_element(elem)
+
+            # Insert new block(s)
+            for i, block in enumerate(blocks):
+                fragment.children.insert(index + i, block)
+
+            self._apply_pending_formats()
+
+        return block_id
+
+    def insert_block_after_id(self, after_block_id: str, xml_str: str) -> str:
+        """Insert a new block after the specified block.
+
+        Args:
+            after_block_id: The block ID to insert after
+            xml_str: TipTap XML for the new block
+
+        Returns:
+            The new block's generated ID.
+
+        Raises:
+            ValueError: If reference block not found.
+        """
+        result = self.find_block_by_id(after_block_id)
+        if result is None:
+            raise ValueError(f"Block not found: {after_block_id}")
+
+        index, _ = result
+        fragment = self.get_content_fragment()
+        elem = ET.fromstring(xml_str)
+
+        # Pre-generate block ID if not already set
+        new_block_id = elem.get("data-block-id")
+        if not new_block_id:
+            new_block_id = _generate_block_id()
+            elem.set("data-block-id", new_block_id)
+
+        with self._doc.transaction():
+            blocks = self._process_element(elem)
+
+            for i, block in enumerate(blocks):
+                fragment.children.insert(index + 1 + i, block)
+
+            self._apply_pending_formats()
+
+        return new_block_id
+
+    def insert_block_before_id(self, before_block_id: str, xml_str: str) -> str:
+        """Insert a new block before the specified block.
+
+        Args:
+            before_block_id: The block ID to insert before
+            xml_str: TipTap XML for the new block
+
+        Returns:
+            The new block's generated ID.
+
+        Raises:
+            ValueError: If reference block not found.
+        """
+        result = self.find_block_by_id(before_block_id)
+        if result is None:
+            raise ValueError(f"Block not found: {before_block_id}")
+
+        index, _ = result
+        fragment = self.get_content_fragment()
+        elem = ET.fromstring(xml_str)
+
+        # Pre-generate block ID if not already set
+        new_block_id = elem.get("data-block-id")
+        if not new_block_id:
+            new_block_id = _generate_block_id()
+            elem.set("data-block-id", new_block_id)
+
+        with self._doc.transaction():
+            blocks = self._process_element(elem)
+
+            for i, block in enumerate(blocks):
+                fragment.children.insert(index + i, block)
+
+            self._apply_pending_formats()
+
+        return new_block_id
 
     # -------------------------------------------------------------------------
     # Destructive Methods (use with caution in collaborative contexts)
@@ -402,6 +874,9 @@ class DocumentWriter:
         WARNING: This is DESTRUCTIVE - it clears all existing content first.
         Any concurrent edits from other clients will be lost.
 
+        Note: List containers (bulletList, orderedList, taskList) are automatically
+        flattened to individual listItem blocks with listType attributes.
+
         For collaborative editing, prefer surgical methods:
         - append_block() to add content
         - insert_block_at() to insert at position
@@ -420,8 +895,10 @@ class DocumentWriter:
 
         with self._doc.transaction():
             for child in root:
-                elem = self._xml_to_pycrdt(child)
-                fragment.children.append(elem)
+                # Process element - may return multiple blocks for list containers
+                blocks = self._process_element(child)
+                for block in blocks:
+                    fragment.children.append(block)
             self._apply_pending_formats()
 
     # -------------------------------------------------------------------------
@@ -454,13 +931,97 @@ class DocumentWriter:
         self.replace_all_content(xml_str)
         return self._doc.get_update()
 
+    def _flatten_list_container(
+        self, elem: ET.Element, list_type: str, base_indent: int = 0
+    ) -> list[pycrdt.XmlElement]:
+        """Flatten a list container (bulletList/orderedList/taskList) into flat listItem blocks.
+
+        Converts nested list structure to flat listItems with attributes:
+        - listType: 'bullet' | 'ordered' | 'task'
+        - indent: hierarchy level (0-based)
+        - checked: boolean (for task items)
+
+        Args:
+            elem: The list container element (bulletList, orderedList, taskList)
+            list_type: The type of list ('bullet', 'ordered', 'task')
+            base_indent: The starting indent level for items in this list
+
+        Returns:
+            List of pycrdt.XmlElement for each flattened listItem
+        """
+        items: list[pycrdt.XmlElement] = []
+
+        for child in elem:
+            # Handle listItem or taskItem
+            if child.tag in ("listItem", "taskItem"):
+                # Collect content and nested lists separately
+                content_children: list[ET.Element] = []
+                nested_lists: list[tuple[ET.Element, str]] = []
+
+                for subchild in child:
+                    if subchild.tag in LIST_CONTAINER_TYPES:
+                        # This is a nested list - process after the item content
+                        nested_type = _get_list_type_from_container(subchild.tag)
+                        nested_lists.append((subchild, nested_type))
+                    else:
+                        # This is content (paragraph, etc.)
+                        content_children.append(subchild)
+
+                # Build the listItem element with content
+                contents: list[Any] = []
+                for content_child in content_children:
+                    if content_child.tag in BLOCK_TYPES:
+                        contents.append(self._xml_to_pycrdt(content_child))
+                    else:
+                        # Inline content directly in listItem
+                        content_items = self._extract_inline_content(content_child)
+                        contents.extend(content_items)
+
+                # If no block children, extract inline content from the listItem itself
+                if not contents:
+                    content_items = self._extract_inline_content(child)
+                    contents.extend(content_items)
+
+                # Build attributes for the flattened listItem
+                attrs: dict[str, Any] = {
+                    "listType": list_type,
+                    "data-block-id": _generate_block_id(),
+                }
+                if base_indent > 0:
+                    attrs["indent"] = base_indent
+
+                # For task items, handle checked state
+                if list_type == "task" or child.tag == "taskItem":
+                    attrs["listType"] = "task"
+                    checked = child.get("data-checked") == "true" or child.get("checked") == "true"
+                    if checked:
+                        attrs["checked"] = True
+
+                items.append(pycrdt.XmlElement(
+                    "listItem",
+                    attrs,
+                    contents=contents or None,
+                ))
+
+                # Process nested lists at increased indent
+                for nested_elem, nested_type in nested_lists:
+                    nested_items = self._flatten_list_container(
+                        nested_elem, nested_type, base_indent + 1
+                    )
+                    items.extend(nested_items)
+
+        return items
+
     def _xml_to_pycrdt(self, elem: ET.Element) -> pycrdt.XmlElement:
         """Convert XML element to pycrdt XmlElement.
 
         Handles three cases:
-        1. Block with nested blocks (list > listItem > paragraph): Recursively build children
+        1. Block with nested blocks (listItem > paragraph): Recursively build children
         2. Block with inline nodes (paragraph with footnotes): Mixed XmlText/XmlElement children
         3. Block with only marks (paragraph with bold/italic): Single XmlText with formatting
+
+        Note: List containers (bulletList, orderedList, taskList) are NOT handled here.
+        They should be pre-processed via _flatten_list_container() or _process_element().
 
         Marks (strong, em, etc.) are encoded as formatting attributes on XmlText.
         Inline nodes (footnote, commentMark) become XmlElement children.
@@ -470,17 +1031,24 @@ class DocumentWriter:
         """
         contents: list[Any] = []
 
-        # Check if this element has any nested block children
-        has_block_children = any(child.tag in BLOCK_TYPES for child in elem)
+        # Check if this element has any nested block children (excluding list containers)
+        has_block_children = any(
+            child.tag in BLOCK_TYPES or child.tag in LIST_CONTAINER_TYPES
+            for child in elem
+        )
 
         if has_block_children:
-            # Handle nested block structure (e.g., bulletList > listItem > paragraph)
+            # Handle nested block structure (e.g., listItem > paragraph)
             # Recursively process each block child
             for child in elem:
                 if child.tag in BLOCK_TYPES:
                     contents.append(self._xml_to_pycrdt(child))
+                elif child.tag in LIST_CONTAINER_TYPES:
+                    # Flatten nested list and add items
+                    list_type = _get_list_type_from_container(child.tag)
+                    items = self._flatten_list_container(child, list_type, 0)
+                    contents.extend(items)
                 # Note: We ignore non-block children in block containers
-                # TipTap structure is always: container > block > inline content
         else:
             # Handle inline content (paragraph, heading with text/marks/inline nodes)
             # This produces a list of content items: XmlText and XmlElement mixed
@@ -499,6 +1067,26 @@ class DocumentWriter:
             attrs,
             contents=contents or None,
         )
+
+    def _process_element(self, elem: ET.Element) -> list[pycrdt.XmlElement]:
+        """Process a single XML element, returning one or more pycrdt elements.
+
+        This handles the top-level case where list containers need to be flattened
+        into multiple listItem elements.
+
+        Args:
+            elem: The XML element to process
+
+        Returns:
+            List of pycrdt.XmlElement (usually one, but multiple for list containers)
+        """
+        if elem.tag in LIST_CONTAINER_TYPES:
+            # Flatten list container into multiple listItem elements
+            list_type = _get_list_type_from_container(elem.tag)
+            return self._flatten_list_container(elem, list_type, 0)
+        else:
+            # Regular block element - return as single-item list
+            return [self._xml_to_pycrdt(elem)]
 
     def _extract_text_runs(
         self, elem: ET.Element, inherited_marks: dict[str, dict[str, Any]] | None = None
