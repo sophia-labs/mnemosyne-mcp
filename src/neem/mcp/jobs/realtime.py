@@ -62,6 +62,7 @@ class RealtimeJobClient:
         token_provider: TokenProvider,
         *,
         dev_user_id: Optional[str] = None,
+        internal_service_secret: Optional[str] = None,
         heartbeat: float = 20.0,
         connect_timeout: float = 10.0,
         reconnect_base_delay: float = 1.0,
@@ -81,6 +82,7 @@ class RealtimeJobClient:
         self._max_connect_attempts = max_connect_attempts
         self._session_factory = session_factory
         self._dev_user_id = dev_user_id
+        self._internal_service_secret = internal_service_secret
         self._cache_ttl_seconds = cache_ttl_seconds
         self._cache_max_size = cache_max_size
         self._cleanup_interval_seconds = cleanup_interval_seconds
@@ -241,6 +243,9 @@ class RealtimeJobClient:
                 if self._dev_user_id:
                     headers["X-User-ID"] = self._dev_user_id
                     protocols = [f"Bearer.{self._dev_user_id}"]
+                # Add internal service auth header for cluster-internal requests
+                if self._internal_service_secret:
+                    headers["X-Internal-Service"] = self._internal_service_secret
 
                 self._ws = await self._session.ws_connect(
                     self.websocket_url,

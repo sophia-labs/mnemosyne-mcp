@@ -15,6 +15,7 @@ import jwt
 
 DEV_TOKEN_ENV = "MNEMOSYNE_DEV_TOKEN"
 DEV_USER_ENV = "MNEMOSYNE_DEV_USER_ID"
+INTERNAL_SERVICE_SECRET_ENV = "MNEMOSYNE_INTERNAL_SERVICE_SECRET"
 
 logger = structlog.get_logger(__name__)
 
@@ -70,6 +71,19 @@ def get_dev_user_id() -> Optional[str]:
     if dev_token:
         return dev_token.strip()
 
+    return None
+
+
+def get_internal_service_secret() -> Optional[str]:
+    """
+    Return the internal service secret for cluster-internal auth.
+
+    When running as a sidecar in Kubernetes, this secret allows the MCP
+    to authenticate with the API without needing a user JWT token.
+    """
+    secret = os.getenv(INTERNAL_SERVICE_SECRET_ENV)
+    if secret:
+        return secret.strip()
     return None
 
 

@@ -24,7 +24,7 @@ from neem.mcp.tools.basic import register_basic_tools
 from neem.mcp.tools.graph_ops import register_graph_ops_tools
 from neem.mcp.tools.hocuspocus import register_hocuspocus_tools
 from neem.utils.logging import LoggerFactory
-from neem.utils.token_storage import get_dev_user_id, validate_token_and_load
+from neem.utils.token_storage import get_dev_user_id, get_internal_service_secret, validate_token_and_load
 
 logger = LoggerFactory.get_logger("mcp.standalone_server")
 
@@ -300,6 +300,7 @@ def create_standalone_mcp_server() -> FastMCP:
             websocket_url=backend_config.websocket_url,  # type: ignore[arg-type]
             token_provider=validate_token_and_load,
             dev_user_id=get_dev_user_id(),
+            internal_service_secret=get_internal_service_secret(),
         )
         mcp_server._job_stream = job_client  # type: ignore[attr-defined]
         logger.info(

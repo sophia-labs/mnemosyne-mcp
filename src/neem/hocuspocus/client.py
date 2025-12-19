@@ -72,6 +72,7 @@ class HocuspocusClient:
         token_provider: TokenProvider,
         *,
         dev_user_id: Optional[str] = None,
+        internal_service_secret: Optional[str] = None,
         connect_timeout: float = 10.0,
         heartbeat_interval: float = 30.0,
     ) -> None:
@@ -81,12 +82,14 @@ class HocuspocusClient:
             base_url: Base URL of the Mnemosyne API (e.g., http://localhost:8080)
             token_provider: Callable that returns the current auth token
             dev_user_id: Optional dev mode user ID (bypasses OAuth)
+            internal_service_secret: Shared secret for cluster-internal auth
             connect_timeout: WebSocket connection timeout in seconds
             heartbeat_interval: Interval between ping messages
         """
         self._base_url = base_url.rstrip("/")
         self._token_provider = token_provider
         self._dev_user_id = dev_user_id
+        self._internal_service_secret = internal_service_secret
         self._connect_timeout = connect_timeout
         self._heartbeat_interval = heartbeat_interval
 
@@ -132,6 +135,9 @@ class HocuspocusClient:
             headers["Authorization"] = f"Bearer {token}"
         if self._dev_user_id:
             headers["X-User-ID"] = self._dev_user_id
+        # Add internal service auth header for cluster-internal requests
+        if self._internal_service_secret:
+            headers["X-Internal-Service"] = self._internal_service_secret
         return headers
 
     def _build_ws_protocols(self) -> Optional[list[str]]:
@@ -829,9 +835,29 @@ class HocuspocusClient:
         if channel.ws and not channel.ws.closed:
             await channel.ws.close()
 
+    async def _flush_pending_updates(self, timeout: float = 0.5) -> None:
+        """Wait briefly to ensure pending WebSocket sends complete.
+
+        Y.js updates are sent asynchronously via WebSocket. This method
+        gives pending sends time to complete before closing connections.
+        """
+        # Give the event loop time to process any pending sends
+        # This is a simple approach; a more robust solution would track
+        # pending operations explicitly
+        await asyncio.sleep(min(timeout, 0.1))
+
+        # Yield to allow any pending callbacks to run
+        await asyncio.sleep(0)
+
     async def close(self) -> None:
-        """Close all connections and cleanup."""
+        """Close all connections and cleanup.
+
+        Waits briefly for pending updates to be sent before closing.
+        """
         self._closed = True
+
+        # Flush pending updates before closing
+        await self._flush_pending_updates()
 
         # Close document channels
         for key in list(self._document_channels.keys()):

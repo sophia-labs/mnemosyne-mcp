@@ -13,6 +13,7 @@ from typing import Any, Dict, Literal, Optional
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
 
+from neem.mcp.auth import MCPAuthContext
 from neem.mcp.jobs import JobSubmitMetadata, RealtimeJobClient
 from neem.mcp.utils.response_filters import (
     extract_result_from_job_detail,
@@ -22,7 +23,6 @@ from neem.mcp.utils.response_filters import (
 )
 from neem.mcp.utils.token_utils import estimate_tokens, render_compact_json, render_pretty_json
 from neem.utils.logging import LoggerFactory
-from neem.utils.token_storage import get_dev_user_id, validate_token_and_load
 
 logger = LoggerFactory.get_logger("mcp.tools.graph_operations")
 
@@ -79,9 +79,8 @@ def register_graph_tools(server: FastMCP) -> None:
         Returns:
             Filtered query results in compact JSON format
         """
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         # Validate max_results
         if max_results < 1 or max_results > MAX_QUERY_RESULTS:
@@ -98,7 +97,7 @@ def register_graph_tools(server: FastMCP) -> None:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
                 response = await client.post(
                     f"{backend_config.base_url}/graphs/query",
-                    headers=_auth_headers(token),
+                    headers=auth.http_headers(),
                     json={
                         "sparql": sparql,
                         "result_format": result_format,
@@ -128,7 +127,7 @@ def register_graph_tools(server: FastMCP) -> None:
             job_stream=job_stream,
             job_id=job_id,
             poll_url=poll_url,
-            token=token,
+            auth=auth,
             wait_ms=DEFAULT_WAIT_MS,
         )
 
@@ -149,7 +148,7 @@ def register_graph_tools(server: FastMCP) -> None:
         if raw_results is None:
             result_url = job_data.get("result_url")
             if result_url:
-                raw_results = await _fetch_result(result_url, token)
+                raw_results = await _fetch_result(result_url, auth)
 
         if raw_results is None:
             return render_pretty_json({
@@ -206,9 +205,8 @@ def register_graph_tools(server: FastMCP) -> None:
         Returns:
             Success confirmation with affected triple count
         """
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         if context:
             await context.report_progress(5, 100)
@@ -218,7 +216,7 @@ def register_graph_tools(server: FastMCP) -> None:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
                 response = await client.post(
                     f"{backend_config.base_url}/graphs/update",
-                    headers=_auth_headers(token),
+                    headers=auth.http_headers(),
                     json={"sparql": sparql},
                 )
                 response.raise_for_status()
@@ -243,7 +241,7 @@ def register_graph_tools(server: FastMCP) -> None:
             job_stream=job_stream,
             job_id=job_id,
             poll_url=poll_url,
-            token=token,
+            auth=auth,
             wait_ms=DEFAULT_WAIT_MS,
         )
 
@@ -292,9 +290,8 @@ def register_graph_tools(server: FastMCP) -> None:
         Returns:
             Action-specific results in compact JSON
         """
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         if context:
             await context.report_progress(10, 100)
@@ -319,7 +316,7 @@ def register_graph_tools(server: FastMCP) -> None:
                 response = await client.request(
                     method,
                     f"{backend_config.base_url}{endpoint}",
-                    headers=_auth_headers(token),
+                    headers=auth.http_headers(),
                     params={"wait_ms": DEFAULT_WAIT_MS} if method == "GET" else None,
                 )
                 response.raise_for_status()
@@ -350,7 +347,7 @@ def register_graph_tools(server: FastMCP) -> None:
                 job_stream=job_stream,
                 job_id=job_id,
                 poll_url=poll_url,
-                token=token,
+                auth=auth,
                 wait_ms=DEFAULT_WAIT_MS,
             )
 
@@ -407,9 +404,8 @@ def register_graph_tools(server: FastMCP) -> None:
         Returns:
             Created graph metadata in compact JSON
         """
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         # Validate graph_id format
         if not graph_id or len(graph_id) > 128:
@@ -426,7 +422,7 @@ def register_graph_tools(server: FastMCP) -> None:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
                 response = await client.post(
                     f"{backend_config.base_url}/graphs",
-                    headers=_auth_headers(token),
+                    headers=auth.http_headers(),
                     json={
                         "graph_id": graph_id,
                         "title": title,
@@ -459,7 +455,7 @@ def register_graph_tools(server: FastMCP) -> None:
             job_stream=job_stream,
             job_id=job_id,
             poll_url=poll_url,
-            token=token,
+            auth=auth,
             wait_ms=DEFAULT_WAIT_MS,
         )
 
@@ -487,7 +483,7 @@ async def _await_job_status(
     job_stream: Optional[RealtimeJobClient],
     job_id: str,
     poll_url: Optional[str],
-    token: str,
+    auth: MCPAuthContext,
     wait_ms: int,
     stream_timeout: float = 60.0,
 ) -> Optional[JsonDict]:
@@ -498,14 +494,14 @@ async def _await_job_status(
             return status_payload
 
     if poll_url:
-        return await _poll_job_until_terminal(poll_url, token, wait_ms=wait_ms)
+        return await _poll_job_until_terminal(poll_url, auth, wait_ms=wait_ms)
 
     return None
 
 
 async def _poll_job_until_terminal(
     status_url: str,
-    token: str,
+    auth: MCPAuthContext,
     *,
     wait_ms: int = DEFAULT_WAIT_MS,
 ) -> Optional[JsonDict]:
@@ -519,7 +515,7 @@ async def _poll_job_until_terminal(
             try:
                 resp = await client.get(
                     status_url,
-                    headers=_auth_headers(token),
+                    headers=auth.http_headers(),
                     params={"wait_ms": wait_ms},
                 )
                 resp.raise_for_status()
@@ -541,11 +537,11 @@ async def _poll_job_until_terminal(
     return last_payload
 
 
-async def _fetch_result(result_url: str, token: str) -> Optional[JsonDict]:
+async def _fetch_result(result_url: str, auth: MCPAuthContext) -> Optional[JsonDict]:
     """Fetch job result payload."""
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            response = await client.get(result_url, headers=_auth_headers(token))
+            response = await client.get(result_url, headers=auth.http_headers())
             response.raise_for_status()
             if not response.content:
                 return None
@@ -553,12 +549,3 @@ async def _fetch_result(result_url: str, token: str) -> Optional[JsonDict]:
     except Exception as e:
         logger.warning("Failed to fetch job result", extra_context={"error": str(e)})
         return None
-
-
-def _auth_headers(token: str) -> Dict[str, str]:
-    """Generate auth headers with dev mode support."""
-    headers = {"Authorization": f"Bearer {token}"}
-    dev_user = get_dev_user_id()
-    if dev_user:
-        headers["X-User-ID"] = dev_user
-    return headers

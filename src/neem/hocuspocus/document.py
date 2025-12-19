@@ -547,6 +547,7 @@ class DocumentWriter:
     def __init__(self, doc: pycrdt.Doc) -> None:
         self._doc = doc
         self._pending_formats: list[tuple[pycrdt.XmlText, list[dict[str, Any]]]] = []
+        self._seen_block_ids: set[str] = set()  # Track IDs to detect duplicates
 
     def get_content_fragment(self) -> pycrdt.XmlFragment:
         """Get the content XmlFragment for native TipTap collaboration."""
@@ -595,7 +596,7 @@ class DocumentWriter:
                 "append_block: processed element into blocks",
                 extra_context={
                     "num_blocks": len(blocks),
-                    "block_tags": [b.tag for b in blocks] if blocks else [],
+                    "source_tag": elem.tag,
                 },
             )
             for block in blocks:
@@ -866,7 +867,7 @@ class DocumentWriter:
                 "insert_block_after_id: processed into blocks",
                 extra_context={
                     "num_blocks": len(blocks),
-                    "block_tags": [b.tag for b in blocks],
+                    "source_tag": elem.tag,
                 },
             )
 
@@ -958,13 +959,33 @@ class DocumentWriter:
         Args:
             xml_str: TipTap XML content, e.g.:
                      "<paragraph>Hello</paragraph><paragraph>World</paragraph>"
+
+        Raises:
+            ValueError: If content is not valid TipTap XML
         """
-        self.clear_content()
-        fragment = self.get_content_fragment()
+        content = xml_str.strip()
+
+        # Empty content is valid - just clear
+        if not content:
+            self.clear_content()
+            return
+
+        # Validate XML structure
+        if not content.startswith("<"):
+            raise ValueError(
+                "Content must be valid TipTap XML (got plain text). "
+                "Wrap plain text in <paragraph>...</paragraph>."
+            )
 
         # Wrap for parsing (handles multiple root elements)
-        wrapped = f"<root>{xml_str}</root>"
-        root = ET.fromstring(wrapped)
+        wrapped = f"<root>{content}</root>"
+        try:
+            root = ET.fromstring(wrapped)
+        except ET.ParseError as e:
+            raise ValueError(f"Invalid XML: {e}")
+
+        self.clear_content()
+        fragment = self.get_content_fragment()
 
         with self._doc.transaction():
             for child in root:
@@ -1056,9 +1077,22 @@ class DocumentWriter:
                     contents.extend(content_items)
 
                 # Build attributes for the flattened listItem
+                # Check for existing block ID from source element
+                existing_id = child.get("data-block-id", "").strip()
+                if existing_id and existing_id not in self._seen_block_ids:
+                    block_id = existing_id
+                else:
+                    if existing_id:
+                        logger.warning(
+                            "Duplicate block ID in list item, regenerating",
+                            extra_context={"original_id": existing_id},
+                        )
+                    block_id = _generate_block_id()
+                self._seen_block_ids.add(block_id)
+
                 attrs: dict[str, Any] = {
                     "listType": list_type,
-                    "data-block-id": _generate_block_id(),
+                    "data-block-id": block_id,
                 }
                 if base_indent > 0:
                     attrs["indent"] = base_indent
@@ -1131,9 +1165,24 @@ class DocumentWriter:
         # Build attributes, mapping XML names to TipTap internal names
         attrs = _map_block_attrs(elem.tag, dict(elem.attrib))
 
-        # Add data-block-id for block types if not present
-        if elem.tag in BLOCK_TYPES and "data-block-id" not in attrs:
-            attrs["data-block-id"] = _generate_block_id()
+        # Ensure valid unique data-block-id for block types
+        if elem.tag in BLOCK_TYPES:
+            block_id = attrs.get("data-block-id", "").strip()
+
+            # Empty or missing - generate new
+            if not block_id:
+                block_id = _generate_block_id()
+
+            # Duplicate - regenerate with warning
+            if block_id in self._seen_block_ids:
+                logger.warning(
+                    "Duplicate block ID detected, regenerating",
+                    extra_context={"original_id": block_id},
+                )
+                block_id = _generate_block_id()
+
+            self._seen_block_ids.add(block_id)
+            attrs["data-block-id"] = block_id
 
         return pycrdt.XmlElement(
             elem.tag,

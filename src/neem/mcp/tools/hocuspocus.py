@@ -7,15 +7,15 @@ CRDT synchronization, bypassing the job queue for lower latency operations.
 
 from __future__ import annotations
 
-import json
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 
 from mcp.server.fastmcp import Context, FastMCP
 
 from neem.hocuspocus import HocuspocusClient, DocumentReader, DocumentWriter, WorkspaceWriter, WorkspaceReader
 from neem.hocuspocus.document import extract_title_from_xml
+from neem.mcp.auth import MCPAuthContext
 from neem.utils.logging import LoggerFactory
-from neem.utils.token_storage import get_dev_user_id, get_user_id_from_token, validate_token_and_load
+from neem.utils.token_storage import get_dev_user_id, get_internal_service_secret, get_user_id_from_token, validate_token_and_load
 
 logger = LoggerFactory.get_logger("mcp.tools.hocuspocus")
 
@@ -37,6 +37,7 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
             base_url=backend_config.base_url,
             token_provider=validate_token_and_load,
             dev_user_id=get_dev_user_id(),
+            internal_service_secret=get_internal_service_secret(),
         )
         server._hocuspocus_client = hp_client  # type: ignore[attr-defined]
         logger.info(
@@ -56,15 +57,15 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
     async def get_active_context_tool(
         user_id: Optional[str] = None,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict:
         """Get the active graph and document from session state."""
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        token = auth.require_auth()
 
         # Auto-derive user_id if not provided
         if not user_id:
-            user_id = get_user_id_from_token(token)
+            # Try auth context first, then token
+            user_id = auth.user_id or (get_user_id_from_token(token) if token else None)
             if not user_id:
                 raise RuntimeError(
                     "Could not determine user ID. Either provide it explicitly or "
@@ -83,7 +84,7 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
                 "active_document_id": active_doc,
                 "session": session_snapshot,
             }
-            return _render_json(result)
+            return result
 
         except Exception as e:
             logger.error(
@@ -105,11 +106,10 @@ Lists: <bulletList><listItem><paragraph>item</paragraph></listItem></bulletList>
         graph_id: str,
         document_id: str,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict:
         """Read document content as TipTap XML."""
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         try:
             # Connect to the document channel
@@ -130,7 +130,7 @@ Lists: <bulletList><listItem><paragraph>item</paragraph></listItem></bulletList>
                 "content": xml_content,
                 "comments": comments,
             }
-            return _render_json(result)
+            return result
 
         except Exception as e:
             logger.error(
@@ -163,11 +163,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         content: str,
         comments: Optional[Dict[str, Any]] = None,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict:
         """Write TipTap XML content to a document."""
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         try:
             # 1. Write document content and comments
@@ -220,7 +219,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 "content": xml_content,
                 "comments": result_comments,
             }
-            return _render_json(result)
+            return result
 
         except Exception as e:
             logger.error(
@@ -248,7 +247,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         document_id: str,
         text: str,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict:
         """Append a block to a document.
 
         Args:
@@ -256,9 +255,8 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             document_id: The document to append to
             text: TipTap XML content. If it doesn't start with '<', it's wrapped in <paragraph>.
         """
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required")
@@ -305,7 +303,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 "document_id": document_id.strip(),
                 "new_block_id": new_block_id,
             }
-            return _render_json(result)
+            return result
 
         except Exception as e:
             logger.error(
@@ -329,11 +327,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
     async def get_workspace_tool(
         graph_id: str,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict:
         """Get workspace folder structure."""
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         try:
             # Connect to the workspace channel
@@ -346,7 +343,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 "graph_id": graph_id,
                 "workspace": snapshot,
             }
-            return _render_json(result)
+            return result
 
         except Exception as e:
             logger.error(
@@ -379,11 +376,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         order: Optional[float] = None,
         section: str = "documents",
         context: Context | None = None,
-    ) -> str:
+    ) -> dict:
         """Create a new folder in the workspace via Y.js."""
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required and cannot be empty")
@@ -421,7 +417,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 "section": section,
                 "workspace": snapshot,
             }
-            return _render_json(result)
+            return result
 
         except Exception as e:
             logger.error(
@@ -449,11 +445,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         new_parent_id: Optional[str] = None,
         new_order: Optional[float] = None,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict:
         """Move a folder to a new parent via Y.js."""
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required and cannot be empty")
@@ -493,7 +488,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 "new_parent_id": new_parent_id.strip() if new_parent_id else None,
                 "workspace": snapshot,
             }
-            return _render_json(result)
+            return result
 
         except Exception as e:
             logger.error(
@@ -516,11 +511,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         folder_id: str,
         new_label: str,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict:
         """Rename a folder via Y.js."""
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required and cannot be empty")
@@ -561,7 +555,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 "new_label": new_label.strip(),
                 "workspace": snapshot,
             }
-            return _render_json(result)
+            return result
 
         except Exception as e:
             logger.error(
@@ -588,11 +582,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         folder_id: str,
         cascade: bool = False,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict:
         """Delete a folder via Y.js."""
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required and cannot be empty")
@@ -618,7 +611,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 "cascade": cascade,
                 "workspace": snapshot,
             }
-            return _render_json(result)
+            return result
 
         except ValueError as ve:
             # Cascade error - folder has children
@@ -652,11 +645,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         new_parent_id: Optional[str] = None,
         new_order: Optional[float] = None,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict:
         """Move an artifact to a different folder via Y.js."""
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required and cannot be empty")
@@ -696,7 +688,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 "new_parent_id": new_parent_id.strip() if new_parent_id else None,
                 "workspace": snapshot,
             }
-            return _render_json(result)
+            return result
 
         except Exception as e:
             logger.error(
@@ -719,11 +711,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         artifact_id: str,
         new_label: str,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict:
         """Rename an artifact via Y.js."""
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required and cannot be empty")
@@ -764,7 +755,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 "new_label": new_label.strip(),
                 "workspace": snapshot,
             }
-            return _render_json(result)
+            return result
 
         except Exception as e:
             logger.error(
@@ -795,11 +786,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         document_id: str,
         new_parent_id: Optional[str] = None,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict:
         """Move a document to a folder via Y.js."""
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required and cannot be empty")
@@ -838,7 +828,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 "new_parent_id": new_parent_id.strip() if new_parent_id else None,
                 "workspace": snapshot,
             }
-            return _render_json(result)
+            return result
 
         except Exception as e:
             logger.error(
@@ -869,11 +859,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         document_id: str,
         block_id: str,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict:
         """Get detailed information about a block by its ID."""
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required")
@@ -900,7 +889,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 "document_id": document_id.strip(),
                 "block": block_info,
             }
-            return _render_json(result)
+            return result
 
         except Exception as e:
             logger.error(
@@ -935,11 +924,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         text_contains: Optional[str] = None,
         limit: int = 50,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict:
         """Query blocks matching specific criteria."""
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required")
@@ -971,7 +959,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 "count": len(matches),
                 "blocks": matches,
             }
-            return _render_json(result)
+            return result
 
         except Exception as e:
             logger.error(
@@ -1000,7 +988,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         attributes: Optional[Dict[str, Any]] = None,
         xml_content: Optional[str] = None,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict:
         """Update a block's attributes or content.
 
         Args:
@@ -1010,9 +998,8 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             attributes: Dict of attributes to update (indent, checked, listType, collapsed)
             xml_content: If provided, replaces the entire block content (preserves block_id)
         """
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required")
@@ -1055,7 +1042,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 "document_id": document_id.strip(),
                 "block": block_info,
             }
-            return _render_json(result)
+            return result
 
         except Exception as e:
             logger.error(
@@ -1085,7 +1072,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         xml_content: str,
         position: str = "after",
         context: Context | None = None,
-    ) -> str:
+    ) -> dict:
         """Insert a new block before or after a reference block.
 
         Args:
@@ -1095,9 +1082,8 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             xml_content: TipTap XML for the new block
             position: 'after' or 'before' the reference block
         """
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required")
@@ -1148,7 +1134,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 "new_block_id": new_block_id,
                 "block": block_info,
             }
-            return _render_json(result)
+            return result
 
         except Exception as e:
             logger.error(
@@ -1176,7 +1162,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         block_id: str,
         cascade: bool = False,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict:
         """Delete a block and optionally its indent-children.
 
         Args:
@@ -1185,9 +1171,8 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             block_id: The block to delete
             cascade: If True, also delete indent-children
         """
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required")
@@ -1221,7 +1206,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 "deleted_block_ids": deleted_ids,
                 "cascade": cascade,
             }
-            return _render_json(result)
+            return result
 
         except Exception as e:
             logger.error(
@@ -1235,8 +1220,92 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             )
             raise RuntimeError(f"Failed to delete block: {e}")
 
+    # -------------------------------------------------------------------------
+    # Batch Operations
+    # -------------------------------------------------------------------------
+
+    @server.tool(
+        name="batch_update_blocks",
+        title="Batch Update Blocks",
+        description=(
+            "Update multiple blocks in a single transaction. More efficient than "
+            "individual update_block calls. Each update can specify attributes to change "
+            "and/or new XML content. Returns results for each update."
+        ),
+    )
+    async def batch_update_blocks_tool(
+        graph_id: str,
+        document_id: str,
+        updates: list[Dict[str, Any]],
+        context: Context | None = None,
+    ) -> dict:
+        """Batch update multiple blocks atomically.
+
+        Args:
+            graph_id: The graph containing the document
+            document_id: The document containing the blocks
+            updates: List of update specs, each with:
+                - block_id (required): The block to update
+                - attributes (optional): Dict of attributes to update
+                - content (optional): New XML content for the block
+        """
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required")
+        if not document_id or not document_id.strip():
+            raise ValueError("document_id is required")
+        if not updates:
+            raise ValueError("updates list is required and cannot be empty")
+
+        try:
+            await hp_client.connect_document(graph_id.strip(), document_id.strip())
+
+            results: list[Dict[str, Any]] = []
+
+            def perform_batch(doc: Any) -> None:
+                writer = DocumentWriter(doc)
+                for update in updates:
+                    block_id = update.get("block_id")
+                    if not block_id:
+                        results.append({"error": "missing block_id"})
+                        continue
+
+                    try:
+                        if "content" in update:
+                            writer.replace_block_by_id(block_id, update["content"])
+                        if "attributes" in update:
+                            writer.update_block_attributes(block_id, update["attributes"])
+                        results.append({"block_id": block_id, "success": True})
+                    except Exception as e:
+                        results.append({"block_id": block_id, "error": str(e)})
+
+            await hp_client.transact_document(
+                graph_id.strip(),
+                document_id.strip(),
+                perform_batch,
+            )
+
+            return {
+                "success": all(r.get("success") for r in results),
+                "graph_id": graph_id.strip(),
+                "document_id": document_id.strip(),
+                "results": results,
+                "updated_count": sum(1 for r in results if r.get("success")),
+                "error_count": sum(1 for r in results if "error" in r),
+            }
+
+        except Exception as e:
+            logger.error(
+                "Failed to batch update blocks",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "update_count": len(updates),
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to batch update blocks: {e}")
+
     logger.info("Registered hocuspocus tools (documents, navigation, and block operations)")
-
-
-def _render_json(payload: JsonDict) -> str:
-    return json.dumps(payload, indent=2, sort_keys=True, default=str)

@@ -1,0 +1,1500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MCP Document Playground</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f5f5f5;
+            min-height: 100vh;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #ddd;
+        }
+        h1 {
+            margin: 0;
+            font-size: 1.5rem;
+            color: #333;
+        }
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 0.9rem;
+        }
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #ccc;
+        }
+        .status-dot.connected {
+            background: #4caf50;
+        }
+        .status-dot.synced {
+            background: #2196f3;
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        input, button {
+            padding: 8px 12px;
+            font-size: 14px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        input {
+            flex: 1;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button.secondary {
+            background: #6c757d;
+        }
+        button.secondary:hover {
+            background: #545b62;
+        }
+        .editor-wrapper {
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .toolbar {
+            display: flex;
+            gap: 5px;
+            padding: 10px;
+            border-bottom: 1px solid #eee;
+            background: #fafafa;
+            flex-wrap: wrap;
+        }
+        .toolbar button {
+            padding: 6px 10px;
+            font-size: 13px;
+            background: white;
+            color: #333;
+            border: 1px solid #ddd;
+        }
+        .toolbar button:hover {
+            background: #f0f0f0;
+        }
+        .toolbar button.is-active {
+            background: #007bff;
+            color: white;
+            border-color: #007bff;
+        }
+        .toolbar .separator {
+            border-left: 1px solid #ddd;
+            margin: 0 5px;
+        }
+
+        /* ===== EDITOR STYLES ===== */
+        #editor {
+            min-height: 400px;
+            padding: 20px;
+            outline: none;
+        }
+        #editor:focus {
+            outline: none;
+        }
+        #editor .ProseMirror {
+            outline: none;
+        }
+        #editor .ProseMirror p {
+            margin: 0 0 0.75em 0;
+        }
+        #editor .ProseMirror h1, #editor .ProseMirror h2, #editor .ProseMirror h3 {
+            margin: 1em 0 0.5em 0;
+        }
+        #editor .ProseMirror blockquote {
+            border-left: 3px solid #ddd;
+            margin: 0.5em 0;
+            padding-left: 1em;
+            color: #666;
+        }
+        #editor .ProseMirror code {
+            background: #f4f4f4;
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-family: 'Monaco', 'Menlo', monospace;
+        }
+        #editor .ProseMirror pre {
+            background: #2d2d2d;
+            color: #f8f8f2;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+        }
+        #editor .ProseMirror pre code {
+            background: none;
+            padding: 0;
+            color: inherit;
+        }
+        #editor .ProseMirror mark {
+            background: #fef3cd;
+            padding: 0 2px;
+        }
+
+        /* ===== FLAT LIST MODEL STYLES ===== */
+        /* All list items are direct children of .ProseMirror, not nested in containers */
+        #editor .ProseMirror > li {
+            list-style: none;
+            position: relative;
+            padding: 4px 8px 4px 28px;
+            margin: 2px 0;
+        }
+
+        /* Bullet list marker */
+        #editor .ProseMirror li[data-list-type="bullet"]::before {
+            content: '';
+            position: absolute;
+            left: 10px;
+            top: 12px;
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            background: #666;
+        }
+        /* Indented bullets get hollow style */
+        #editor .ProseMirror li[data-list-type="bullet"][data-indent]::before {
+            width: 4px;
+            height: 4px;
+            background: transparent;
+            border: 1.5px solid #888;
+        }
+
+        /* Ordered list - use CSS counters per indent level */
+        #editor .ProseMirror {
+            counter-reset: list-counter-0 list-counter-1 list-counter-2 list-counter-3 list-counter-4 list-counter-5 list-counter-6;
+        }
+
+        /* Indent level 0 */
+        #editor .ProseMirror li[data-list-type="ordered"]:not([data-indent]) {
+            counter-increment: list-counter-0;
+            counter-reset: list-counter-1 list-counter-2 list-counter-3 list-counter-4 list-counter-5 list-counter-6;
+        }
+        #editor .ProseMirror li[data-list-type="ordered"]:not([data-indent])::before {
+            content: counter(list-counter-0) '.';
+            position: absolute;
+            left: 6px;
+            top: 4px;
+            font-size: 14px;
+            color: #666;
+        }
+
+        /* Indent level 1 */
+        #editor .ProseMirror li[data-list-type="ordered"][data-indent="1"] {
+            counter-increment: list-counter-1;
+            counter-reset: list-counter-2 list-counter-3 list-counter-4 list-counter-5 list-counter-6;
+        }
+        #editor .ProseMirror li[data-list-type="ordered"][data-indent="1"]::before {
+            content: counter(list-counter-1, lower-alpha) '.';
+            position: absolute;
+            left: calc(6px + 2rem);
+            top: 4px;
+            font-size: 14px;
+            color: #666;
+        }
+
+        /* Indent level 2 */
+        #editor .ProseMirror li[data-list-type="ordered"][data-indent="2"] {
+            counter-increment: list-counter-2;
+            counter-reset: list-counter-3 list-counter-4 list-counter-5 list-counter-6;
+        }
+        #editor .ProseMirror li[data-list-type="ordered"][data-indent="2"]::before {
+            content: counter(list-counter-2, lower-roman) '.';
+            position: absolute;
+            left: calc(6px + 4rem);
+            top: 4px;
+            font-size: 14px;
+            color: #666;
+        }
+
+        /* Task list - checkbox rendering */
+        #editor .ProseMirror li[data-list-type="task"] {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            padding-left: 8px;
+        }
+        #editor .ProseMirror li[data-list-type="task"]::before {
+            display: none; /* No bullet marker for tasks */
+        }
+        #editor .ProseMirror li[data-list-type="task"] > label {
+            flex-shrink: 0;
+            margin-top: 2px;
+        }
+        #editor .ProseMirror li[data-list-type="task"] > label input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            cursor: pointer;
+            accent-color: #007bff;
+        }
+        #editor .ProseMirror li[data-list-type="task"] > .list-item-content {
+            flex: 1;
+        }
+        /* Checked tasks get strikethrough */
+        #editor .ProseMirror li[data-list-type="task"][data-checked="true"] > .list-item-content p {
+            text-decoration: line-through;
+            color: #999;
+        }
+
+        /* ===== INDENTATION LEVELS ===== */
+        #editor .ProseMirror li[data-indent="1"],
+        #editor .ProseMirror p[data-indent="1"],
+        #editor .ProseMirror h1[data-indent="1"],
+        #editor .ProseMirror h2[data-indent="1"],
+        #editor .ProseMirror h3[data-indent="1"] { margin-left: 2rem; }
+
+        #editor .ProseMirror li[data-indent="2"],
+        #editor .ProseMirror p[data-indent="2"],
+        #editor .ProseMirror h1[data-indent="2"],
+        #editor .ProseMirror h2[data-indent="2"],
+        #editor .ProseMirror h3[data-indent="2"] { margin-left: 4rem; }
+
+        #editor .ProseMirror li[data-indent="3"],
+        #editor .ProseMirror p[data-indent="3"],
+        #editor .ProseMirror h1[data-indent="3"],
+        #editor .ProseMirror h2[data-indent="3"],
+        #editor .ProseMirror h3[data-indent="3"] { margin-left: 6rem; }
+
+        #editor .ProseMirror li[data-indent="4"],
+        #editor .ProseMirror p[data-indent="4"],
+        #editor .ProseMirror h1[data-indent="4"],
+        #editor .ProseMirror h2[data-indent="4"],
+        #editor .ProseMirror h3[data-indent="4"] { margin-left: 8rem; }
+
+        #editor .ProseMirror li[data-indent="5"],
+        #editor .ProseMirror p[data-indent="5"],
+        #editor .ProseMirror h1[data-indent="5"],
+        #editor .ProseMirror h2[data-indent="5"],
+        #editor .ProseMirror h3[data-indent="5"] { margin-left: 10rem; }
+
+        #editor .ProseMirror li[data-indent="6"],
+        #editor .ProseMirror p[data-indent="6"],
+        #editor .ProseMirror h1[data-indent="6"],
+        #editor .ProseMirror h2[data-indent="6"],
+        #editor .ProseMirror h3[data-indent="6"] { margin-left: 12rem; }
+
+        /* Collapsed blocks - hide children */
+        #editor .ProseMirror .outliner-hidden {
+            display: none;
+        }
+
+        /* Has children indicator */
+        #editor .ProseMirror .outliner-has-children {
+            /* Could add a disclosure triangle here */
+        }
+
+        /* ===== FOOTNOTE STYLES ===== */
+        /* Counter for auto-numbering footnotes */
+        #editor .ProseMirror {
+            counter-reset: footnote list-counter-0 list-counter-1 list-counter-2 list-counter-3 list-counter-4 list-counter-5 list-counter-6;
+        }
+
+        #editor .ProseMirror .footnote-ref {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            vertical-align: super;
+            font-size: 0.75em;
+            line-height: 1;
+            color: #7c3aed;
+            cursor: help;
+            position: relative;
+            margin: 0 1px;
+            padding: 0 2px;
+            min-width: 1em;
+            font-weight: 500;
+            border-radius: 2px;
+            transition: background 0.15s ease;
+        }
+
+        #editor .ProseMirror .footnote-ref::before {
+            counter-increment: footnote;
+            content: counter(footnote);
+        }
+
+        #editor .ProseMirror .footnote-ref:hover {
+            background: #ede9fe;
+        }
+
+        /* Tooltip on hover */
+        #editor .ProseMirror .footnote-ref::after {
+            content: attr(data-footnote-content);
+            position: absolute;
+            bottom: calc(100% + 8px);
+            left: 50%;
+            transform: translateX(-50%);
+            background: #292524;
+            color: #ffffff;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 400;
+            line-height: 1.4;
+            white-space: normal;
+            max-width: 280px;
+            min-width: 120px;
+            text-align: left;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.15s ease, visibility 0.15s ease;
+            z-index: 1000;
+            pointer-events: none;
+        }
+
+        #editor .ProseMirror .footnote-ref:hover::after {
+            opacity: 1;
+            visibility: visible;
+        }
+
+        /* ===== COMMENT MARK STYLES ===== */
+        #editor .ProseMirror .comment-mark {
+            background-color: #fef9c3;
+            border-bottom: 2px solid #facc15;
+            cursor: pointer;
+            transition: background-color 0.15s ease;
+            border-radius: 2px;
+            padding: 0 1px;
+        }
+
+        #editor .ProseMirror .comment-mark:hover {
+            background-color: #fef08a;
+        }
+
+        #editor .ProseMirror .comment-mark.active,
+        #editor .ProseMirror .comment-mark[data-active="true"] {
+            background-color: #fde047;
+            border-bottom-color: #eab308;
+        }
+
+        /* ===== DEBUG PANEL ===== */
+        .debug-panel {
+            margin-top: 20px;
+            background: #2d2d2d;
+            color: #f8f8f2;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .debug-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 15px;
+            background: #1a1a1a;
+            cursor: pointer;
+        }
+        .debug-header h3 {
+            margin: 0;
+            font-size: 14px;
+            font-weight: 500;
+        }
+        .debug-content {
+            padding: 15px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 12px;
+            max-height: 300px;
+            overflow-y: auto;
+            display: none;
+        }
+        .debug-content.expanded {
+            display: block;
+        }
+        .debug-content pre {
+            margin: 0;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .info-box {
+            background: #e3f2fd;
+            border: 1px solid #90caf9;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+        .info-box code {
+            background: #bbdefb;
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>MCP Document Playground</h1>
+            <div class="status">
+                <span id="sync-status">Connecting...</span>
+                <div class="status-dot" id="status-dot"></div>
+            </div>
+        </header>
+
+        <div class="info-box">
+            <strong>Flat List Model:</strong> This editor matches the production frontend schema.
+            List items are root-level blocks with <code>data-list-type</code>, <code>data-indent</code>, and <code>data-checked</code> attributes.
+            <br><br>
+            <strong>Lists:</strong> Tab/Shift-Tab to indent, - or * for bullets, 1. for ordered, [ ] for tasks
+            <br>
+            <strong>Footnotes:</strong> Type <code>[^note text]</code> or Cmd/Ctrl+Shift+F
+            <br>
+            <strong>Comments:</strong> Select text, then Cmd/Ctrl+Shift+M or click 💬 Comment
+        </div>
+
+        <div class="controls">
+            <input type="text" id="graph-id" value="test-graph" placeholder="Graph ID">
+            <input type="text" id="doc-id" value="test-doc" placeholder="Document ID">
+            <button onclick="connectToDocument()">Connect</button>
+            <button class="secondary" onclick="refreshContent()">Refresh Debug</button>
+        </div>
+
+        <div class="editor-wrapper">
+            <div class="toolbar">
+                <button onclick="editor.chain().focus().toggleBold().run()" data-active="bold">
+                    <strong>B</strong>
+                </button>
+                <button onclick="editor.chain().focus().toggleItalic().run()" data-active="italic">
+                    <em>I</em>
+                </button>
+                <button onclick="editor.chain().focus().toggleStrike().run()" data-active="strike">
+                    <s>S</s>
+                </button>
+                <button onclick="editor.chain().focus().toggleCode().run()" data-active="code">
+                    &lt;/&gt;
+                </button>
+                <button onclick="editor.chain().focus().toggleHighlight().run()" data-active="highlight">
+                    <mark>H</mark>
+                </button>
+                <span class="separator"></span>
+                <button onclick="editor.chain().focus().toggleHeading({ level: 1 }).run()" data-active="heading-1">
+                    H1
+                </button>
+                <button onclick="editor.chain().focus().toggleHeading({ level: 2 }).run()" data-active="heading-2">
+                    H2
+                </button>
+                <button onclick="editor.chain().focus().toggleHeading({ level: 3 }).run()" data-active="heading-3">
+                    H3
+                </button>
+                <span class="separator"></span>
+                <button onclick="editor.chain().focus().toggleBulletItem().run()" data-active="bullet">
+                    &bull; Bullet
+                </button>
+                <button onclick="editor.chain().focus().toggleOrderedItem().run()" data-active="ordered">
+                    1. Ordered
+                </button>
+                <button onclick="editor.chain().focus().toggleTaskItem().run()" data-active="task">
+                    &#9744; Task
+                </button>
+                <span class="separator"></span>
+                <button onclick="editor.chain().focus().increaseIndent().run()">
+                    &rarr; Indent
+                </button>
+                <button onclick="editor.chain().focus().decreaseIndent().run()">
+                    &larr; Outdent
+                </button>
+                <span class="separator"></span>
+                <button onclick="editor.chain().focus().toggleBlockquote().run()" data-active="blockquote">
+                    &ldquo; Quote
+                </button>
+                <button onclick="editor.chain().focus().toggleCodeBlock().run()" data-active="codeBlock">
+                    Code Block
+                </button>
+                <button onclick="editor.chain().focus().setHorizontalRule().run()">
+                    &mdash; HR
+                </button>
+                <span class="separator"></span>
+                <button onclick="insertFootnote()">
+                    [^] Footnote
+                </button>
+                <button onclick="insertComment()" data-active="commentMark">
+                    💬 Comment
+                </button>
+            </div>
+            <div id="editor"></div>
+        </div>
+
+        <div class="debug-panel">
+            <div class="debug-header" onclick="toggleDebug()">
+                <h3>Debug: Y.Doc Content (XML)</h3>
+                <span id="debug-toggle">&#9660;</span>
+            </div>
+            <div class="debug-content" id="debug-content">
+                <pre id="debug-xml">(connecting...)</pre>
+            </div>
+        </div>
+    </div>
+
+    <!-- TipTap and Y.js from CDN -->
+    <script type="importmap">
+    {
+        "imports": {
+            "@tiptap/core": "https://esm.sh/@tiptap/core@2.1.13",
+            "@tiptap/starter-kit": "https://esm.sh/@tiptap/starter-kit@2.1.13",
+            "@tiptap/extension-highlight": "https://esm.sh/@tiptap/extension-highlight@2.1.13",
+            "@tiptap/extension-collaboration": "https://esm.sh/@tiptap/extension-collaboration@2.1.13",
+            "@tiptap/pm/state": "https://esm.sh/@tiptap/pm@2.1.13/state",
+            "@tiptap/pm/view": "https://esm.sh/@tiptap/pm@2.1.13/view",
+            "@tiptap/pm/inputrules": "https://esm.sh/@tiptap/pm@2.1.13/inputrules",
+            "yjs": "https://esm.sh/yjs@13.6.10",
+            "y-websocket": "https://esm.sh/y-websocket@1.5.0"
+        }
+    }
+    </script>
+    <script type="module">
+        import { Editor, Node, Mark, Extension, mergeAttributes } from '@tiptap/core';
+        import StarterKit from '@tiptap/starter-kit';
+        import Highlight from '@tiptap/extension-highlight';
+        import Collaboration from '@tiptap/extension-collaboration';
+        import { Plugin, PluginKey } from '@tiptap/pm/state';
+        import { Decoration, DecorationSet } from '@tiptap/pm/view';
+        import { InputRule } from '@tiptap/pm/inputrules';
+        import * as Y from 'yjs';
+        import { WebsocketProvider } from 'y-websocket';
+
+        // ===== FLAT LIST ITEM NODE =====
+        // Matches frontend: tiptap-list-item.ts
+        const ListItem = Node.create({
+            name: 'listItem',
+            group: 'block',
+            content: '(paragraph | heading | codeBlock | blockquote)+',
+            defining: true,
+
+            addAttributes() {
+                return {
+                    listType: {
+                        default: 'bullet',
+                        parseHTML: el => el.getAttribute('data-list-type') || 'bullet',
+                        renderHTML: attrs => ({ 'data-list-type': attrs.listType }),
+                    },
+                    indent: {
+                        default: 0,
+                        parseHTML: el => parseInt(el.getAttribute('data-indent') || '0', 10),
+                        renderHTML: attrs => attrs.indent > 0 ? { 'data-indent': attrs.indent } : {},
+                    },
+                    checked: {
+                        default: false,
+                        parseHTML: el => el.getAttribute('data-checked') === 'true',
+                        renderHTML: attrs => attrs.checked ? { 'data-checked': 'true' } : {},
+                    },
+                    'data-block-id': {
+                        default: null,
+                        parseHTML: el => el.getAttribute('data-block-id'),
+                        renderHTML: attrs => attrs['data-block-id'] ? { 'data-block-id': attrs['data-block-id'] } : {},
+                    },
+                };
+            },
+
+            parseHTML() {
+                return [{ tag: 'li' }];
+            },
+
+            renderHTML({ node, HTMLAttributes }) {
+                const attrs = mergeAttributes(HTMLAttributes);
+
+                // Task items get checkbox
+                if (node.attrs.listType === 'task') {
+                    return [
+                        'li', attrs,
+                        ['label', { contenteditable: 'false' },
+                            ['input', { type: 'checkbox', checked: node.attrs.checked ? 'checked' : null }]
+                        ],
+                        ['div', { class: 'list-item-content' }, 0]
+                    ];
+                }
+
+                return ['li', attrs, 0];
+            },
+
+            addCommands() {
+                return {
+                    toggleBulletItem: () => ({ commands, state }) => {
+                        const { $from } = state.selection;
+                        const node = this.findListItemAt($from, state);
+
+                        if (node?.type.name === 'listItem' && node.attrs.listType === 'bullet') {
+                            return commands.setNode('paragraph');
+                        }
+                        if (state.selection.$from.parent.type.name === 'paragraph') {
+                            return commands.setNode('listItem', { listType: 'bullet' });
+                        }
+                        if (node?.type.name === 'listItem') {
+                            return commands.updateAttributes('listItem', { listType: 'bullet' });
+                        }
+                        return false;
+                    },
+
+                    toggleOrderedItem: () => ({ commands, state }) => {
+                        const { $from } = state.selection;
+                        const node = this.findListItemAt($from, state);
+
+                        if (node?.type.name === 'listItem' && node.attrs.listType === 'ordered') {
+                            return commands.setNode('paragraph');
+                        }
+                        if (state.selection.$from.parent.type.name === 'paragraph') {
+                            return commands.setNode('listItem', { listType: 'ordered' });
+                        }
+                        if (node?.type.name === 'listItem') {
+                            return commands.updateAttributes('listItem', { listType: 'ordered' });
+                        }
+                        return false;
+                    },
+
+                    toggleTaskItem: () => ({ commands, state }) => {
+                        const { $from } = state.selection;
+                        const node = this.findListItemAt($from, state);
+
+                        if (node?.type.name === 'listItem' && node.attrs.listType === 'task') {
+                            return commands.setNode('paragraph');
+                        }
+                        if (state.selection.$from.parent.type.name === 'paragraph') {
+                            return commands.setNode('listItem', { listType: 'task', checked: false });
+                        }
+                        if (node?.type.name === 'listItem') {
+                            return commands.updateAttributes('listItem', { listType: 'task', checked: false });
+                        }
+                        return false;
+                    },
+
+                    toggleChecked: () => ({ commands, state }) => {
+                        const { $from } = state.selection;
+                        const node = this.findListItemAt($from, state);
+
+                        if (node?.type.name === 'listItem' && node.attrs.listType === 'task') {
+                            return commands.updateAttributes('listItem', { checked: !node.attrs.checked });
+                        }
+                        return false;
+                    },
+                };
+            },
+
+            // Helper to find listItem at position
+            findListItemAt($from, state) {
+                for (let d = $from.depth; d >= 1; d--) {
+                    const node = $from.node(d);
+                    if (node.type.name === 'listItem') return node;
+                }
+                return null;
+            },
+
+            addKeyboardShortcuts() {
+                return {
+                    Enter: ({ editor }) => {
+                        const { $from } = editor.state.selection;
+                        let listItemDepth = -1;
+                        let listItem = null;
+
+                        for (let d = $from.depth; d >= 1; d--) {
+                            if ($from.node(d).type.name === 'listItem') {
+                                listItemDepth = d;
+                                listItem = $from.node(d);
+                                break;
+                            }
+                        }
+
+                        if (!listItem) return false;
+
+                        const { listType, indent } = listItem.attrs;
+
+                        // Empty list item -> convert to paragraph
+                        if (listItem.textContent === '') {
+                            return editor.commands.setNode('paragraph');
+                        }
+
+                        // Split and create new list item
+                        return editor.chain()
+                            .splitBlock()
+                            .setNode('listItem', { listType, indent, checked: false })
+                            .run();
+                    },
+
+                    Backspace: ({ editor }) => {
+                        const { $from, empty } = editor.state.selection;
+                        if (!empty) return false;
+
+                        let listItemDepth = -1;
+                        let listItem = null;
+
+                        for (let d = $from.depth; d >= 1; d--) {
+                            if ($from.node(d).type.name === 'listItem') {
+                                listItemDepth = d;
+                                listItem = $from.node(d);
+                                break;
+                            }
+                        }
+
+                        if (!listItem) return false;
+
+                        // Check if at start of content
+                        const listItemStart = $from.before(listItemDepth);
+                        const paragraphStart = listItemStart + 2; // After listItem and paragraph opening
+                        const isAtStart = $from.pos === paragraphStart;
+
+                        if (!isAtStart) return false;
+
+                        const indent = listItem.attrs.indent || 0;
+
+                        // If indented, decrease indent first
+                        if (indent > 0) {
+                            return editor.commands.decreaseIndent();
+                        }
+
+                        // At indent 0, convert to paragraph
+                        return editor.commands.setNode('paragraph');
+                    },
+                };
+            },
+
+            addInputRules() {
+                return [
+                    // Bullet: "- " or "* "
+                    new InputRule({
+                        find: /^[-*]\s$/,
+                        handler: ({ state, range }) => {
+                            const { tr } = state;
+                            const $from = state.doc.resolve(range.from);
+                            if ($from.parent.type.name !== 'paragraph') return null;
+                            if ($from.parentOffset !== 0) return null;
+                            tr.delete(range.from, range.to);
+                            tr.setNodeMarkup($from.before(), this.type, { listType: 'bullet', indent: 0 });
+                            return tr;
+                        },
+                    }),
+                    // Ordered: "1. "
+                    new InputRule({
+                        find: /^(\d+)\.\s$/,
+                        handler: ({ state, range }) => {
+                            const { tr } = state;
+                            const $from = state.doc.resolve(range.from);
+                            if ($from.parent.type.name !== 'paragraph') return null;
+                            if ($from.parentOffset !== 0) return null;
+                            tr.delete(range.from, range.to);
+                            tr.setNodeMarkup($from.before(), this.type, { listType: 'ordered', indent: 0 });
+                            return tr;
+                        },
+                    }),
+                    // Task unchecked: "[ ] "
+                    new InputRule({
+                        find: /^\[\s?\]\s$/,
+                        handler: ({ state, range }) => {
+                            const { tr } = state;
+                            const $from = state.doc.resolve(range.from);
+                            if ($from.parent.type.name !== 'paragraph') return null;
+                            if ($from.parentOffset !== 0) return null;
+                            tr.delete(range.from, range.to);
+                            tr.setNodeMarkup($from.before(), this.type, { listType: 'task', indent: 0, checked: false });
+                            return tr;
+                        },
+                    }),
+                    // Task checked: "[x] " or "[X] "
+                    new InputRule({
+                        find: /^\[[xX]\]\s$/,
+                        handler: ({ state, range }) => {
+                            const { tr } = state;
+                            const $from = state.doc.resolve(range.from);
+                            if ($from.parent.type.name !== 'paragraph') return null;
+                            if ($from.parentOffset !== 0) return null;
+                            tr.delete(range.from, range.to);
+                            tr.setNodeMarkup($from.before(), this.type, { listType: 'task', indent: 0, checked: true });
+                            return tr;
+                        },
+                    }),
+                ];
+            },
+
+            // Node view for task items (checkbox handling)
+            addNodeView() {
+                return ({ node, getPos, editor }) => {
+                    if (node.attrs.listType !== 'task') return {};
+
+                    const dom = document.createElement('li');
+                    dom.setAttribute('data-list-type', 'task');
+                    if (node.attrs.indent > 0) dom.setAttribute('data-indent', String(node.attrs.indent));
+                    if (node.attrs.checked) dom.setAttribute('data-checked', 'true');
+                    if (node.attrs['data-block-id']) dom.setAttribute('data-block-id', node.attrs['data-block-id']);
+
+                    const label = document.createElement('label');
+                    label.contentEditable = 'false';
+
+                    const checkbox = document.createElement('input');
+                    checkbox.type = 'checkbox';
+                    checkbox.checked = node.attrs.checked;
+                    checkbox.addEventListener('change', () => {
+                        const pos = getPos();
+                        if (typeof pos === 'number') {
+                            editor.chain().focus().command(({ tr }) => {
+                                tr.setNodeMarkup(pos, undefined, { ...node.attrs, checked: checkbox.checked });
+                                return true;
+                            }).run();
+                        }
+                    });
+
+                    label.appendChild(checkbox);
+                    dom.appendChild(label);
+
+                    const contentDOM = document.createElement('div');
+                    contentDOM.classList.add('list-item-content');
+                    dom.appendChild(contentDOM);
+
+                    return {
+                        dom,
+                        contentDOM,
+                        update: (updatedNode) => {
+                            if (updatedNode.type.name !== 'listItem') return false;
+                            if (updatedNode.attrs.listType !== 'task') return false;
+
+                            checkbox.checked = updatedNode.attrs.checked;
+                            if (updatedNode.attrs.checked) {
+                                dom.setAttribute('data-checked', 'true');
+                            } else {
+                                dom.removeAttribute('data-checked');
+                            }
+                            if (updatedNode.attrs.indent > 0) {
+                                dom.setAttribute('data-indent', String(updatedNode.attrs.indent));
+                            } else {
+                                dom.removeAttribute('data-indent');
+                            }
+                            if (updatedNode.attrs['data-block-id']) {
+                                dom.setAttribute('data-block-id', updatedNode.attrs['data-block-id']);
+                            }
+                            return true;
+                        },
+                    };
+                };
+            },
+        });
+
+        // ===== OUTLINER EXTENSION =====
+        // Matches frontend: tiptap-outliner.ts
+        const MAX_INDENT = 6;
+        const OUTLINER_NODE_TYPES = ['paragraph', 'heading', 'listItem'];
+        const outlinerPluginKey = new PluginKey('outliner');
+
+        function getIndent(node) {
+            return node.attrs.indent || 0;
+        }
+
+        function isCollapsed(node) {
+            return !!node.attrs.collapsed;
+        }
+
+        function findOutlinerBlockAtSelection($from) {
+            let targetDepth = $from.depth;
+            let node = $from.node(targetDepth);
+
+            while (targetDepth > 1) {
+                const parent = $from.node(targetDepth - 1);
+                if (parent.type.name === 'doc') break;
+                targetDepth--;
+                node = $from.node(targetDepth);
+            }
+
+            if (!OUTLINER_NODE_TYPES.includes(node.type.name)) return null;
+            return { depth: targetDepth, node };
+        }
+
+        function getOutlinerBlocks(doc) {
+            const blocks = [];
+            doc.descendants((node, pos, parent) => {
+                if (parent === doc && OUTLINER_NODE_TYPES.includes(node.type.name)) {
+                    blocks.push({ pos, node });
+                }
+                if (node.type.name === 'listItem') return false;
+                return true;
+            });
+            return blocks;
+        }
+
+        function findChildren(doc, parentPos, parentIndent) {
+            const allBlocks = getOutlinerBlocks(doc);
+            const children = [];
+            const parentIndex = allBlocks.findIndex(b => b.pos === parentPos);
+            if (parentIndex === -1) return children;
+
+            for (let i = parentIndex + 1; i < allBlocks.length; i++) {
+                const block = allBlocks[i];
+                const blockIndent = getIndent(block.node);
+                if (blockIndent <= parentIndent) break;
+                children.push(block);
+            }
+            return children;
+        }
+
+        const Outliner = Extension.create({
+            name: 'outliner',
+
+            addGlobalAttributes() {
+                return [{
+                    types: OUTLINER_NODE_TYPES,
+                    attributes: {
+                        indent: {
+                            default: 0,
+                            parseHTML: el => parseInt(el.getAttribute('data-indent') || '0', 10),
+                            renderHTML: attrs => attrs.indent > 0 ? { 'data-indent': attrs.indent } : {},
+                        },
+                        collapsed: {
+                            default: false,
+                            parseHTML: el => el.getAttribute('data-collapsed') === 'true',
+                            renderHTML: attrs => attrs.collapsed ? { 'data-collapsed': 'true' } : {},
+                        },
+                    },
+                }];
+            },
+
+            addCommands() {
+                return {
+                    increaseIndent: () => ({ tr, state, dispatch }) => {
+                        const { $from } = state.selection;
+                        const target = findOutlinerBlockAtSelection($from);
+                        if (!target) return false;
+
+                        const { depth, node } = target;
+                        const currentIndent = getIndent(node);
+                        if (currentIndent >= MAX_INDENT) return false;
+
+                        if (dispatch) {
+                            const parentPos = $from.before(depth);
+                            const children = findChildren(state.doc, parentPos, currentIndent);
+
+                            tr.setNodeMarkup(parentPos, null, { ...node.attrs, indent: currentIndent + 1 });
+
+                            for (let i = children.length - 1; i >= 0; i--) {
+                                const child = children[i];
+                                const childIndent = getIndent(child.node);
+                                if (childIndent < MAX_INDENT) {
+                                    tr.setNodeMarkup(child.pos, null, { ...child.node.attrs, indent: childIndent + 1 });
+                                }
+                            }
+                            dispatch(tr);
+                        }
+                        return true;
+                    },
+
+                    decreaseIndent: () => ({ tr, state, dispatch }) => {
+                        const { $from } = state.selection;
+                        const target = findOutlinerBlockAtSelection($from);
+                        if (!target) return false;
+
+                        const { depth, node } = target;
+                        const currentIndent = getIndent(node);
+                        if (currentIndent <= 0) return false;
+
+                        if (dispatch) {
+                            const parentPos = $from.before(depth);
+                            const children = findChildren(state.doc, parentPos, currentIndent);
+
+                            tr.setNodeMarkup(parentPos, null, { ...node.attrs, indent: currentIndent - 1 });
+
+                            for (let i = children.length - 1; i >= 0; i--) {
+                                const child = children[i];
+                                const childIndent = getIndent(child.node);
+                                if (childIndent > 0) {
+                                    tr.setNodeMarkup(child.pos, null, { ...child.node.attrs, indent: childIndent - 1 });
+                                }
+                            }
+                            dispatch(tr);
+                        }
+                        return true;
+                    },
+
+                    toggleCollapse: () => ({ tr, state, dispatch }) => {
+                        const { $from } = state.selection;
+                        const target = findOutlinerBlockAtSelection($from);
+                        if (!target) return false;
+
+                        const { depth, node } = target;
+                        const parentPos = $from.before(depth);
+                        const currentIndent = getIndent(node);
+                        const children = findChildren(state.doc, parentPos, currentIndent);
+
+                        if (children.length === 0) return false;
+
+                        if (dispatch) {
+                            tr.setNodeMarkup(parentPos, null, { ...node.attrs, collapsed: !isCollapsed(node) });
+                            dispatch(tr);
+                        }
+                        return true;
+                    },
+                };
+            },
+
+            addKeyboardShortcuts() {
+                return {
+                    Tab: ({ editor }) => {
+                        if (editor.isActive('codeBlock')) return false;
+                        return editor.commands.increaseIndent();
+                    },
+                    'Shift-Tab': ({ editor }) => {
+                        if (editor.isActive('codeBlock')) return false;
+                        return editor.commands.decreaseIndent();
+                    },
+                    'Mod-.': ({ editor }) => editor.commands.toggleCollapse(),
+                };
+            },
+
+            addProseMirrorPlugins() {
+                return [
+                    new Plugin({
+                        key: outlinerPluginKey,
+                        props: {
+                            decorations: (state) => {
+                                const decorations = [];
+                                const { doc } = state;
+                                const allBlocks = getOutlinerBlocks(doc);
+                                const blocks = allBlocks.map(b => ({ ...b, indent: getIndent(b.node) }));
+
+                                let hiddenUntilIndent = null;
+
+                                for (let i = 0; i < blocks.length; i++) {
+                                    const { pos, node, indent } = blocks[i];
+                                    const nodeCollapsed = isCollapsed(node);
+                                    const hasChildren = i < blocks.length - 1 && blocks[i + 1].indent > indent;
+
+                                    if (hiddenUntilIndent !== null && indent <= hiddenUntilIndent) {
+                                        hiddenUntilIndent = null;
+                                    }
+
+                                    if (hiddenUntilIndent !== null) {
+                                        decorations.push(Decoration.node(pos, pos + node.nodeSize, { class: 'outliner-hidden' }));
+                                    } else if (hasChildren) {
+                                        decorations.push(Decoration.node(pos, pos + node.nodeSize, { class: 'outliner-has-children' }));
+                                    }
+
+                                    if (nodeCollapsed && hiddenUntilIndent === null) {
+                                        hiddenUntilIndent = indent;
+                                    }
+                                }
+
+                                return DecorationSet.create(doc, decorations);
+                            },
+                        },
+                    }),
+                ];
+            },
+        });
+
+        // ===== BLOCK ID EXTENSION =====
+        // Matches frontend: tiptap-block-id.ts
+        const BLOCK_TYPES = ['paragraph', 'heading', 'listItem', 'blockquote', 'codeBlock', 'horizontalRule'];
+
+        function generateBlockId() {
+            return `block-${crypto.randomUUID().slice(0, 8)}`;
+        }
+
+        const BlockId = Extension.create({
+            name: 'blockId',
+
+            addGlobalAttributes() {
+                return [{
+                    types: BLOCK_TYPES,
+                    attributes: {
+                        'data-block-id': {
+                            default: null,
+                            parseHTML: el => el.getAttribute('data-block-id'),
+                            renderHTML: attrs => attrs['data-block-id'] ? { 'data-block-id': attrs['data-block-id'] } : {},
+                        },
+                    },
+                }];
+            },
+
+            addProseMirrorPlugins() {
+                return [
+                    new Plugin({
+                        key: new PluginKey('blockId'),
+                        appendTransaction: (transactions, _oldState, newState) => {
+                            if (!transactions.some(tr => tr.docChanged)) return null;
+
+                            const { tr } = newState;
+                            let modified = false;
+
+                            newState.doc.descendants((node, pos) => {
+                                if (!node.isBlock) return;
+                                if (node.attrs['data-block-id']) return;
+                                if (!BLOCK_TYPES.includes(node.type.name)) return;
+
+                                tr.setNodeMarkup(pos, undefined, { ...node.attrs, 'data-block-id': generateBlockId() });
+                                modified = true;
+                            });
+
+                            return modified ? tr : null;
+                        },
+                    }),
+                ];
+            },
+        });
+
+        // ===== FOOTNOTE NODE =====
+        // Matches frontend: tiptap-footnote.ts
+        // Inline atom node that stores footnote content in data-footnote-content
+        const Footnote = Node.create({
+            name: 'footnote',
+            group: 'inline',
+            inline: true,
+            atom: true, // Can't place cursor inside
+
+            addAttributes() {
+                return {
+                    content: {
+                        default: '',
+                        parseHTML: el =>
+                            el.getAttribute('data-footnote-content') ||
+                            el.getAttribute('content') || '',
+                        renderHTML: attrs => ({
+                            'data-footnote-content': attrs.content,
+                        }),
+                    },
+                };
+            },
+
+            parseHTML() {
+                return [
+                    { tag: 'span[data-footnote]' },
+                    { tag: 'footnote' },
+                ];
+            },
+
+            renderHTML({ HTMLAttributes }) {
+                return [
+                    'span',
+                    mergeAttributes(HTMLAttributes, {
+                        'data-footnote': '',
+                        'class': 'footnote-ref',
+                        'tabindex': '0',
+                        'role': 'doc-noteref',
+                    }),
+                ];
+            },
+
+            addCommands() {
+                return {
+                    insertFootnote: (options) => ({ commands }) => {
+                        return commands.insertContent({
+                            type: 'footnote',
+                            attrs: { content: options.content },
+                        });
+                    },
+                };
+            },
+
+            addInputRules() {
+                return [
+                    // [^text] -> footnote
+                    new InputRule({
+                        find: /\[\^([^\]]+)\]$/,
+                        handler: ({ state, range, match }) => {
+                            const footnoteContent = match[1];
+                            const { tr } = state;
+                            if (footnoteContent) {
+                                tr.delete(range.from, range.to);
+                                tr.insert(range.from, this.type.create({ content: footnoteContent }));
+                            }
+                        },
+                    }),
+                ];
+            },
+
+            addKeyboardShortcuts() {
+                return {
+                    'Mod-Shift-f': () => {
+                        const content = window.prompt('Footnote content:');
+                        if (content) {
+                            return this.editor.commands.insertFootnote({ content });
+                        }
+                        return false;
+                    },
+                };
+            },
+
+            // Plugin for hover tooltips
+            addProseMirrorPlugins() {
+                return [
+                    new Plugin({
+                        key: new PluginKey('footnoteTooltip'),
+                        props: {
+                            handleDOMEvents: {
+                                mouseover: (_view, event) => {
+                                    const target = event.target;
+                                    if (target.classList && target.classList.contains('footnote-ref')) {
+                                        const content = target.getAttribute('data-footnote-content');
+                                        if (content) {
+                                            target.setAttribute('title', content);
+                                        }
+                                    }
+                                    return false;
+                                },
+                            },
+                        },
+                    }),
+                ];
+            },
+        });
+
+        // ===== COMMENT MARK =====
+        // Matches frontend: tiptap-comment.ts
+        // Mark that wraps text and stores commentId referencing external comment data
+        const CommentMark = Mark.create({
+            name: 'commentMark',
+            keepOnSplit: false,
+            inclusive: false,
+
+            addAttributes() {
+                return {
+                    commentId: {
+                        default: null,
+                        parseHTML: el =>
+                            el.getAttribute('data-comment-id') ||
+                            el.getAttribute('commentId'),
+                        renderHTML: attrs => {
+                            if (!attrs.commentId) return {};
+                            return { 'data-comment-id': attrs.commentId };
+                        },
+                    },
+                };
+            },
+
+            parseHTML() {
+                return [
+                    { tag: 'span[data-comment-id]' },
+                    { tag: 'commentMark' },
+                ];
+            },
+
+            renderHTML({ HTMLAttributes }) {
+                return [
+                    'span',
+                    mergeAttributes(HTMLAttributes, { class: 'comment-mark' }),
+                    0, // Content placeholder
+                ];
+            },
+
+            addCommands() {
+                return {
+                    setComment: (options) => ({ commands }) => {
+                        return commands.setMark('commentMark', options);
+                    },
+                    unsetComment: () => ({ commands }) => {
+                        return commands.unsetMark('commentMark');
+                    },
+                    toggleComment: (options) => ({ commands }) => {
+                        return commands.toggleMark('commentMark', options);
+                    },
+                };
+            },
+
+            addKeyboardShortcuts() {
+                return {
+                    'Mod-Shift-m': () => {
+                        const commentId = `c-${Date.now()}`;
+                        return this.editor.commands.setComment({ commentId });
+                    },
+                };
+            },
+        });
+
+        // ===== EDITOR SETUP =====
+        let editor = null;
+        let ydoc = null;
+        let provider = null;
+
+        window.editor = null;
+        window.ydoc = null;
+
+        function updateToolbarState() {
+            if (!editor) return;
+            document.querySelectorAll('.toolbar button[data-active]').forEach(button => {
+                const type = button.dataset.active;
+                let isActive = false;
+                if (type.startsWith('heading-')) {
+                    const level = parseInt(type.split('-')[1]);
+                    isActive = editor.isActive('heading', { level });
+                } else if (type === 'bullet') {
+                    isActive = editor.isActive('listItem', { listType: 'bullet' });
+                } else if (type === 'ordered') {
+                    isActive = editor.isActive('listItem', { listType: 'ordered' });
+                } else if (type === 'task') {
+                    isActive = editor.isActive('listItem', { listType: 'task' });
+                } else if (type === 'commentMark') {
+                    isActive = editor.isActive('commentMark');
+                } else {
+                    isActive = editor.isActive(type);
+                }
+                button.classList.toggle('is-active', isActive);
+            });
+        }
+
+        function updateDebugPanel() {
+            if (!ydoc) return;
+            const content = ydoc.getXmlFragment('content');
+            const xml = content.toString();
+            document.getElementById('debug-xml').textContent = xml || '(empty document)';
+        }
+
+        window.connectToDocument = function() {
+            const graphId = document.getElementById('graph-id').value || 'test-graph';
+            const docId = document.getElementById('doc-id').value || 'test-doc';
+
+            if (provider) provider.destroy();
+            if (editor) editor.destroy();
+
+            ydoc = new Y.Doc();
+            window.ydoc = ydoc;
+
+            const wsUrl = `ws://${window.location.host}/hocuspocus/docs/${graphId}/${docId}`;
+            console.log('Connecting to:', wsUrl);
+
+            provider = new WebsocketProvider(
+                `ws://${window.location.host}`,
+                `hocuspocus/docs/${graphId}/${docId}`,
+                ydoc,
+                { connect: true }
+            );
+
+            provider.on('status', ({ status }) => {
+                console.log('WebSocket status:', status);
+                const dot = document.getElementById('status-dot');
+                const statusText = document.getElementById('sync-status');
+
+                if (status === 'connected') {
+                    dot.classList.add('connected');
+                    statusText.textContent = 'Connected';
+                } else {
+                    dot.classList.remove('connected', 'synced');
+                    statusText.textContent = status === 'connecting' ? 'Connecting...' : 'Disconnected';
+                }
+            });
+
+            provider.on('sync', (isSynced) => {
+                console.log('Sync status:', isSynced);
+                const dot = document.getElementById('status-dot');
+                const statusText = document.getElementById('sync-status');
+
+                if (isSynced) {
+                    dot.classList.add('synced');
+                    statusText.textContent = 'Synced';
+                    updateDebugPanel();
+                }
+            });
+
+            // Debug: Log Y.Doc updates to catch footnote handling
+            ydoc.on('update', (update, origin) => {
+                const fragment = ydoc.getXmlFragment('content');
+                const xml = fragment.toString();
+                if (xml.includes('footnote')) {
+                    console.log('[Y.Doc update] Footnote detected in Y.Doc:', xml.substring(0, 200));
+                }
+            });
+
+            editor = new Editor({
+                element: document.getElementById('editor'),
+                extensions: [
+                    StarterKit.configure({
+                        history: false,
+                        // Disable built-in list extensions - using flat model
+                        bulletList: false,
+                        orderedList: false,
+                        listItem: false,
+                    }),
+                    Highlight,
+                    ListItem,   // Custom flat list item
+                    Outliner,   // Indent/collapse
+                    BlockId,    // Auto block IDs
+                    Footnote,   // Inline footnotes
+                    CommentMark, // Comment annotations
+                    Collaboration.configure({
+                        document: ydoc,
+                        fragment: ydoc.getXmlFragment('content'),
+                    }),
+                ],
+                content: '',
+                onUpdate: () => {
+                    updateToolbarState();
+                    updateDebugPanel();
+                },
+                onSelectionUpdate: () => {
+                    updateToolbarState();
+                },
+            });
+
+            window.editor = editor;
+
+            // Debug: Check if footnote is in schema
+            console.log('[Schema] footnote node exists:', !!editor.schema.nodes.footnote);
+            console.log('[Schema] footnote spec:', editor.schema.nodes.footnote?.spec);
+            console.log('[Schema] all node types:', Object.keys(editor.schema.nodes));
+
+            ydoc.on('update', () => {
+                updateDebugPanel();
+            });
+
+            console.log(`Editor connected to ${graphId}/${docId}`);
+        };
+
+        window.refreshContent = function() {
+            updateDebugPanel();
+        };
+
+        window.insertFootnote = function() {
+            const content = window.prompt('Footnote content:');
+            if (content && editor) {
+                editor.chain().focus().insertFootnote({ content }).run();
+            }
+        };
+
+        window.insertComment = function() {
+            if (!editor) return;
+            const { from, to } = editor.state.selection;
+            if (from === to) {
+                alert('Select some text first to add a comment.');
+                return;
+            }
+            const commentId = `c-${Date.now()}`;
+            editor.chain().focus().setComment({ commentId }).run();
+            console.log('Added comment:', commentId);
+        };
+
+        window.toggleDebug = function() {
+            const content = document.getElementById('debug-content');
+            const toggle = document.getElementById('debug-toggle');
+            content.classList.toggle('expanded');
+            toggle.textContent = content.classList.contains('expanded') ? '▲' : '▼';
+        };
+
+        window.addEventListener('DOMContentLoaded', () => {
+            connectToDocument();
+            document.getElementById('debug-content').classList.add('expanded');
+            document.getElementById('debug-toggle').textContent = '▲';
+        });
+    </script>
+</body>
+</html>

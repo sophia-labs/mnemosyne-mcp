@@ -15,9 +15,9 @@ from typing import Any, Dict, Optional
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
 
+from neem.mcp.auth import MCPAuthContext
 from neem.mcp.jobs import JobSubmitMetadata, RealtimeJobClient, WebSocketConnectionError
 from neem.utils.logging import LoggerFactory
-from neem.utils.token_storage import get_dev_user_id, validate_token_and_load
 
 logger = LoggerFactory.get_logger("mcp.tools.basic")
 
@@ -58,13 +58,12 @@ def register_basic_tools(server: FastMCP) -> None:
         ),
     )
     async def list_graphs_tool(context: Context | None = None) -> str:
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         metadata = await submit_job(
             base_url=backend_config.base_url,
-            token=token,
+            auth=auth,
             task_type="list_graphs",
             payload={},
         )
@@ -88,7 +87,7 @@ def register_basic_tools(server: FastMCP) -> None:
 
         # Poll for job completion and extract result
         status_payload = (
-            await poll_job_until_terminal(metadata.links.status, token)
+            await poll_job_until_terminal(metadata.links.status, auth)
             if metadata.links.status
             else None
         )
@@ -111,7 +110,7 @@ def register_basic_tools(server: FastMCP) -> None:
 
 async def submit_job(
     base_url: str,
-    token: str,
+    auth: MCPAuthContext,
     task_type: str,
     payload: JsonDict,
 ) -> JobSubmitMetadata:
@@ -120,7 +119,7 @@ async def submit_job(
     data = await _request_json(
         method="POST",
         url=url,
-        token=token,
+        auth=auth,
         json_payload={"type": task_type, "payload": payload},
     )
     return JobSubmitMetadata.from_api(data, base_url=base_url)
@@ -128,7 +127,7 @@ async def submit_job(
 
 async def poll_job_until_terminal(
     status_url: Optional[str],
-    token: str,
+    auth: MCPAuthContext,
     wait_ms: int = DEFAULT_WAIT_MS,
 ) -> Optional[JsonDict]:
     """Poll the job status endpoint until it reaches a terminal state."""
@@ -142,7 +141,7 @@ async def poll_job_until_terminal(
             attempt += 1
             resp = await client.get(
                 status_url,
-                headers=_auth_headers(token),
+                headers=auth.http_headers(),
                 params={"wait_ms": wait_ms},
             )
             resp.raise_for_status()
@@ -238,29 +237,47 @@ async def stream_job(
 async def _request_json(
     method: str,
     url: str,
-    token: str,
+    auth: MCPAuthContext,
     *,
     json_payload: Optional[JsonDict] = None,
 ) -> JsonDict:
+    headers = auth.http_headers()
+    # Log headers being sent (redact secrets)
+    safe_headers = {
+        k: (v[:20] + "..." if len(v) > 20 else v) if k.lower() not in ("authorization", "x-internal-service") else "[REDACTED]"
+        for k, v in headers.items()
+    }
+    logger.info(
+        "mcp_api_request",
+        extra_context={
+            "method": method,
+            "url": url,
+            "headers": safe_headers,
+            "auth_source": auth.source,
+            "has_token": bool(auth.token),
+            "has_user_id": bool(auth.user_id),
+            "has_internal_secret": bool(auth.internal_service_secret),
+        },
+    )
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         response = await client.request(
             method,
             url,
-            headers=_auth_headers(token),
+            headers=headers,
             json=json_payload,
         )
+        if response.status_code >= 400:
+            logger.error(
+                "mcp_api_request_failed",
+                extra_context={
+                    "status_code": response.status_code,
+                    "response_text": response.text[:500] if response.text else None,
+                },
+            )
         response.raise_for_status()
         if not response.content:
             return {}
         return response.json()
-
-
-def _auth_headers(token: str) -> Dict[str, str]:
-    headers = {"Authorization": f"Bearer {token}"}
-    dev_user = get_dev_user_id()
-    if dev_user:
-        headers["X-User-ID"] = dev_user
-    return headers
 
 
 def _render_json(payload: JsonDict) -> str:
