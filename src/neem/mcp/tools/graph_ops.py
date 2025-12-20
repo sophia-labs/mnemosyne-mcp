@@ -11,10 +11,10 @@ from typing import Any, Dict, Optional
 
 from mcp.server.fastmcp import Context, FastMCP
 
+from neem.mcp.auth import MCPAuthContext
 from neem.mcp.jobs import JobSubmitMetadata, RealtimeJobClient, WebSocketConnectionError
 from neem.mcp.tools.basic import poll_job_until_terminal, stream_job, submit_job
 from neem.utils.logging import LoggerFactory
-from neem.utils.token_storage import validate_token_and_load
 
 logger = LoggerFactory.get_logger("mcp.tools.graph_ops")
 
@@ -47,9 +47,8 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         context: Context | None = None,
     ) -> str:
         """Create a new knowledge graph."""
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required and cannot be empty")
@@ -65,7 +64,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
 
         metadata = await submit_job(
             base_url=backend_config.base_url,
-            token=token,
+            auth=auth,
             task_type="create_graph",
             payload=payload,
         )
@@ -74,7 +73,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             await context.report_progress(10, 100)
 
         result = await _wait_for_job_result(
-            job_stream, metadata, context, token
+            job_stream, metadata, context, auth
         )
 
         return _render_json({
@@ -99,16 +98,15 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         context: Context | None = None,
     ) -> str:
         """Delete a knowledge graph."""
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required and cannot be empty")
 
         metadata = await submit_job(
             base_url=backend_config.base_url,
-            token=token,
+            auth=auth,
             task_type="delete_graph",
             payload={"graph_id": graph_id.strip()},
         )
@@ -117,7 +115,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             await context.report_progress(10, 100)
 
         result = await _wait_for_job_result(
-            job_stream, metadata, context, token
+            job_stream, metadata, context, auth
         )
 
         return _render_json({
@@ -142,16 +140,15 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         context: Context | None = None,
     ) -> str:
         """Execute a SPARQL SELECT/CONSTRUCT query."""
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         if not sparql or not sparql.strip():
             raise ValueError("sparql query is required and cannot be empty")
 
         metadata = await submit_job(
             base_url=backend_config.base_url,
-            token=token,
+            auth=auth,
             task_type="run_query",
             payload={
                 "sparql": sparql.strip(),
@@ -163,7 +160,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             await context.report_progress(10, 100)
 
         result = await _wait_for_job_result(
-            job_stream, metadata, context, token
+            job_stream, metadata, context, auth
         )
 
         # Extract query results from job output
@@ -194,16 +191,15 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         context: Context | None = None,
     ) -> str:
         """Execute a SPARQL INSERT/DELETE/UPDATE operation."""
-        token = validate_token_and_load()
-        if not token:
-            raise RuntimeError("Not authenticated. Run `neem init` to refresh your token.")
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
         if not sparql or not sparql.strip():
             raise ValueError("sparql update is required and cannot be empty")
 
         metadata = await submit_job(
             base_url=backend_config.base_url,
-            token=token,
+            auth=auth,
             task_type="apply_update",
             payload={"sparql": sparql.strip()},
         )
@@ -212,7 +208,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             await context.report_progress(10, 100)
 
         result = await _wait_for_job_result(
-            job_stream, metadata, context, token
+            job_stream, metadata, context, auth
         )
 
         return _render_json({
@@ -228,7 +224,7 @@ async def _wait_for_job_result(
     job_stream: Optional[RealtimeJobClient],
     metadata: JobSubmitMetadata,
     context: Optional[Context],
-    token: str,
+    auth: MCPAuthContext,
 ) -> JsonDict:
     """Wait for job completion via WebSocket or polling, return result info including detail."""
     events = None
@@ -259,7 +255,7 @@ async def _wait_for_job_result(
 
     # Fall back to polling
     status_payload = (
-        await poll_job_until_terminal(metadata.links.status, token)
+        await poll_job_until_terminal(metadata.links.status, auth)
         if metadata.links.status
         else None
     )
