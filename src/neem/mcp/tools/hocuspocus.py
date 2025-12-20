@@ -289,7 +289,9 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 if count > 0:
                     block = reader.get_block_at(count - 1)
                     if block and hasattr(block, "attributes"):
-                        new_block_id = block.attributes.get("data-block-id", "")
+                        # pycrdt XmlAttributesView.get() doesn't support default arg
+                        attrs = block.attributes
+                        new_block_id = attrs.get("data-block-id") if "data-block-id" in attrs else ""
 
             await hp_client.transact_document(
                 graph_id.strip(),
