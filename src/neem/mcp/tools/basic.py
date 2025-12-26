@@ -57,7 +57,16 @@ def register_basic_tools(server: FastMCP) -> None:
             "Returns graph metadata including IDs, titles, and timestamps."
         ),
     )
-    async def list_graphs_tool(context: Context | None = None) -> str:
+    async def list_graphs_tool(
+        include_deleted: bool = False,
+        context: Context | None = None,
+    ) -> str:
+        """List graphs owned by the authenticated user.
+
+        Args:
+            include_deleted: If False (default), excludes graphs with status 'deleted'.
+                            Set to True to include soft-deleted graphs.
+        """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -81,6 +90,7 @@ def register_basic_tools(server: FastMCP) -> None:
                 await context.report_progress(80, 100)
             graphs = _extract_graphs_from_events(events)
             if graphs is not None:
+                graphs = _filter_deleted_graphs(graphs, include_deleted)
                 return _render_json({"graphs": graphs, "count": len(graphs)})
             # Fall back to raw events if extraction failed
             return _render_json({"job_id": metadata.job_id, "events": events})
@@ -98,6 +108,7 @@ def register_basic_tools(server: FastMCP) -> None:
         # Extract graphs from the job's detail.result_inline field
         graphs = _extract_graphs_from_status(status_payload)
         if graphs is not None:
+            graphs = _filter_deleted_graphs(graphs, include_deleted)
             return _render_json({"graphs": graphs, "count": len(graphs)})
 
         # Fallback: return error with debug info
@@ -169,6 +180,13 @@ def _extract_graphs_from_status(status_payload: Optional[JsonDict]) -> Optional[
         return result_inline
 
     return None
+
+
+def _filter_deleted_graphs(graphs: list, include_deleted: bool) -> list:
+    """Filter out soft-deleted graphs unless include_deleted is True."""
+    if include_deleted:
+        return graphs
+    return [g for g in graphs if g.get("status") != "deleted"]
 
 
 def _extract_graphs_from_events(events: list[JsonDict]) -> Optional[list]:
