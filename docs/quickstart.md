@@ -2,7 +2,7 @@
 
 Get up and running with Mnemosyne’s Claude Code integration in 4 steps.
 
-> **Status:** 10 MCP tools are available for graph management, SPARQL queries, and real-time document editing.
+> **Status:** 23+ MCP tools are available for graph management, SPARQL queries, real-time document editing, and workspace organization.
 
 ---
 
@@ -40,13 +40,14 @@ claude mcp add mnemosyne-graph neem-mcp-server \
 # Check authentication status
 neem status
 
-# Re-authenticate (when token expires after 4 hours)
+# Force re-authentication (tokens auto-refresh, but if needed)
 neem init --force
-# Then restart Claude Code
 
 # Log out
 neem logout
 ```
+
+> **Note:** Tokens automatically refresh in the background. You'll stay logged in for ~30 days without manual intervention.
 
 ---
 
@@ -83,11 +84,11 @@ The MCP server will send `X-User-ID: alice` and `Sec-WebSocket-Protocol: Bearer.
 
 ## Troubleshooting
 
-**Token expired?** → `neem init --force` + restart Claude Code
+**Auth errors?** → Tokens auto-refresh, but if your refresh token expired (~30 days), run `neem init`
 
 **Tools not showing?** → Make sure you reinstalled after updates: `uv cache clean && uv tool install --no-cache .`
 
-**Connection refused?** → Ensure the FastAPI backend is running and port-forwarded: `kubectl port-forward svc/mnemosyne-api 8001:80`
+**Connection refused?** → Ensure the FastAPI backend is running and port-forwarded: `kubectl port-forward svc/mnemosyne-api 8080:80`
 
 ---
 

@@ -2,7 +2,7 @@
 
 Quick guide to setting up OAuth authentication for Mnemosyne’s Claude Code integration.
 
-> **Status:** 10 MCP tools are available for graph management, SPARQL operations, and real-time document editing via Hocuspocus/Y.js.
+> **Status:** 23+ MCP tools are available for graph management, SPARQL operations, real-time document editing, and workspace organization via Hocuspocus/Y.js.
 
 ---
 
@@ -111,13 +111,19 @@ Token expires in: 2 hours 15 minutes
 
 ## Token Expiration
 
-Your authentication token expires after **about 4 hours**. When it expires:
+Tokens are **automatically refreshed** in the background using OAuth refresh tokens. After initial authentication:
 
-1. Claude Code MCP tools will return authentication errors.
-2. Re-authenticate: `neem init --force`
-3. Restart Claude Code
+- **ID tokens** expire after ~1 hour but are silently refreshed
+- **Refresh tokens** last ~30 days
+- You stay logged in without any manual intervention
 
-**Tip:** Run `neem status` before long work sessions to check if you need to refresh.
+When your refresh token eventually expires:
+
+1. You'll see authentication errors
+2. Run `neem init` to re-authenticate
+3. Continue working (no restart needed for MCP server)
+
+**Tip:** Run `neem status` to check your authentication status anytime.
 
 ---
 
@@ -136,20 +142,38 @@ This deletes your token from `~/.mnemosyne/config.json`.
 ## Available MCP Tools
 
 ### Graph Management
-- `list_graphs` – List all knowledge graphs owned by the authenticated user
-- `create_graph` – Create a new knowledge graph with ID, title, and optional description
-- `delete_graph` – Permanently delete a graph and all its contents
+- `list_graphs` – List all graphs (use `include_deleted=true` to show soft-deleted)
+- `create_graph` – Create a new knowledge graph
+- `delete_graph` – Soft-delete a graph
 
 ### SPARQL Operations
-- `sparql_query` – Execute read-only SPARQL SELECT/CONSTRUCT queries against your graphs
-- `sparql_update` – Execute SPARQL INSERT/DELETE/UPDATE operations to modify graph data
+- `sparql_query` – Execute read-only SPARQL SELECT/CONSTRUCT queries
+- `sparql_update` – Execute SPARQL INSERT/DELETE/UPDATE operations
+
+### Context & Workspace
+- `get_active_context` – Get the currently active graph/document from UI
+- `get_workspace` – Get the folder/file structure of a graph
+
+### Folder Operations
+- `create_folder`, `rename_folder`, `move_folder`, `delete_folder`
 
 ### Document Operations (via Hocuspocus/Y.js)
-- `get_active_context` – Get the currently active graph and document from the Mnemosyne UI
-- `get_workspace` – Get the folder/file structure of a graph
-- `read_document` – Read document content as markdown
-- `write_document` – Replace document content with markdown
-- `append_to_document` – Add a paragraph to an existing document
+- `read_document` – Read document content as TipTap XML
+- `write_document` – Replace document content
+- `append_to_document` – Add a block to the end
+- `move_document` – Move to a different folder
+- `delete_document` – Remove from workspace navigation
+
+### Block-Level Operations
+- `get_block` – Read a specific block by ID
+- `query_blocks` – Search for blocks matching criteria
+- `update_block` – Update a block's attributes or content
+- `insert_block` – Insert a new block relative to another
+- `delete_block` – Delete a block
+- `batch_update_blocks` – Update multiple blocks at once
+
+### Artifact Operations
+- `move_artifact`, `rename_artifact`
 
 All tools submit jobs to the FastAPI backend, stream realtime updates via WebSocket when available, and fall back to HTTP polling otherwise.
 
@@ -167,14 +191,14 @@ All tools submit jobs to the FastAPI backend, stream realtime updates via WebSoc
 3. Export `MNEMOSYNE_FASTAPI_URL=http://127.0.0.1:8001` (or use the host/port env vars) before launching `neem-mcp-server`.
 4. If you are running inside the cluster, set `MNEMOSYNE_FASTAPI_HOST` / `PORT` to the service DNS name and port instead.
 
-### “Authentication failed” or 401/403 errors
+### "Authentication failed" or 401/403 errors
 
-**Problem:** Token expired or invalid
+**Problem:** Refresh token expired (after ~30 days) or invalid
 
 **Solution:**
 ```bash
-neem init --force
-# Then restart Claude Code
+neem init
+# Tokens auto-refresh normally, but if refresh token expired, re-authenticate
 ```
 
 ### “Where did the tools go?”
