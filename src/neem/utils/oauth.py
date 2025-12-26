@@ -354,12 +354,76 @@ async def exchange_code_for_token(code: str, code_verifier: str) -> Dict[str, An
             raise OAuthError(f"Token exchange failed: {str(e)}") from e
 
 
-async def run_oauth_flow() -> str:
+async def refresh_access_token(refresh_token: str) -> Optional[Dict[str, Any]]:
+    """
+    Use refresh token to obtain new access and ID tokens.
+
+    Args:
+        refresh_token: OAuth refresh token from previous authentication
+
+    Returns:
+        Token response with new id_token, access_token, and possibly new refresh_token.
+        Returns None if refresh fails (e.g., refresh token expired).
+    """
+    logger.info("Attempting to refresh access token")
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                OAuthConfig.TOKEN_URL,
+                data={
+                    "grant_type": "refresh_token",
+                    "client_id": OAuthConfig.CLIENT_ID,
+                    "refresh_token": refresh_token,
+                },
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded"
+                },
+                timeout=30.0
+            )
+
+            if response.status_code == 400:
+                # Refresh token likely expired or revoked
+                error_data = response.json()
+                error = error_data.get("error", "unknown")
+                logger.warning(
+                    "Refresh token rejected",
+                    error=error,
+                    description=error_data.get("error_description"),
+                )
+                return None
+
+            response.raise_for_status()
+            tokens = response.json()
+
+            logger.info(
+                "Successfully refreshed tokens",
+                has_id_token="id_token" in tokens,
+                has_access_token="access_token" in tokens,
+                has_new_refresh_token="refresh_token" in tokens,
+            )
+
+            return tokens
+
+        except httpx.HTTPStatusError as e:
+            logger.warning(
+                "Token refresh failed with HTTP error",
+                status_code=e.response.status_code,
+            )
+            return None
+
+        except Exception as e:
+            logger.warning("Token refresh failed", error=str(e))
+            return None
+
+
+async def run_oauth_flow() -> Tuple[str, Optional[str]]:
     """
     Run complete OAuth Authorization Code + PKCE flow.
 
     Returns:
-        ID token (JWT) for API authentication
+        Tuple of (id_token, refresh_token) for API authentication.
+        refresh_token may be None if not provided by the IdP.
 
     Raises:
         OAuthError: If any step of the flow fails
@@ -414,10 +478,16 @@ async def run_oauth_flow() -> str:
         if not id_token:
             raise OAuthError("No ID token in response - unexpected token format")
 
-        print("✓ Tokens received", file=sys.stderr)
-        logger.info("OAuth flow completed successfully")
+        # Also extract refresh token for automatic renewal
+        refresh_token = tokens.get('refresh_token')
 
-        return id_token
+        print("✓ Tokens received", file=sys.stderr)
+        logger.info(
+            "OAuth flow completed successfully",
+            has_refresh_token=refresh_token is not None,
+        )
+
+        return id_token, refresh_token
 
     except (OAuthTimeoutError, OAuthCancelledError) as e:
         logger.warning("OAuth flow cancelled or timed out", reason=str(e))

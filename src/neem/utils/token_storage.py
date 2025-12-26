@@ -17,6 +17,9 @@ DEV_TOKEN_ENV = "MNEMOSYNE_DEV_TOKEN"
 DEV_USER_ENV = "MNEMOSYNE_DEV_USER_ID"
 INTERNAL_SERVICE_SECRET_ENV = "MNEMOSYNE_INTERNAL_SERVICE_SECRET"
 
+# Refresh token this many seconds before expiry to avoid edge cases
+TOKEN_REFRESH_THRESHOLD_SECONDS = 300  # 5 minutes
+
 logger = structlog.get_logger(__name__)
 
 
@@ -113,13 +116,18 @@ def ensure_config_dir() -> Path:
         raise TokenStorageError(f"Cannot create config directory: {config_dir}") from e
 
 
-def save_token(token: str, user_info: Optional[Dict[str, Any]] = None) -> Path:
+def save_token(
+    token: str,
+    user_info: Optional[Dict[str, Any]] = None,
+    refresh_token: Optional[str] = None,
+) -> Path:
     """
     Save authentication token to config file with secure permissions.
 
     Args:
-        token: JWT token to save
+        token: JWT token (id_token) to save
         user_info: Optional user information to save alongside token
+        refresh_token: Optional OAuth refresh token for automatic token renewal
 
     Returns:
         Path to saved config file
@@ -135,6 +143,9 @@ def save_token(token: str, user_info: Optional[Dict[str, Any]] = None) -> Path:
         "token": token,
         "version": "1.0"
     }
+
+    if refresh_token:
+        config_data["refresh_token"] = refresh_token
 
     if user_info:
         config_data["user_info"] = user_info
@@ -211,6 +222,19 @@ def load_config() -> Optional[Dict[str, Any]]:
         return None
 
 
+def load_refresh_token() -> Optional[str]:
+    """
+    Load refresh token from config file.
+
+    Returns:
+        Refresh token if found, None otherwise
+    """
+    config = load_config()
+    if not config:
+        return None
+    return config.get("refresh_token")
+
+
 def delete_token() -> bool:
     """
     Delete saved token (logout).
@@ -277,6 +301,41 @@ def is_token_expired(token: str) -> bool:
         return True
 
 
+def token_needs_refresh(token: str) -> bool:
+    """
+    Check if token is expired or will expire soon (within threshold).
+
+    Args:
+        token: JWT token to check
+
+    Returns:
+        True if token should be refreshed, False if still valid with buffer
+    """
+    try:
+        payload = jwt.decode(token, options={"verify_signature": False})
+        exp = payload.get('exp')
+        if not exp:
+            return True
+
+        import time
+        current_time = time.time()
+        time_remaining = exp - current_time
+
+        needs_refresh = time_remaining < TOKEN_REFRESH_THRESHOLD_SECONDS
+
+        if needs_refresh:
+            logger.debug(
+                "Token needs refresh",
+                seconds_remaining=int(time_remaining),
+                threshold=TOKEN_REFRESH_THRESHOLD_SECONDS,
+            )
+
+        return needs_refresh
+
+    except Exception:
+        return True
+
+
 def get_token_info(token: str) -> Optional[Dict[str, Any]]:
     """
     Extract information from JWT token without validation.
@@ -329,9 +388,63 @@ def get_user_id_from_token(token: Optional[str] = None) -> Optional[str]:
     return None
 
 
+def _try_refresh_token() -> Optional[str]:
+    """
+    Attempt to refresh the token using stored refresh_token.
+
+    Returns:
+        New id_token if refresh succeeded, None otherwise
+    """
+    refresh_token = load_refresh_token()
+    if not refresh_token:
+        logger.debug("No refresh token available")
+        return None
+
+    try:
+        import asyncio
+        from .oauth import refresh_access_token
+
+        # Run async refresh in sync context
+        try:
+            loop = asyncio.get_running_loop()
+            # Already in async context - this shouldn't happen often
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, refresh_access_token(refresh_token))
+                tokens = future.result(timeout=35)
+        except RuntimeError:
+            # No running loop - normal case
+            tokens = asyncio.run(refresh_access_token(refresh_token))
+
+        if not tokens:
+            logger.warning("Token refresh failed - refresh token may be expired")
+            return None
+
+        # Extract new tokens
+        new_id_token = tokens.get("id_token")
+        if not new_id_token:
+            logger.warning("Refresh response missing id_token")
+            return None
+
+        # Cognito may or may not return a new refresh token
+        new_refresh_token = tokens.get("refresh_token", refresh_token)
+
+        # Save new tokens
+        config = load_config() or {}
+        user_info = config.get("user_info")
+        save_token(new_id_token, user_info=user_info, refresh_token=new_refresh_token)
+
+        logger.info("Token refreshed successfully")
+        return new_id_token
+
+    except Exception as e:
+        logger.warning("Token refresh failed", error=str(e))
+        return None
+
+
 def validate_token_and_load() -> Optional[str]:
     """
-    Load token and validate it's not expired.
+    Load token and validate it's not expired. Auto-refreshes if needed.
 
     Returns:
         Valid token if found and not expired, None otherwise
@@ -350,11 +463,22 @@ def validate_token_and_load() -> Optional[str]:
         logger.debug("No token found")
         return None
 
-    if is_token_expired(token):
-        logger.warning("Stored token is expired")
-        import sys
-        print("⚠️  Stored authentication token has expired", file=sys.stderr)
-        print("   Please run 'neem init' to re-authenticate", file=sys.stderr)
-        return None
+    # Check if token needs refresh (expired or about to expire)
+    if token_needs_refresh(token):
+        logger.info("Token expired or expiring soon, attempting refresh")
+        new_token = _try_refresh_token()
+        if new_token:
+            return new_token
+
+        # Refresh failed - check if token is actually expired vs just close to expiry
+        if is_token_expired(token):
+            import sys
+            print("⚠️  Authentication token has expired and refresh failed", file=sys.stderr)
+            print("   Please run 'neem init' to re-authenticate", file=sys.stderr)
+            return None
+        else:
+            # Token still valid, just couldn't refresh early - use it anyway
+            logger.warning("Could not refresh token early, but token still valid")
+            return token
 
     return token

@@ -113,10 +113,12 @@ async def _init_async(api_url: Optional[str], force: bool):
         rprint("[bold]Step 1/2:[/bold] Authenticating with Mnemosyne...")
         console.print()
 
-        id_token = await run_oauth_flow()
+        id_token, refresh_token = await run_oauth_flow()
 
         console.print()
         rprint("[green]✓[/green] Authentication successful!")
+        if refresh_token:
+            rprint("[dim]   (with refresh token for automatic renewal)[/dim]")
 
     except OAuthTimeoutError as e:
         rprint(f"\n[yellow]⏱️  {e}[/yellow]")
@@ -149,7 +151,7 @@ async def _init_async(api_url: Optional[str], force: bool):
                 "name": token_info.get('name') or token_info.get('given_name')
             }
 
-        config_path = save_token(id_token, user_info)
+        config_path = save_token(id_token, user_info, refresh_token=refresh_token)
 
         rprint(f"[green]✓[/green] Token saved to: [cyan]{config_path}[/cyan]")
 
