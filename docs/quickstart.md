@@ -56,7 +56,7 @@ neem logout
 **Graph Management:**
 - "List my knowledge graphs" → `list_graphs`
 - "Create a new graph called 'research' with title 'Research Notes'" → `create_graph`
-- "Delete the test-graph" → `delete_graph`
+- "Delete the test-graph" → `delete_graph` (soft delete by default, `hard=true` for permanent)
 
 **SPARQL Operations:**
 - "Run this SPARQL query: SELECT * WHERE { ?s ?p ?o } LIMIT 10" → `sparql_query`

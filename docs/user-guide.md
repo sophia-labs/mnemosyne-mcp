@@ -76,7 +76,8 @@ Authentication is **completely automatic**. Here's what you can do:
 **Graph Management:**
 - "List my knowledge graphs" → `list_graphs`
 - "Create a new knowledge graph called 'my-research' for storing research papers" → `create_graph`
-- "Delete the test-graph" → `delete_graph`
+- "Delete the test-graph" → `delete_graph` (soft delete)
+- "Permanently delete test-graph and all its data" → `delete_graph` with `hard=true`
 
 **SPARQL Operations:**
 - "Run this SPARQL query: SELECT * WHERE { ?s ?p ?o } LIMIT 10" → `sparql_query`
@@ -144,7 +145,7 @@ This deletes your token from `~/.mnemosyne/config.json`.
 ### Graph Management
 - `list_graphs` – List all graphs (use `include_deleted=true` to show soft-deleted)
 - `create_graph` – Create a new knowledge graph
-- `delete_graph` – Soft-delete a graph
+- `delete_graph` – Delete a graph (soft delete by default, `hard=true` to permanently delete)
 
 ### SPARQL Operations
 - `sparql_query` – Execute read-only SPARQL SELECT/CONSTRUCT queries

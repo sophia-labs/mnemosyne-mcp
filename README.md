@@ -122,7 +122,7 @@ When the refresh token eventually expires, simply run `neem init` to re-authenti
 ### Graph Management
 - `list_graphs` – List all knowledge graphs owned by the authenticated user (use `include_deleted=true` to show soft-deleted graphs)
 - `create_graph` – Create a new knowledge graph with ID, title, and optional description
-- `delete_graph` – Soft-delete a graph (marks as deleted but retains data)
+- `delete_graph` – Delete a graph (soft delete by default, use `hard=true` to permanently delete)
 
 ### SPARQL Operations
 - `sparql_query` – Execute read-only SPARQL SELECT/CONSTRUCT queries against your graphs

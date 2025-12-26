@@ -89,15 +89,22 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         name="delete_graph",
         title="Delete Knowledge Graph",
         description=(
-            "Permanently deletes a knowledge graph and all its contents. "
-            "This action cannot be undone. Use with caution."
+            "Deletes a knowledge graph. By default, performs a soft delete (marks as deleted but retains data). "
+            "Set hard=True to permanently delete the graph and all its contents. Hard delete cannot be undone."
         ),
     )
     async def delete_graph_tool(
         graph_id: str,
+        hard: bool = False,
         context: Context | None = None,
     ) -> str:
-        """Delete a knowledge graph."""
+        """Delete a knowledge graph.
+
+        Args:
+            graph_id: The ID of the graph to delete
+            hard: If True, permanently delete the graph and all data.
+                  If False (default), soft delete (mark as deleted but retain data).
+        """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -108,7 +115,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             base_url=backend_config.base_url,
             auth=auth,
             task_type="delete_graph",
-            payload={"graph_id": graph_id.strip()},
+            payload={"graph_id": graph_id.strip(), "hard": hard},
         )
 
         if context:
@@ -122,6 +129,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             "success": True,
             "graph_id": graph_id.strip(),
             "deleted": True,
+            "hard_delete": hard,
             "job_id": metadata.job_id,
             **result,
         })
