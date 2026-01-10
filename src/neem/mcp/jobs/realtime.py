@@ -232,13 +232,16 @@ class RealtimeJobClient:
 
             try:
                 token = self._token_provider()
-                if not token:
+                # Allow internal service auth without a token (cluster-internal sidecars)
+                if not token and not (self._internal_service_secret and self._dev_user_id):
                     raise RuntimeError(
                         "Authentication token not available; run `neem init` again to refresh credentials."
                     )
 
                 self._session = self._session_factory() if self._session_factory else aiohttp.ClientSession()
-                headers = {"Authorization": f"Bearer {token}"}
+                headers: dict[str, str] = {}
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
                 protocols = None
                 if self._dev_user_id:
                     headers["X-User-ID"] = self._dev_user_id
