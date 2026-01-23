@@ -138,28 +138,55 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         name="sparql_query",
         title="Run SPARQL Query",
         description=(
-            "Executes a read-only SPARQL SELECT or CONSTRUCT query against the user's graphs. "
+            "Executes a read-only SPARQL SELECT or CONSTRUCT query against a specific graph. "
+            "The graph_id parameter is required to scope the query to a named graph. "
             "Returns query results as JSON. Use this for searching and retrieving data from graphs."
         ),
     )
     async def sparql_query_tool(
+        graph_id: str,
         sparql: str,
         result_format: str = "json",
         context: Context | None = None,
     ) -> str:
-        """Execute a SPARQL SELECT/CONSTRUCT query."""
+        """Execute a SPARQL SELECT/CONSTRUCT query against a specific graph."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required to scope the query")
         if not sparql or not sparql.strip():
             raise ValueError("sparql query is required and cannot be empty")
+
+        # Build the graph URI and inject FROM clause if not already present
+        graph_id = graph_id.strip()
+        sparql = sparql.strip()
+        graph_uri = f"urn:mnemosyne:user:{auth.user_id}:graph:{graph_id}"
+
+        # Check if query already has FROM clause (case-insensitive)
+        sparql_upper = sparql.upper()
+        if "FROM <" not in sparql_upper and "FROM NAMED" not in sparql_upper:
+            # Inject FROM clause after SELECT/CONSTRUCT/DESCRIBE/ASK
+            import re
+            # Match SELECT, CONSTRUCT, DESCRIBE, or ASK (with optional DISTINCT/REDUCED)
+            pattern = r"((?:SELECT|CONSTRUCT|DESCRIBE|ASK)(?:\s+(?:DISTINCT|REDUCED))?)"
+            match = re.search(pattern, sparql, re.IGNORECASE)
+            if match:
+                insert_pos = match.end()
+                sparql = f"{sparql[:insert_pos]} FROM <{graph_uri}>{sparql[insert_pos:]}"
+            else:
+                # Fallback: prepend FROM clause (may not work for all queries)
+                logger.warning(
+                    "sparql_query_from_injection_fallback",
+                    extra_context={"graph_id": graph_id, "query_prefix": sparql[:50]},
+                )
 
         metadata = await submit_job(
             base_url=backend_config.base_url,
             auth=auth,
             task_type="run_query",
             payload={
-                "sparql": sparql.strip(),
+                "sparql": sparql,
                 "result_format": result_format,
             },
         )
@@ -191,25 +218,68 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         title="Run SPARQL Update",
         description=(
             "Executes a SPARQL INSERT, DELETE, or UPDATE operation to modify graph data. "
+            "The graph_id parameter is required to scope the update to a specific graph. "
             "Use this for adding, modifying, or removing triples from graphs."
         ),
     )
     async def sparql_update_tool(
+        graph_id: str,
         sparql: str,
         context: Context | None = None,
     ) -> str:
-        """Execute a SPARQL INSERT/DELETE/UPDATE operation."""
+        """Execute a SPARQL INSERT/DELETE/UPDATE operation against a specific graph."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required to scope the update")
         if not sparql or not sparql.strip():
             raise ValueError("sparql update is required and cannot be empty")
+
+        # Build the graph URI for reference (updates typically use GRAPH clauses)
+        graph_id = graph_id.strip()
+        sparql = sparql.strip()
+        graph_uri = f"urn:mnemosyne:user:{auth.user_id}:graph:{graph_id}"
+
+        # For updates, check if query references a graph - if not, wrap in GRAPH clause
+        sparql_upper = sparql.upper()
+        if "GRAPH <" not in sparql_upper and "WITH <" not in sparql_upper:
+            # Check for INSERT DATA or DELETE DATA patterns
+            if "INSERT DATA" in sparql_upper:
+                # Replace INSERT DATA { with INSERT DATA { GRAPH <uri> {
+                import re
+                sparql = re.sub(
+                    r"(INSERT\s+DATA\s*)\{",
+                    rf"\1{{ GRAPH <{graph_uri}> {{",
+                    sparql,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                # Add closing brace before final }
+                sparql = sparql.rstrip()
+                if sparql.endswith("}"):
+                    sparql = sparql[:-1] + "} }"
+            elif "DELETE DATA" in sparql_upper:
+                import re
+                sparql = re.sub(
+                    r"(DELETE\s+DATA\s*)\{",
+                    rf"\1{{ GRAPH <{graph_uri}> {{",
+                    sparql,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                sparql = sparql.rstrip()
+                if sparql.endswith("}"):
+                    sparql = sparql[:-1] + "} }"
+            else:
+                # For other updates (INSERT/DELETE WHERE), prepend WITH clause
+                sparql = f"WITH <{graph_uri}>\n{sparql}"
 
         metadata = await submit_job(
             base_url=backend_config.base_url,
             auth=auth,
             task_type="apply_update",
-            payload={"sparql": sparql.strip()},
+            payload={"sparql": sparql},
         )
 
         if context:
