@@ -15,6 +15,7 @@ from neem.mcp.auth import MCPAuthContext
 from neem.mcp.jobs import JobSubmitMetadata, RealtimeJobClient, WebSocketConnectionError
 from neem.mcp.tools.basic import poll_job_until_terminal, stream_job, submit_job
 from neem.utils.logging import LoggerFactory
+from neem.utils.token_storage import get_user_id_from_token
 
 logger = LoggerFactory.get_logger("mcp.tools.graph_ops")
 
@@ -158,22 +159,29 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         if not sparql or not sparql.strip():
             raise ValueError("sparql query is required and cannot be empty")
 
+        # Extract user_id from auth context or token (same pattern as hocuspocus tools)
+        user_id = auth.user_id or (get_user_id_from_token(auth.token) if auth.token else None)
+        if not user_id:
+            raise ValueError(
+                "Could not determine user ID from authentication context. "
+                "Ensure your token contains a 'sub' claim or set MNEMOSYNE_DEV_USER_ID."
+            )
+
         # Build the graph URI and inject FROM clause if not already present
         graph_id = graph_id.strip()
         sparql = sparql.strip()
-        graph_uri = f"urn:mnemosyne:user:{auth.user_id}:graph:{graph_id}"
+        graph_uri = f"urn:mnemosyne:user:{user_id}:graph:{graph_id}"
 
         # Check if query already has FROM clause (case-insensitive)
         sparql_upper = sparql.upper()
         if "FROM <" not in sparql_upper and "FROM NAMED" not in sparql_upper:
-            # Inject FROM clause after SELECT/CONSTRUCT/DESCRIBE/ASK
+            # Inject FROM clause before WHERE (SPARQL syntax: SELECT vars FROM <graph> WHERE)
             import re
-            # Match SELECT, CONSTRUCT, DESCRIBE, or ASK (with optional DISTINCT/REDUCED)
-            pattern = r"((?:SELECT|CONSTRUCT|DESCRIBE|ASK)(?:\s+(?:DISTINCT|REDUCED))?)"
-            match = re.search(pattern, sparql, re.IGNORECASE)
-            if match:
-                insert_pos = match.end()
-                sparql = f"{sparql[:insert_pos]} FROM <{graph_uri}>{sparql[insert_pos:]}"
+            # Find WHERE clause position and insert FROM before it
+            where_match = re.search(r"\bWHERE\s*\{", sparql, re.IGNORECASE)
+            if where_match:
+                insert_pos = where_match.start()
+                sparql = f"{sparql[:insert_pos]}FROM <{graph_uri}> {sparql[insert_pos:]}"
             else:
                 # Fallback: prepend FROM clause (may not work for all queries)
                 logger.warning(
@@ -236,10 +244,18 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         if not sparql or not sparql.strip():
             raise ValueError("sparql update is required and cannot be empty")
 
+        # Extract user_id from auth context or token (same pattern as hocuspocus tools)
+        user_id = auth.user_id or (get_user_id_from_token(auth.token) if auth.token else None)
+        if not user_id:
+            raise ValueError(
+                "Could not determine user ID from authentication context. "
+                "Ensure your token contains a 'sub' claim or set MNEMOSYNE_DEV_USER_ID."
+            )
+
         # Build the graph URI for reference (updates typically use GRAPH clauses)
         graph_id = graph_id.strip()
         sparql = sparql.strip()
-        graph_uri = f"urn:mnemosyne:user:{auth.user_id}:graph:{graph_id}"
+        graph_uri = f"urn:mnemosyne:user:{user_id}:graph:{graph_id}"
 
         # For updates, check if query references a graph - if not, wrap in GRAPH clause
         sparql_upper = sparql.upper()
