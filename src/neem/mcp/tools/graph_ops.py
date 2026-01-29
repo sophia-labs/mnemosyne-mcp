@@ -305,8 +305,9 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             job_stream, metadata, context, auth
         )
 
+        job_succeeded = result.get("status") != "failed"
         return _render_json({
-            "success": True,
+            "success": job_succeeded,
             "job_id": metadata.job_id,
             **result,
         })
