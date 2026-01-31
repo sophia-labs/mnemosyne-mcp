@@ -140,7 +140,7 @@ class HocuspocusClient:
             headers["X-Internal-Service"] = self._internal_service_secret
         return headers
 
-    def _build_ws_protocols(self) -> Optional[list[str]]:
+    def _build_ws_protocols(self, user_id: Optional[str] = None) -> Optional[list[str]]:
         """Build WebSocket subprotocols for auth.
 
         Supported formats:
@@ -149,13 +149,17 @@ class HocuspocusClient:
 
         Internal service auth via subprotocol is preferred because it survives
         proxies that may strip custom HTTP headers during WebSocket upgrade.
+
+        Args:
+            user_id: Override user_id for this connection. If not provided, uses _dev_user_id.
         """
+        effective_user_id = user_id or self._dev_user_id
         # Prefer internal service auth via subprotocol (survives proxies)
-        if self._internal_service_secret and self._dev_user_id:
-            return [f"internal.{self._dev_user_id}.{self._internal_service_secret}"]
+        if self._internal_service_secret and effective_user_id:
+            return [f"internal.{effective_user_id}.{self._internal_service_secret}"]
         # Fallback to bearer format for dev mode
-        if self._dev_user_id:
-            return [f"Bearer.{self._dev_user_id}"]
+        if effective_user_id:
+            return [f"Bearer.{effective_user_id}"]
         return None
 
     # -------------------------------------------------------------------------
@@ -166,7 +170,7 @@ class HocuspocusClient:
         """Ensure connection to the user's session channel.
 
         Args:
-            user_id: The user ID (used for room naming, but auth comes from token)
+            user_id: The user ID (used for room naming AND auth)
         """
         if self.is_session_connected:
             return
@@ -182,6 +186,7 @@ class HocuspocusClient:
                 self._session_channel,
                 f"/hocuspocus/session/{user_id}",
                 f"session:{user_id}",
+                user_id=user_id,
             )
 
     async def _connect_channel(
@@ -189,11 +194,19 @@ class HocuspocusClient:
         channel: ChannelState,
         path: str,
         channel_name: str,
+        user_id: Optional[str] = None,
     ) -> None:
-        """Connect a channel to its WebSocket endpoint and perform initial sync."""
+        """Connect a channel to its WebSocket endpoint and perform initial sync.
+
+        Args:
+            channel: The channel state to connect
+            path: WebSocket endpoint path
+            channel_name: Human-readable channel name for logging
+            user_id: Override user_id for auth (uses _dev_user_id if not provided)
+        """
         ws_url = self._build_ws_url(path)
         headers = self._build_auth_headers()
-        protocols = self._build_ws_protocols()
+        protocols = self._build_ws_protocols(user_id=user_id)
 
         logger.info(
             "Connecting to Hocuspocus channel",
@@ -522,30 +535,34 @@ class HocuspocusClient:
     # Workspace Channel (per-graph filesystem)
     # -------------------------------------------------------------------------
 
-    async def connect_workspace(self, graph_id: str) -> None:
+    async def connect_workspace(self, graph_id: str, user_id: Optional[str] = None) -> None:
         """Connect to a workspace channel for the given graph.
 
         Args:
             graph_id: The graph ID
+            user_id: The user ID for auth (uses _dev_user_id if not provided)
         """
-        if graph_id in self._workspace_channels:
-            channel = self._workspace_channels[graph_id]
+        channel_key = f"{user_id or self._dev_user_id}:{graph_id}"
+        if channel_key in self._workspace_channels:
+            channel = self._workspace_channels[channel_key]
             if channel.ws and not channel.ws.closed and channel.synced.is_set():
                 return  # Already connected and synced
 
         channel = ChannelState()
-        self._workspace_channels[graph_id] = channel
+        self._workspace_channels[channel_key] = channel
 
         async with channel.lock:
             await self._connect_channel(
                 channel,
                 f"/hocuspocus/workspace/{graph_id}",
                 f"workspace:{graph_id}",
+                user_id=user_id,
             )
 
-    def get_workspace_snapshot(self, graph_id: str) -> Dict[str, Any]:
+    def get_workspace_snapshot(self, graph_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
         """Get a snapshot of the workspace state for a graph."""
-        channel = self._workspace_channels.get(graph_id)
+        channel_key = f"{user_id or self._dev_user_id}:{graph_id}"
+        channel = self._workspace_channels.get(channel_key)
         if channel is None:
             return {}
 
@@ -580,6 +597,7 @@ class HocuspocusClient:
         self,
         graph_id: str,
         operation: Callable[[pycrdt.Doc], None],
+        user_id: Optional[str] = None,
     ) -> None:
         """Execute an operation on a workspace and broadcast the incremental update.
 
@@ -592,15 +610,17 @@ class HocuspocusClient:
         Args:
             graph_id: The graph ID
             operation: Callable that modifies the doc (e.g., lambda doc: WorkspaceWriter(doc).upsert_document(...))
+            user_id: The user ID (uses _dev_user_id if not provided)
 
         Example:
             await client.transact_workspace(graph_id, lambda doc:
                 WorkspaceWriter(doc).upsert_document(doc_id, "My Document")
-            )
+            , user_id="user-123")
         """
-        channel = self._workspace_channels.get(graph_id)
+        channel_key = f"{user_id or self._dev_user_id}:{graph_id}"
+        channel = self._workspace_channels.get(channel_key)
         if channel is None:
-            raise ValueError(f"Workspace channel not connected: {graph_id}")
+            raise ValueError(f"Workspace channel not connected: {channel_key}")
 
         # Capture state BEFORE changes
         old_state = channel.doc.get_state()

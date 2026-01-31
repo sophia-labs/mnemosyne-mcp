@@ -196,10 +196,11 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             # 2. Update workspace navigation so document appears in file tree
             # Extract title from first heading, fallback to document_id
             title = extract_title_from_xml(content) or document_id
-            await hp_client.connect_workspace(graph_id)
+            await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
             await hp_client.transact_workspace(
                 graph_id,
                 lambda doc: WorkspaceWriter(doc).upsert_document(document_id, title),
+                user_id=auth.user_id,
             )
 
             # 3. Read back document content and comments to confirm
@@ -335,11 +336,11 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         auth.require_auth()
 
         try:
-            # Connect to the workspace channel
-            await hp_client.connect_workspace(graph_id)
+            # Connect to the workspace channel with user context
+            await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
 
             # Get workspace snapshot
-            snapshot = hp_client.get_workspace_snapshot(graph_id)
+            snapshot = hp_client.get_workspace_snapshot(graph_id, user_id=auth.user_id)
 
             result = {
                 "graph_id": graph_id,
@@ -393,7 +394,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("section must be 'documents' or 'artifacts'")
 
         try:
-            await hp_client.connect_workspace(graph_id.strip())
+            await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
 
             # Create folder via Y.js transact
             await hp_client.transact_workspace(
@@ -405,10 +406,11 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                     section=section,
                     order=order,
                 ),
+                user_id=auth.user_id,
             )
 
             # Return workspace snapshot for confirmation
-            snapshot = hp_client.get_workspace_snapshot(graph_id.strip())
+            snapshot = hp_client.get_workspace_snapshot(graph_id.strip(), user_id=auth.user_id)
 
             result = {
                 "success": True,
@@ -458,7 +460,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("folder_id is required and cannot be empty")
 
         try:
-            await hp_client.connect_workspace(graph_id.strip())
+            await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
 
             # Read current folder state from Y.js
             channel = hp_client._workspace_channels.get(graph_id.strip())
@@ -479,9 +481,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                     parent_id=new_parent_id.strip() if new_parent_id else None,
                     order=new_order,
                 ),
+                user_id=auth.user_id,
             )
 
-            snapshot = hp_client.get_workspace_snapshot(graph_id.strip())
+            snapshot = hp_client.get_workspace_snapshot(graph_id.strip(), user_id=auth.user_id)
 
             result = {
                 "success": True,
@@ -526,7 +529,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("new_label is required and cannot be empty")
 
         try:
-            await hp_client.connect_workspace(graph_id.strip())
+            await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
 
             # Verify folder exists
             channel = hp_client._workspace_channels.get(graph_id.strip())
@@ -546,9 +549,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                     folder_id.strip(),
                     name=new_label.strip(),
                 ),
+                user_id=auth.user_id,
             )
 
-            snapshot = hp_client.get_workspace_snapshot(graph_id.strip())
+            snapshot = hp_client.get_workspace_snapshot(graph_id.strip(), user_id=auth.user_id)
 
             result = {
                 "success": True,
@@ -595,15 +599,16 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("folder_id is required and cannot be empty")
 
         try:
-            await hp_client.connect_workspace(graph_id.strip())
+            await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
 
             # Delete folder via Y.js
             await hp_client.transact_workspace(
                 graph_id.strip(),
                 lambda doc: WorkspaceWriter(doc).delete_folder(folder_id.strip(), cascade=cascade),
+                user_id=auth.user_id,
             )
 
-            snapshot = hp_client.get_workspace_snapshot(graph_id.strip())
+            snapshot = hp_client.get_workspace_snapshot(graph_id.strip(), user_id=auth.user_id)
 
             result = {
                 "success": True,
@@ -658,7 +663,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("artifact_id is required and cannot be empty")
 
         try:
-            await hp_client.connect_workspace(graph_id.strip())
+            await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
 
             # Read current artifact state from Y.js
             channel = hp_client._workspace_channels.get(graph_id.strip())
@@ -679,9 +684,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                     parent_id=new_parent_id.strip() if new_parent_id else None,
                     order=new_order,
                 ),
+                user_id=auth.user_id,
             )
 
-            snapshot = hp_client.get_workspace_snapshot(graph_id.strip())
+            snapshot = hp_client.get_workspace_snapshot(graph_id.strip(), user_id=auth.user_id)
 
             result = {
                 "success": True,
@@ -726,7 +732,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("new_label is required and cannot be empty")
 
         try:
-            await hp_client.connect_workspace(graph_id.strip())
+            await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
 
             # Verify artifact exists
             channel = hp_client._workspace_channels.get(graph_id.strip())
@@ -746,9 +752,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                     artifact_id.strip(),
                     name=new_label.strip(),
                 ),
+                user_id=auth.user_id,
             )
 
-            snapshot = hp_client.get_workspace_snapshot(graph_id.strip())
+            snapshot = hp_client.get_workspace_snapshot(graph_id.strip(), user_id=auth.user_id)
 
             result = {
                 "success": True,
@@ -799,7 +806,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("document_id is required and cannot be empty")
 
         try:
-            await hp_client.connect_workspace(graph_id.strip())
+            await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
 
             # Verify document exists in workspace
             channel = hp_client._workspace_channels.get(graph_id.strip())
@@ -819,9 +826,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                     document_id.strip(),
                     parent_id=new_parent_id.strip() if new_parent_id else None,
                 ),
+                user_id=auth.user_id,
             )
 
-            snapshot = hp_client.get_workspace_snapshot(graph_id.strip())
+            snapshot = hp_client.get_workspace_snapshot(graph_id.strip(), user_id=auth.user_id)
 
             result = {
                 "success": True,
