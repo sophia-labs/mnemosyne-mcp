@@ -141,7 +141,19 @@ class HocuspocusClient:
         return headers
 
     def _build_ws_protocols(self) -> Optional[list[str]]:
-        """Build WebSocket subprotocols for auth (used in dev mode)."""
+        """Build WebSocket subprotocols for auth.
+
+        Supported formats:
+        - internal.{user_id}.{secret} - internal service auth (preferred for sidecars)
+        - Bearer.{user_id} - dev mode fallback
+
+        Internal service auth via subprotocol is preferred because it survives
+        proxies that may strip custom HTTP headers during WebSocket upgrade.
+        """
+        # Prefer internal service auth via subprotocol (survives proxies)
+        if self._internal_service_secret and self._dev_user_id:
+            return [f"internal.{self._dev_user_id}.{self._internal_service_secret}"]
+        # Fallback to bearer format for dev mode
         if self._dev_user_id:
             return [f"Bearer.{self._dev_user_id}"]
         return None
