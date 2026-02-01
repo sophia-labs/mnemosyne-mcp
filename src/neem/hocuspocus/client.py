@@ -559,6 +559,14 @@ class HocuspocusClient:
                 user_id=user_id,
             )
 
+    def get_workspace_channel(
+        self, graph_id: str, user_id: Optional[str] = None
+    ) -> Optional[ChannelState]:
+        """Get the channel state for a workspace."""
+        effective_user_id = user_id or self._dev_user_id
+        key = f"{effective_user_id}:{graph_id}"
+        return self._workspace_channels.get(key)
+
     def get_workspace_snapshot(self, graph_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
         """Get a snapshot of the workspace state for a graph."""
         channel_key = f"{user_id or self._dev_user_id}:{graph_id}"
@@ -646,14 +654,18 @@ class HocuspocusClient:
     # Document Channel (per-document content)
     # -------------------------------------------------------------------------
 
-    async def connect_document(self, graph_id: str, doc_id: str) -> None:
+    async def connect_document(
+        self, graph_id: str, doc_id: str, user_id: Optional[str] = None
+    ) -> None:
         """Connect to a document channel.
 
         Args:
             graph_id: The graph ID
             doc_id: The document ID
+            user_id: The user ID for auth (uses _dev_user_id if not provided)
         """
-        key = f"{graph_id}:{doc_id}"
+        effective_user_id = user_id or self._dev_user_id
+        key = f"{effective_user_id}:{graph_id}:{doc_id}"
 
         if key in self._document_channels:
             channel = self._document_channels[key]
@@ -668,11 +680,15 @@ class HocuspocusClient:
                 channel,
                 f"/hocuspocus/docs/{graph_id}/{doc_id}",
                 f"doc:{graph_id}:{doc_id}",
+                user_id=user_id,
             )
 
-    def get_document_channel(self, graph_id: str, doc_id: str) -> Optional[ChannelState]:
+    def get_document_channel(
+        self, graph_id: str, doc_id: str, user_id: Optional[str] = None
+    ) -> Optional[ChannelState]:
         """Get the channel state for a document."""
-        key = f"{graph_id}:{doc_id}"
+        effective_user_id = user_id or self._dev_user_id
+        key = f"{effective_user_id}:{graph_id}:{doc_id}"
         return self._document_channels.get(key)
 
     async def apply_document_update(
@@ -680,6 +696,7 @@ class HocuspocusClient:
         graph_id: str,
         doc_id: str,
         update: bytes,
+        user_id: Optional[str] = None,
     ) -> None:
         """Apply a Y.js update to a document and broadcast to server.
 
@@ -691,6 +708,7 @@ class HocuspocusClient:
             graph_id: The graph ID
             doc_id: The document ID
             update: The Y.js update bytes
+            user_id: The user ID (uses _dev_user_id if not provided)
         """
         import warnings
 
@@ -699,7 +717,8 @@ class HocuspocusClient:
             DeprecationWarning,
             stacklevel=2,
         )
-        key = f"{graph_id}:{doc_id}"
+        effective_user_id = user_id or self._dev_user_id
+        key = f"{effective_user_id}:{graph_id}:{doc_id}"
         channel = self._document_channels.get(key)
         if channel is None:
             raise ValueError(f"Document channel not connected: {key}")
@@ -716,6 +735,7 @@ class HocuspocusClient:
         graph_id: str,
         doc_id: str,
         operation: Callable[[pycrdt.Doc], None],
+        user_id: Optional[str] = None,
     ) -> None:
         """Execute an operation on a document and broadcast the incremental update.
 
@@ -729,13 +749,15 @@ class HocuspocusClient:
             graph_id: The graph ID
             doc_id: The document ID
             operation: Callable that modifies the doc (e.g., lambda doc: writer.append_block(...))
+            user_id: The user ID (uses _dev_user_id if not provided)
 
         Example:
             await client.transact_document(graph_id, doc_id, lambda doc:
                 DocumentWriter(doc).append_block("<paragraph>Hello</paragraph>")
-            )
+            , user_id="user-123")
         """
-        key = f"{graph_id}:{doc_id}"
+        effective_user_id = user_id or self._dev_user_id
+        key = f"{effective_user_id}:{graph_id}:{doc_id}"
         channel = self._document_channels.get(key)
         if channel is None:
             raise ValueError(f"Document channel not connected: {key}")
@@ -842,16 +864,21 @@ class HocuspocusClient:
     # Cleanup
     # -------------------------------------------------------------------------
 
-    async def disconnect_document(self, graph_id: str, doc_id: str) -> None:
+    async def disconnect_document(
+        self, graph_id: str, doc_id: str, user_id: Optional[str] = None
+    ) -> None:
         """Disconnect from a document channel."""
-        key = f"{graph_id}:{doc_id}"
+        effective_user_id = user_id or self._dev_user_id
+        key = f"{effective_user_id}:{graph_id}:{doc_id}"
         channel = self._document_channels.pop(key, None)
         if channel:
             await self._close_channel(channel)
 
-    async def disconnect_workspace(self, graph_id: str) -> None:
+    async def disconnect_workspace(self, graph_id: str, user_id: Optional[str] = None) -> None:
         """Disconnect from a workspace channel."""
-        channel = self._workspace_channels.pop(graph_id, None)
+        effective_user_id = user_id or self._dev_user_id
+        key = f"{effective_user_id}:{graph_id}"
+        channel = self._workspace_channels.pop(key, None)
         if channel:
             await self._close_channel(channel)
 

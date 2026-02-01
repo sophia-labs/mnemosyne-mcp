@@ -16,6 +16,7 @@ from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import (
     get_dev_user_id,
     get_internal_service_secret,
+    get_user_id_from_token,
     validate_token_and_load,
 )
 
@@ -48,10 +49,14 @@ class MCPAuthContext:
     def from_context(cls, ctx: Optional[Context]) -> MCPAuthContext:
         """Extract auth from MCP request context, with fallbacks.
 
-        Priority:
+        Token priority:
         1. HTTP Authorization header (Bearer token from OpenCode mcpAuth)
         2. validate_token_and_load() for local/dev token
-        3. Internal service auth with dev user
+
+        User ID priority:
+        1. HTTP X-User-ID header (sidecar mode)
+        2. MNEMOSYNE_DEV_USER_ID or MNEMOSYNE_DEV_TOKEN env vars
+        3. JWT token claims (sub, user_id, uid) - for local CLI users
         """
         token: Optional[str] = None
         user_id: Optional[str] = None
@@ -98,6 +103,15 @@ class MCPAuthContext:
             user_id = get_dev_user_id()
             if user_id and source == "none":
                 source = "dev_env"
+
+        # 4. Extract user_id from JWT token claims (for local CLI users)
+        if not user_id and token:
+            user_id = get_user_id_from_token(token)
+            if user_id:
+                logger.debug(
+                    "user_id_from_token_claim",
+                    extra_context={"user_id": user_id},
+                )
 
         internal_secret = get_internal_service_secret()
 

@@ -112,11 +112,11 @@ Lists: <bulletList><listItem><paragraph>item</paragraph></listItem></bulletList>
         auth.require_auth()
 
         try:
-            # Connect to the document channel
-            await hp_client.connect_document(graph_id, document_id)
+            # Connect to the document channel with user context
+            await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
 
             # Get the channel and read content
-            channel = hp_client.get_document_channel(graph_id, document_id)
+            channel = hp_client.get_document_channel(graph_id, document_id, user_id=auth.user_id)
             if channel is None:
                 raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
 
@@ -169,8 +169,8 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         auth.require_auth()
 
         try:
-            # 1. Write document content and comments
-            await hp_client.connect_document(graph_id, document_id)
+            # 1. Write document content and comments (with user context)
+            await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
 
             def write_content_and_comments(doc: Any) -> None:
                 writer = DocumentWriter(doc)
@@ -191,6 +191,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 graph_id,
                 document_id,
                 write_content_and_comments,
+                user_id=auth.user_id,
             )
 
             # 2. Update workspace navigation so document appears in file tree
@@ -204,7 +205,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             )
 
             # 3. Read back document content and comments to confirm
-            channel = hp_client.get_document_channel(graph_id, document_id)
+            channel = hp_client.get_document_channel(graph_id, document_id, user_id=auth.user_id)
             if channel is None:
                 raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
 
@@ -267,8 +268,8 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("text is required")
 
         try:
-            # Connect to the document channel
-            await hp_client.connect_document(graph_id.strip(), document_id.strip())
+            # Connect to the document channel with user context
+            await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
             # Determine if text is XML or plain text
             content = text.strip()
@@ -298,6 +299,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 graph_id.strip(),
                 document_id.strip(),
                 perform_append,
+                user_id=auth.user_id,
             )
 
             result = {
@@ -463,7 +465,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
 
             # Read current folder state from Y.js
-            channel = hp_client._workspace_channels.get(graph_id.strip())
+            channel = hp_client.get_workspace_channel(graph_id.strip(), user_id=auth.user_id)
             if channel is None:
                 raise RuntimeError(f"Workspace not connected: {graph_id}")
 
@@ -532,7 +534,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
 
             # Verify folder exists
-            channel = hp_client._workspace_channels.get(graph_id.strip())
+            channel = hp_client.get_workspace_channel(graph_id.strip(), user_id=auth.user_id)
             if channel is None:
                 raise RuntimeError(f"Workspace not connected: {graph_id}")
 
@@ -666,7 +668,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
 
             # Read current artifact state from Y.js
-            channel = hp_client._workspace_channels.get(graph_id.strip())
+            channel = hp_client.get_workspace_channel(graph_id.strip(), user_id=auth.user_id)
             if channel is None:
                 raise RuntimeError(f"Workspace not connected: {graph_id}")
 
@@ -735,7 +737,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
 
             # Verify artifact exists
-            channel = hp_client._workspace_channels.get(graph_id.strip())
+            channel = hp_client.get_workspace_channel(graph_id.strip(), user_id=auth.user_id)
             if channel is None:
                 raise RuntimeError(f"Workspace not connected: {graph_id}")
 
@@ -809,7 +811,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
 
             # Verify document exists in workspace
-            channel = hp_client._workspace_channels.get(graph_id.strip())
+            channel = hp_client.get_workspace_channel(graph_id.strip(), user_id=auth.user_id)
             if channel is None:
                 raise RuntimeError(f"Workspace not connected: {graph_id}")
 
@@ -882,9 +884,9 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("block_id is required")
 
         try:
-            await hp_client.connect_document(graph_id.strip(), document_id.strip())
+            await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
-            channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip())
+            channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
             if channel is None:
                 raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
 
@@ -945,9 +947,9 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("document_id is required")
 
         try:
-            await hp_client.connect_document(graph_id.strip(), document_id.strip())
+            await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
-            channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip())
+            channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
             if channel is None:
                 raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
 
@@ -1021,7 +1023,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("Either attributes or xml_content must be provided")
 
         try:
-            await hp_client.connect_document(graph_id.strip(), document_id.strip())
+            await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
             def perform_update(doc: Any) -> None:
                 writer = DocumentWriter(doc)
@@ -1036,10 +1038,11 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 graph_id.strip(),
                 document_id.strip(),
                 perform_update,
+                user_id=auth.user_id,
             )
 
             # Read back the updated block
-            channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip())
+            channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
             if channel is None:
                 raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
 
@@ -1107,7 +1110,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("position must be 'after' or 'before'")
 
         try:
-            await hp_client.connect_document(graph_id.strip(), document_id.strip())
+            await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
             new_block_id: str = ""
 
@@ -1127,10 +1130,11 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 graph_id.strip(),
                 document_id.strip(),
                 perform_insert,
+                user_id=auth.user_id,
             )
 
             # Read back the new block
-            channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip())
+            channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
             if channel is None:
                 raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
 
@@ -1192,7 +1196,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("block_id is required")
 
         try:
-            await hp_client.connect_document(graph_id.strip(), document_id.strip())
+            await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
             deleted_ids: list[str] = []
 
@@ -1207,6 +1211,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 graph_id.strip(),
                 document_id.strip(),
                 perform_delete,
+                user_id=auth.user_id,
             )
 
             result = {
@@ -1270,7 +1275,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("updates list is required and cannot be empty")
 
         try:
-            await hp_client.connect_document(graph_id.strip(), document_id.strip())
+            await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
             results: list[Dict[str, Any]] = []
 
@@ -1295,6 +1300,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 graph_id.strip(),
                 document_id.strip(),
                 perform_batch,
+                user_id=auth.user_id,
             )
 
             return {
