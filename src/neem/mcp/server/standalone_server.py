@@ -286,6 +286,7 @@ def create_standalone_mcp_server() -> FastMCP:
             "- move_document: Move a document to a folder\n\n"
             "**Wire Operations (Semantic Connections):**\n"
             "- list_wire_predicates: List available semantic predicates for wires\n"
+            "- create_wire: Create a semantic connection between documents/blocks\n"
             "- get_wires: Get all wires connected to a document\n"
             "- traverse_wires: Follow wire connections to discover related documents\n\n"
             "**SPARQL Operations:**\n"

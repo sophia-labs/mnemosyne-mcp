@@ -1,16 +1,18 @@
 """
-MCP tools for querying and traversing Wires (semantic connections).
+MCP tools for creating, querying, and traversing Wires (semantic connections).
 
 Wires are semantic links between documents/blocks stored in the workspace Y.Doc.
-These tools provide read access to wire data for graph exploration, knowledge
-discovery, and understanding document relationships.
+These tools provide CRDT-native access to wire data — writes go through Y.js
+transactions so changes sync in real-time to the browser and other clients.
 """
 
 from __future__ import annotations
 
 import json
 from collections import deque
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 import pycrdt
 from mcp.server.fastmcp import Context, FastMCP
@@ -138,6 +140,48 @@ def _format_wire_summary(wire: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _create_wire_in_doc(
+    doc: pycrdt.Doc,
+    wire_id: str,
+    source_document_id: str,
+    target_graph_id: str,
+    target_document_id: str,
+    predicate: str,
+    *,
+    source_block_id: Optional[str] = None,
+    target_block_id: Optional[str] = None,
+    bidirectional: bool = False,
+    inverse_of: Optional[str] = None,
+) -> None:
+    """Create a wire entry in the workspace Y.Doc's wires Map.
+
+    IMPORTANT: pycrdt.Map cannot be mutated after construction until it is
+    integrated into a Y.Doc. We MUST build the complete dict upfront and
+    pass it to pycrdt.Map() in one shot. See commit 5f6f489.
+    """
+    wires_map: pycrdt.Map = doc.get("wires", type=pycrdt.Map)
+    now = datetime.now(timezone.utc).isoformat()
+
+    wire_data: dict[str, Any] = {
+        "sourceDocumentId": source_document_id,
+        "targetGraphId": target_graph_id,
+        "targetDocumentId": target_document_id,
+        "predicate": predicate,
+        "bidirectional": bidirectional,
+        "createdAt": now,
+        "snapshotAt": now,
+    }
+
+    if source_block_id:
+        wire_data["sourceBlockId"] = source_block_id
+    if target_block_id:
+        wire_data["targetBlockId"] = target_block_id
+    if inverse_of:
+        wire_data["inverseOf"] = inverse_of
+
+    wires_map[wire_id] = pycrdt.Map(wire_data)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tool Registration
 # ─────────────────────────────────────────────────────────────────────────────
@@ -221,6 +265,104 @@ def register_wire_tools(server: FastMCP) -> None:
             )
 
         return json.dumps({"predicates": predicates, "count": len(predicates)}, indent=2)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # create_wire
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @server.tool(
+        name="create_wire",
+        title="Create Wire",
+        description=(
+            "Create a semantic wire (connection) between two documents or blocks. "
+            "The wire is written directly to the workspace Y.Doc via CRDT, so it "
+            "syncs in real-time to the browser and materializes to RDF automatically. "
+            "Use list_wire_predicates to see available predicate URIs. "
+            "Title/snippet previews are not populated at creation time — use the "
+            "UI's refresh action or the backend API to fill them in later."
+        ),
+    )
+    async def create_wire_tool(
+        graph_id: str,
+        source_document_id: str,
+        target_document_id: str,
+        predicate: Optional[str] = None,
+        source_block_id: Optional[str] = None,
+        target_block_id: Optional[str] = None,
+        bidirectional: bool = False,
+        target_graph_id: Optional[str] = None,
+        context: Context | None = None,
+    ) -> str:
+        """Create a wire between two documents/blocks via Y.js CRDT."""
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required")
+        if not source_document_id or not source_document_id.strip():
+            raise ValueError("source_document_id is required")
+        if not target_document_id or not target_document_id.strip():
+            raise ValueError("target_document_id is required")
+
+        effective_predicate = predicate or f"{MNEMO_NS}isWiredTo"
+        effective_target_graph = target_graph_id or graph_id
+        wire_id = f"w-{uuid4().hex[:12]}"
+        inverse_wire_id = f"{wire_id}-inv" if bidirectional else None
+
+        try:
+            await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
+
+            def _do_create(doc: pycrdt.Doc) -> None:
+                _create_wire_in_doc(
+                    doc,
+                    wire_id=wire_id,
+                    source_document_id=source_document_id.strip(),
+                    target_graph_id=effective_target_graph.strip(),
+                    target_document_id=target_document_id.strip(),
+                    predicate=effective_predicate,
+                    source_block_id=source_block_id.strip() if source_block_id else None,
+                    target_block_id=target_block_id.strip() if target_block_id else None,
+                    bidirectional=bidirectional,
+                    inverse_of=inverse_wire_id,
+                )
+
+                # Bidirectional wires create an inverse with source↔target swapped
+                if bidirectional and inverse_wire_id:
+                    _create_wire_in_doc(
+                        doc,
+                        wire_id=inverse_wire_id,
+                        source_document_id=target_document_id.strip(),
+                        target_graph_id=graph_id.strip(),
+                        target_document_id=source_document_id.strip(),
+                        predicate=effective_predicate,
+                        source_block_id=target_block_id.strip() if target_block_id else None,
+                        target_block_id=source_block_id.strip() if source_block_id else None,
+                        bidirectional=True,
+                        inverse_of=wire_id,
+                    )
+
+            await hp_client.transact_workspace(
+                graph_id.strip(),
+                _do_create,
+                user_id=auth.user_id,
+            )
+
+            result = {
+                "success": True,
+                "wire_id": wire_id,
+                "source_document_id": source_document_id.strip(),
+                "target_document_id": target_document_id.strip(),
+                "predicate": effective_predicate,
+                "predicate_label": _get_predicate_label(effective_predicate),
+                "bidirectional": bidirectional,
+            }
+            if inverse_wire_id:
+                result["inverse_wire_id"] = inverse_wire_id
+
+            return json.dumps(result, indent=2)
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to create wire: {e}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # get_wires
