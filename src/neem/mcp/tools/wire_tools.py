@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+import httpx
+
 import pycrdt
 from mcp.server.fastmcp import Context, FastMCP
 
@@ -138,6 +140,48 @@ def _format_wire_summary(wire: Dict[str, Any]) -> Dict[str, Any]:
         "targetSnippet": wire.get("targetSnippet"),
         "createdAt": wire.get("createdAt"),
     }
+
+
+async def _refresh_wire_snapshot(
+    base_url: str,
+    auth: "MCPAuthContext",
+    graph_id: str,
+    wire_id: str,
+) -> bool:
+    """Call the backend refresh endpoint to populate title/snippet previews.
+
+    This is best-effort — the wire already exists in the Y.Doc. If the refresh
+    fails (e.g., RDF hasn't materialized yet), the wire still works; previews
+    will just be empty until the user triggers a manual refresh.
+
+    Returns True if refresh succeeded, False otherwise.
+    """
+    url = f"{base_url}/wires/{graph_id}/{wire_id}/refresh"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            resp = await client.post(url, headers=auth.http_headers())
+            if resp.status_code == 200:
+                logger.debug(
+                    "Wire snapshot refreshed",
+                    extra_context={"wire_id": wire_id, "graph_id": graph_id},
+                )
+                return True
+            else:
+                logger.debug(
+                    "Wire snapshot refresh returned non-200",
+                    extra_context={
+                        "wire_id": wire_id,
+                        "status": resp.status_code,
+                        "body": resp.text[:200],
+                    },
+                )
+                return False
+    except Exception as e:
+        logger.debug(
+            "Wire snapshot refresh failed (best-effort)",
+            extra_context={"wire_id": wire_id, "error": str(e)},
+        )
+        return False
 
 
 def _create_wire_in_doc(
@@ -347,7 +391,7 @@ def register_wire_tools(server: FastMCP) -> None:
                 user_id=auth.user_id,
             )
 
-            result = {
+            result: Dict[str, Any] = {
                 "success": True,
                 "wire_id": wire_id,
                 "source_document_id": source_document_id.strip(),
@@ -358,6 +402,14 @@ def register_wire_tools(server: FastMCP) -> None:
             }
             if inverse_wire_id:
                 result["inverse_wire_id"] = inverse_wire_id
+
+            # Trigger snippet refresh via backend API — this fetches document
+            # titles and block text from RDF and writes them back to the wire's
+            # snapshot fields in the Y.Doc. Best-effort; wire is already created.
+            refresh_result = await _refresh_wire_snapshot(
+                backend_config.base_url, auth, graph_id.strip(), wire_id
+            )
+            result["snapshot_refreshed"] = refresh_result
 
             return json.dumps(result, indent=2)
 
