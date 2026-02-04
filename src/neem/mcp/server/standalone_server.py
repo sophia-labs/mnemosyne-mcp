@@ -23,6 +23,7 @@ from neem.mcp.jobs.realtime import RealtimeJobClient
 from neem.mcp.tools.basic import register_basic_tools
 from neem.mcp.tools.graph_ops import register_graph_ops_tools
 from neem.mcp.tools.hocuspocus import register_hocuspocus_tools
+from neem.mcp.tools.wire_tools import register_wire_tools
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_dev_user_id, get_internal_service_secret, validate_token_and_load
 
@@ -283,6 +284,10 @@ def create_standalone_mcp_server() -> FastMCP:
             "- move_artifact: Move an artifact to a different folder\n"
             "- rename_artifact: Rename an artifact\n"
             "- move_document: Move a document to a folder\n\n"
+            "**Wire Operations (Semantic Connections):**\n"
+            "- list_wire_predicates: List available semantic predicates for wires\n"
+            "- get_wires: Get all wires connected to a document\n"
+            "- traverse_wires: Follow wire connections to discover related documents\n\n"
             "**SPARQL Operations:**\n"
             "- sparql_query: Run read-only SPARQL SELECT/CONSTRUCT queries\n"
             "- sparql_update: Run SPARQL INSERT/DELETE/UPDATE operations\n\n"
@@ -315,9 +320,10 @@ def create_standalone_mcp_server() -> FastMCP:
     register_basic_tools(mcp_server)
     register_graph_ops_tools(mcp_server)
     register_hocuspocus_tools(mcp_server)
+    register_wire_tools(mcp_server)
 
     logger.info(
-        "Standalone MCP server created with graph, document, and navigation tools",
+        "Standalone MCP server created with graph, document, navigation, and wire tools",
         extra_context={"backend_url": backend_config.base_url},
     )
 
