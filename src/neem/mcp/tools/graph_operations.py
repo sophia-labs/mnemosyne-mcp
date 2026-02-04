@@ -477,6 +477,61 @@ def register_graph_tools(server: FastMCP) -> None:
             "title": title,
         })
 
+    @server.tool(
+        name="cancel_job",
+        description="Cancel a queued job. Only jobs that haven't started running can be cancelled.",
+    )
+    async def cancel_job_tool(
+        job_id: str,
+        context: Context | None = None,
+    ) -> str:
+        """
+        Cancel a queued job.
+
+        Only jobs that are still in the QUEUED state can be cancelled.
+        Jobs that have already started running cannot be cancelled - they will
+        run to completion.
+
+        Args:
+            job_id: The job ID to cancel (e.g., "job-abc123...")
+            context: MCP context
+
+        Returns:
+            Cancellation result with previous job status
+        """
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+                response = await client.delete(
+                    f"{backend_config.base_url}/graphs/jobs/{job_id}",
+                    headers=auth.http_headers(),
+                )
+                response.raise_for_status()
+                result = response.json()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return render_pretty_json({
+                    "error": "Job not found",
+                    "job_id": job_id,
+                    "hint": "Job may have already completed or does not exist",
+                })
+            return render_pretty_json({
+                "error": "Failed to cancel job",
+                "status_code": e.response.status_code,
+                "detail": e.response.text,
+            })
+        except Exception as e:
+            return render_pretty_json({"error": str(e)})
+
+        return render_compact_json({
+            "job_id": result.get("job_id", job_id),
+            "cancelled": result.get("cancelled", False),
+            "previous_status": result.get("previous_status"),
+            "message": result.get("message"),
+        })
+
 
 async def _await_job_status(
     *,

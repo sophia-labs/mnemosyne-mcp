@@ -6,7 +6,7 @@
 
 The Mnemosyne MCP (`neem`) historically exposed a full suite of graph management tools. We are currently rebuilding those tools from scratch against a new FastAPI backend that runs inside our local kubectl context.
 
-> **Status:** The MCP server now provides 10 tools for knowledge graph management, SPARQL queries, and real-time document editing via Hocuspocus/Y.js.
+> **Status:** The MCP server provides 23+ tools for knowledge graph management, SPARQL queries, real-time document editing, and workspace organization via Hocuspocus/Y.js.
 
 **Features:**
 - 🔌 Reliable connectivity to a local FastAPI backend (via env vars or kubectl port-forward)
@@ -111,27 +111,51 @@ If none of these environment variables are set the server defaults to `http://12
 
 ### Token Management
 
-Tokens expire after a day. Re-run `neem init --force` whenever you need a fresh token, and restart Claude Code afterwards.
+Tokens are automatically refreshed in the background using OAuth refresh tokens. After initial authentication, you'll stay logged in for approximately 30 days without any manual intervention.
+
+When the refresh token eventually expires, simply run `neem init` to re-authenticate.
 
 **Important**: Set `LOG_LEVEL=ERROR` for Codex CLI to avoid any stderr interference with the stdio protocol.
 
 ## Available MCP Tools
 
 ### Graph Management
-- `list_graphs` – List all knowledge graphs owned by the authenticated user
+- `list_graphs` – List all knowledge graphs owned by the authenticated user (use `include_deleted=true` to show soft-deleted graphs)
 - `create_graph` – Create a new knowledge graph with ID, title, and optional description
-- `delete_graph` – Permanently delete a graph and all its contents
+- `delete_graph` – Delete a graph (soft delete by default, use `hard=true` to permanently delete)
 
 ### SPARQL Operations
 - `sparql_query` – Execute read-only SPARQL SELECT/CONSTRUCT queries against your graphs
 - `sparql_update` – Execute SPARQL INSERT/DELETE/UPDATE operations to modify graph data
 
-### Document Operations (via Hocuspocus/Y.js)
+### Context & Workspace
 - `get_active_context` – Get the currently active graph and document from the Mnemosyne UI
 - `get_workspace` – Get the folder/file structure of a graph
+
+### Folder Operations
+- `create_folder` – Create a new folder in the workspace
+- `rename_folder` – Rename a folder
+- `move_folder` – Move a folder to a different parent
+- `delete_folder` – Delete a folder (with optional cascade to delete contents)
+
+### Document Operations (via Hocuspocus/Y.js)
 - `read_document` – Read document content as TipTap XML
 - `write_document` – Replace document content with TipTap XML
-- `append_to_document` – Add a paragraph to an existing document
+- `append_to_document` – Add a block to the end of a document
+- `move_document` – Move a document to a different folder
+- `delete_document` – Remove a document from workspace navigation
+
+### Block-Level Operations
+- `get_block` – Read a specific block by its ID
+- `query_blocks` – Search for blocks matching specific criteria
+- `update_block` – Update a block's attributes or content
+- `insert_block` – Insert a new block relative to an existing block
+- `delete_block` – Delete a block (with optional cascade for children)
+- `batch_update_blocks` – Update multiple blocks in a single transaction
+
+### Artifact Operations
+- `move_artifact` – Move an artifact to a different folder
+- `rename_artifact` – Rename an artifact
 
 #### TipTap XML Format
 
@@ -267,9 +291,9 @@ Sessions are stored in-memory by default; no external cache service is required.
 
 ### Authentication Issues
 
-1. **Token expired**: Run `neem init --force` to get a fresh token
-2. **Check token**: `neem config` to see token details
-3. **Verify API access**: The token should have access to the API endpoint
+1. **Token not refreshing**: Tokens auto-refresh in the background. If you see auth errors, your refresh token may have expired (~30 days). Run `neem init` to re-authenticate.
+2. **Check token**: `neem status` to see token details and expiry
+3. **Force refresh**: `neem init --force` to get completely fresh tokens
 
 ### Upload Issues
 

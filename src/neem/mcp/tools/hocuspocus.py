@@ -853,6 +853,73 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             )
             raise RuntimeError(f"Failed to move document: {e}")
 
+    @server.tool(
+        name="delete_document",
+        title="Delete Document",
+        description=(
+            "Delete a document from workspace navigation. "
+            "This removes the document from the file tree but does not destroy the underlying data. "
+            "The document can be recreated by writing to the same document_id."
+        ),
+    )
+    async def delete_document_tool(
+        graph_id: str,
+        document_id: str,
+        context: Context | None = None,
+    ) -> dict:
+        """Delete a document from workspace navigation via Y.js."""
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required and cannot be empty")
+        if not document_id or not document_id.strip():
+            raise ValueError("document_id is required and cannot be empty")
+
+        try:
+            await hp_client.connect_workspace(graph_id.strip())
+
+            # Verify document exists in workspace
+            channel = hp_client._workspace_channels.get(graph_id.strip())
+            if channel is None:
+                raise RuntimeError(f"Workspace not connected: {graph_id}")
+
+            reader = WorkspaceReader(channel.doc)
+            current = reader.get_document(document_id.strip())
+
+            if not current:
+                raise RuntimeError(f"Document '{document_id}' not found in workspace '{graph_id}'")
+
+            # Delete document from workspace via Y.js
+            deleted = False
+            await hp_client.transact_workspace(
+                graph_id.strip(),
+                lambda doc: WorkspaceWriter(doc).delete_document(document_id.strip()),
+            )
+            deleted = True
+
+            snapshot = hp_client.get_workspace_snapshot(graph_id.strip())
+
+            result = {
+                "success": True,
+                "deleted": deleted,
+                "document_id": document_id.strip(),
+                "graph_id": graph_id.strip(),
+                "workspace": snapshot,
+            }
+            return result
+
+        except Exception as e:
+            logger.error(
+                "Failed to delete document",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to delete document: {e}")
+
     # -------------------------------------------------------------------------
     # Block-Level Document Operations
     # -------------------------------------------------------------------------

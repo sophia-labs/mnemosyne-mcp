@@ -125,6 +125,7 @@ class CallbackHandler(BaseHTTPRequestHandler):
         <!DOCTYPE html>
         <html>
         <head>
+            <meta charset="UTF-8">
             <title>Authentication Successful</title>
             <style>
                 body {
@@ -139,20 +140,37 @@ class CallbackHandler(BaseHTTPRequestHandler):
                 .container {
                     background: white;
                     padding: 3rem;
-                    border-radius: 10px;
+                    border-radius: 16px;
                     box-shadow: 0 10px 40px rgba(0,0,0,0.2);
                     text-align: center;
                     max-width: 400px;
                 }
-                h1 { color: #667eea; margin-bottom: 1rem; }
+                h1 { color: #667eea; margin-bottom: 1rem; font-weight: 600; }
                 p { color: #555; line-height: 1.6; }
-                .success-icon { font-size: 48px; margin-bottom: 1rem; }
+                .success-icon {
+                    width: 64px;
+                    height: 64px;
+                    margin: 0 auto 1.5rem;
+                    background: #667eea;
+                    border-radius: 50%;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                }
+                .success-icon::after {
+                    content: '';
+                    width: 20px;
+                    height: 32px;
+                    border: solid white;
+                    border-width: 0 4px 4px 0;
+                    transform: rotate(45deg) translate(-2px, -2px);
+                }
             </style>
         </head>
         <body>
             <div class="container">
-                <div class="success-icon">✓</div>
-                <h1>Authentication Successful!</h1>
+                <div class="success-icon"></div>
+                <h1>Authentication Successful</h1>
                 <p>You've successfully authenticated with Mnemosyne.</p>
                 <p>You can close this window and return to your terminal.</p>
             </div>
@@ -171,6 +189,7 @@ class CallbackHandler(BaseHTTPRequestHandler):
         <!DOCTYPE html>
         <html>
         <head>
+            <meta charset="UTF-8">
             <title>Authentication Failed</title>
             <style>
                 body {{
@@ -185,20 +204,38 @@ class CallbackHandler(BaseHTTPRequestHandler):
                 .container {{
                     background: white;
                     padding: 3rem;
-                    border-radius: 10px;
+                    border-radius: 16px;
                     box-shadow: 0 10px 40px rgba(0,0,0,0.2);
                     text-align: center;
                     max-width: 400px;
                 }}
-                h1 {{ color: #f5576c; margin-bottom: 1rem; }}
+                h1 {{ color: #f5576c; margin-bottom: 1rem; font-weight: 600; }}
                 p {{ color: #555; line-height: 1.6; }}
-                .error-icon {{ font-size: 48px; margin-bottom: 1rem; }}
+                .error-icon {{
+                    width: 64px;
+                    height: 64px;
+                    margin: 0 auto 1.5rem;
+                    background: #f5576c;
+                    border-radius: 50%;
+                    position: relative;
+                }}
+                .error-icon::before, .error-icon::after {{
+                    content: '';
+                    position: absolute;
+                    width: 4px;
+                    height: 32px;
+                    background: white;
+                    top: 16px;
+                    left: 30px;
+                }}
+                .error-icon::before {{ transform: rotate(45deg); }}
+                .error-icon::after {{ transform: rotate(-45deg); }}
                 code {{ background: #f5f5f5; padding: 0.2rem 0.5rem; border-radius: 3px; }}
             </style>
         </head>
         <body>
             <div class="container">
-                <div class="error-icon">✗</div>
+                <div class="error-icon"></div>
                 <h1>Authentication Failed</h1>
                 <p>{error_msg}</p>
                 <p>Please close this window and try again in your terminal.</p>
@@ -354,12 +391,76 @@ async def exchange_code_for_token(code: str, code_verifier: str) -> Dict[str, An
             raise OAuthError(f"Token exchange failed: {str(e)}") from e
 
 
-async def run_oauth_flow() -> str:
+async def refresh_access_token(refresh_token: str) -> Optional[Dict[str, Any]]:
+    """
+    Use refresh token to obtain new access and ID tokens.
+
+    Args:
+        refresh_token: OAuth refresh token from previous authentication
+
+    Returns:
+        Token response with new id_token, access_token, and possibly new refresh_token.
+        Returns None if refresh fails (e.g., refresh token expired).
+    """
+    logger.info("Attempting to refresh access token")
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                OAuthConfig.TOKEN_URL,
+                data={
+                    "grant_type": "refresh_token",
+                    "client_id": OAuthConfig.CLIENT_ID,
+                    "refresh_token": refresh_token,
+                },
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded"
+                },
+                timeout=30.0
+            )
+
+            if response.status_code == 400:
+                # Refresh token likely expired or revoked
+                error_data = response.json()
+                error = error_data.get("error", "unknown")
+                logger.warning(
+                    "Refresh token rejected",
+                    error=error,
+                    description=error_data.get("error_description"),
+                )
+                return None
+
+            response.raise_for_status()
+            tokens = response.json()
+
+            logger.info(
+                "Successfully refreshed tokens",
+                has_id_token="id_token" in tokens,
+                has_access_token="access_token" in tokens,
+                has_new_refresh_token="refresh_token" in tokens,
+            )
+
+            return tokens
+
+        except httpx.HTTPStatusError as e:
+            logger.warning(
+                "Token refresh failed with HTTP error",
+                status_code=e.response.status_code,
+            )
+            return None
+
+        except Exception as e:
+            logger.warning("Token refresh failed", error=str(e))
+            return None
+
+
+async def run_oauth_flow() -> Tuple[str, Optional[str]]:
     """
     Run complete OAuth Authorization Code + PKCE flow.
 
     Returns:
-        ID token (JWT) for API authentication
+        Tuple of (id_token, refresh_token) for API authentication.
+        refresh_token may be None if not provided by the IdP.
 
     Raises:
         OAuthError: If any step of the flow fails
@@ -414,10 +515,16 @@ async def run_oauth_flow() -> str:
         if not id_token:
             raise OAuthError("No ID token in response - unexpected token format")
 
-        print("✓ Tokens received", file=sys.stderr)
-        logger.info("OAuth flow completed successfully")
+        # Also extract refresh token for automatic renewal
+        refresh_token = tokens.get('refresh_token')
 
-        return id_token
+        print("✓ Tokens received", file=sys.stderr)
+        logger.info(
+            "OAuth flow completed successfully",
+            has_refresh_token=refresh_token is not None,
+        )
+
+        return id_token, refresh_token
 
     except (OAuthTimeoutError, OAuthCancelledError) as e:
         logger.warning("OAuth flow cancelled or timed out", reason=str(e))

@@ -15,6 +15,7 @@ from neem.mcp.auth import MCPAuthContext
 from neem.mcp.jobs import JobSubmitMetadata, RealtimeJobClient, WebSocketConnectionError
 from neem.mcp.tools.basic import poll_job_until_terminal, stream_job, submit_job
 from neem.utils.logging import LoggerFactory
+from neem.utils.token_storage import get_user_id_from_token
 
 logger = LoggerFactory.get_logger("mcp.tools.graph_ops")
 
@@ -89,15 +90,22 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         name="delete_graph",
         title="Delete Knowledge Graph",
         description=(
-            "Permanently deletes a knowledge graph and all its contents. "
-            "This action cannot be undone. Use with caution."
+            "Deletes a knowledge graph. By default, performs a soft delete (marks as deleted but retains data). "
+            "Set hard=True to permanently delete the graph and all its contents. Hard delete cannot be undone."
         ),
     )
     async def delete_graph_tool(
         graph_id: str,
+        hard: bool = False,
         context: Context | None = None,
     ) -> str:
-        """Delete a knowledge graph."""
+        """Delete a knowledge graph.
+
+        Args:
+            graph_id: The ID of the graph to delete
+            hard: If True, permanently delete the graph and all data.
+                  If False (default), soft delete (mark as deleted but retain data).
+        """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -108,7 +116,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             base_url=backend_config.base_url,
             auth=auth,
             task_type="delete_graph",
-            payload={"graph_id": graph_id.strip()},
+            payload={"graph_id": graph_id.strip(), "hard": hard},
         )
 
         if context:
@@ -122,6 +130,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             "success": True,
             "graph_id": graph_id.strip(),
             "deleted": True,
+            "hard_delete": hard,
             "job_id": metadata.job_id,
             **result,
         })
@@ -130,28 +139,62 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         name="sparql_query",
         title="Run SPARQL Query",
         description=(
-            "Executes a read-only SPARQL SELECT or CONSTRUCT query against the user's graphs. "
+            "Executes a read-only SPARQL SELECT or CONSTRUCT query against a specific graph. "
+            "The graph_id parameter is required to scope the query to a named graph. "
             "Returns query results as JSON. Use this for searching and retrieving data from graphs."
         ),
     )
     async def sparql_query_tool(
+        graph_id: str,
         sparql: str,
         result_format: str = "json",
         context: Context | None = None,
     ) -> str:
-        """Execute a SPARQL SELECT/CONSTRUCT query."""
+        """Execute a SPARQL SELECT/CONSTRUCT query against a specific graph."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required to scope the query")
         if not sparql or not sparql.strip():
             raise ValueError("sparql query is required and cannot be empty")
+
+        # Extract user_id from auth context or token (same pattern as hocuspocus tools)
+        user_id = auth.user_id or (get_user_id_from_token(auth.token) if auth.token else None)
+        if not user_id:
+            raise ValueError(
+                "Could not determine user ID from authentication context. "
+                "Ensure your token contains a 'sub' claim or set MNEMOSYNE_DEV_USER_ID."
+            )
+
+        # Build the graph URI and inject FROM clause if not already present
+        graph_id = graph_id.strip()
+        sparql = sparql.strip()
+        graph_uri = f"urn:mnemosyne:user:{user_id}:graph:{graph_id}"
+
+        # Check if query already has FROM clause (case-insensitive)
+        sparql_upper = sparql.upper()
+        if "FROM <" not in sparql_upper and "FROM NAMED" not in sparql_upper:
+            # Inject FROM clause before WHERE (SPARQL syntax: SELECT vars FROM <graph> WHERE)
+            import re
+            # Find WHERE clause position and insert FROM before it
+            where_match = re.search(r"\bWHERE\s*\{", sparql, re.IGNORECASE)
+            if where_match:
+                insert_pos = where_match.start()
+                sparql = f"{sparql[:insert_pos]}FROM <{graph_uri}> {sparql[insert_pos:]}"
+            else:
+                # Fallback: prepend FROM clause (may not work for all queries)
+                logger.warning(
+                    "sparql_query_from_injection_fallback",
+                    extra_context={"graph_id": graph_id, "query_prefix": sparql[:50]},
+                )
 
         metadata = await submit_job(
             base_url=backend_config.base_url,
             auth=auth,
             task_type="run_query",
             payload={
-                "sparql": sparql.strip(),
+                "sparql": sparql,
                 "result_format": result_format,
             },
         )
@@ -183,25 +226,76 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         title="Run SPARQL Update",
         description=(
             "Executes a SPARQL INSERT, DELETE, or UPDATE operation to modify graph data. "
+            "The graph_id parameter is required to scope the update to a specific graph. "
             "Use this for adding, modifying, or removing triples from graphs."
         ),
     )
     async def sparql_update_tool(
+        graph_id: str,
         sparql: str,
         context: Context | None = None,
     ) -> str:
-        """Execute a SPARQL INSERT/DELETE/UPDATE operation."""
+        """Execute a SPARQL INSERT/DELETE/UPDATE operation against a specific graph."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required to scope the update")
         if not sparql or not sparql.strip():
             raise ValueError("sparql update is required and cannot be empty")
+
+        # Extract user_id from auth context or token (same pattern as hocuspocus tools)
+        user_id = auth.user_id or (get_user_id_from_token(auth.token) if auth.token else None)
+        if not user_id:
+            raise ValueError(
+                "Could not determine user ID from authentication context. "
+                "Ensure your token contains a 'sub' claim or set MNEMOSYNE_DEV_USER_ID."
+            )
+
+        # Build the graph URI for reference (updates typically use GRAPH clauses)
+        graph_id = graph_id.strip()
+        sparql = sparql.strip()
+        graph_uri = f"urn:mnemosyne:user:{user_id}:graph:{graph_id}"
+
+        # For updates, check if query references a graph - if not, wrap in GRAPH clause
+        sparql_upper = sparql.upper()
+        if "GRAPH <" not in sparql_upper and "WITH <" not in sparql_upper:
+            # Check for INSERT DATA or DELETE DATA patterns
+            if "INSERT DATA" in sparql_upper:
+                # Replace INSERT DATA { with INSERT DATA { GRAPH <uri> {
+                import re
+                sparql = re.sub(
+                    r"(INSERT\s+DATA\s*)\{",
+                    rf"\1{{ GRAPH <{graph_uri}> {{",
+                    sparql,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                # Add closing brace before final }
+                sparql = sparql.rstrip()
+                if sparql.endswith("}"):
+                    sparql = sparql[:-1] + "} }"
+            elif "DELETE DATA" in sparql_upper:
+                import re
+                sparql = re.sub(
+                    r"(DELETE\s+DATA\s*)\{",
+                    rf"\1{{ GRAPH <{graph_uri}> {{",
+                    sparql,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                sparql = sparql.rstrip()
+                if sparql.endswith("}"):
+                    sparql = sparql[:-1] + "} }"
+            else:
+                # For other updates (INSERT/DELETE WHERE), prepend WITH clause
+                sparql = f"WITH <{graph_uri}>\n{sparql}"
 
         metadata = await submit_job(
             base_url=backend_config.base_url,
             auth=auth,
             task_type="apply_update",
-            payload={"sparql": sparql.strip()},
+            payload={"sparql": sparql},
         )
 
         if context:
@@ -211,8 +305,9 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             job_stream, metadata, context, auth
         )
 
+        job_succeeded = result.get("status") != "failed"
         return _render_json({
-            "success": True,
+            "success": job_succeeded,
             "job_id": metadata.job_id,
             **result,
         })
