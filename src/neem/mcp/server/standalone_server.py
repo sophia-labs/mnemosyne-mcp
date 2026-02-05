@@ -281,6 +281,7 @@ def create_standalone_mcp_server() -> FastMCP:
             "- get_block: Read a specific block by its data-block-id\n"
             "- query_blocks: Search blocks by type, indent, text content, etc.\n"
             "- update_block: Update a block's attributes or XML content\n"
+            "- edit_block_text: Insert/delete text at character offsets within a block (CRDT-safe, collaborative)\n"
             "- insert_block: Insert a new block before/after an existing block\n"
             "- delete_block: Delete a block (with optional cascade for children)\n"
             "- batch_update_blocks: Update multiple blocks in one transaction\n\n"

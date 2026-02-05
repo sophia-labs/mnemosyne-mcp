@@ -72,6 +72,7 @@ neem logout
 - "Read the document at /notes/meeting.md" → `read_document`
 - "Write this content to my document" → `write_document`
 - "Add a paragraph to the end of my document" → `append_to_document`
+- "Insert 'hello' at position 5 in block-abc123" → `edit_block_text` (collaborative character-level editing)
 
 ### Dev Mode (skip OAuth)
 

@@ -158,9 +158,10 @@ When the refresh token eventually expires, simply run `neem init` to re-authenti
 - `delete_document` – Remove a document from workspace navigation
 
 ### Block-Level Operations
-- `get_block` – Read a specific block by its ID
+- `get_block` – Read a specific block by its ID (includes text_length and formatting runs)
 - `query_blocks` – Search for blocks matching specific criteria
-- `update_block` – Update a block's attributes or content
+- `update_block` – Update a block's attributes or replace entire content
+- `edit_block_text` – Insert/delete text at character offsets within a block (CRDT-safe collaborative editing)
 - `insert_block` – Insert a new block relative to an existing block
 - `delete_block` – Delete a block (with optional cascade for children)
 - `batch_update_blocks` – Update multiple blocks in a single transaction

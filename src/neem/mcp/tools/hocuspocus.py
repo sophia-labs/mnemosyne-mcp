@@ -1137,6 +1137,95 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise RuntimeError(f"Failed to update block: {e}")
 
     @server.tool(
+        name="edit_block_text",
+        title="Edit Block Text",
+        description=(
+            "Insert or delete text at specific character offsets within a block, using "
+            "CRDT-native operations that merge cleanly with concurrent browser edits. "
+            "Unlike update_block (which replaces entire content), this enables true "
+            "collaborative editing without data loss.\n\n"
+            "Workflow: 1) Call get_block to read current text and length, "
+            "2) Determine offset(s) for edits, "
+            "3) Call edit_block_text with operations, "
+            "4) Response includes updated text for verification.\n\n"
+            "Each operation has: type ('insert' or 'delete'), offset (0-indexed char position), "
+            "text (for insert), length (for delete), attrs (optional formatting like {\"bold\": {}}), "
+            "inherit_format (default true - inherit formatting from preceding character).\n\n"
+            "Multiple operations are applied in a single transaction. "
+            "Insert beyond text length appends at end. "
+            "Delete beyond text length raises an error."
+        ),
+    )
+    async def edit_block_text_tool(
+        graph_id: str,
+        document_id: str,
+        block_id: str,
+        operations: list[Dict[str, Any]],
+        context: Context | None = None,
+    ) -> dict:
+        """Edit text within a block at specific character offsets.
+
+        Args:
+            graph_id: The graph containing the document
+            document_id: The document containing the block
+            block_id: The block to edit
+            operations: List of insert/delete operations with offsets
+        """
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required")
+        if not document_id or not document_id.strip():
+            raise ValueError("document_id is required")
+        if not block_id or not block_id.strip():
+            raise ValueError("block_id is required")
+        if not operations:
+            raise ValueError("operations list is required and cannot be empty")
+
+        try:
+            await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
+
+            updated_text_info: dict = {}
+
+            def perform_edit(doc: Any) -> None:
+                nonlocal updated_text_info
+                writer = DocumentWriter(doc)
+                updated_text_info = writer.edit_block_text(
+                    block_id.strip(), operations
+                )
+
+            await hp_client.transact_document(
+                graph_id.strip(),
+                document_id.strip(),
+                perform_edit,
+                user_id=auth.user_id,
+            )
+
+            result = {
+                "success": True,
+                "graph_id": graph_id.strip(),
+                "document_id": document_id.strip(),
+                "block": updated_text_info,
+            }
+            return result
+
+        except ValueError as ve:
+            # Validation errors - return as-is for clear agent feedback
+            raise RuntimeError(str(ve))
+        except Exception as e:
+            logger.error(
+                "Failed to edit block text",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "block_id": block_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to edit block text: {e}")
+
+    @server.tool(
         name="insert_block",
         title="Insert Block",
         description=(
