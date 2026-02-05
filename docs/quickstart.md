@@ -13,15 +13,15 @@ Get up and running with Mnemosyne’s Claude Code integration in 4 steps.
 neem init
 
 # 2. Wire up the FastAPI backend + register the MCP server
-kubectl port-forward svc/mnemosyne-fastapi 8001:8000
-claude mcp add mnemosyne-graph neem-mcp-server \
-  --scope user \
-  --env MNEMOSYNE_FASTAPI_URL=http://127.0.0.1:8001 \
-  --env LOG_LEVEL=ERROR
+kubectl port-forward svc/mnemosyne-api 8080:80
+claude mcp add mnemosyne --scope user \
+  -- uv run neem-mcp-server
 
 # Optional dev-mode shortcut (when backend runs with MNEMOSYNE_AUTH__MODE=dev_no_auth)
-# export MNEMOSYNE_DEV_USER_ID=alice
-# export MNEMOSYNE_DEV_TOKEN=alice
+# claude mcp add mnemosyne --scope user \
+#   --env MNEMOSYNE_DEV_USER_ID=alice \
+#   --env MNEMOSYNE_DEV_TOKEN=alice \
+#   -- uv run neem-mcp-server
 
 # 3. Restart Claude Code
 # (Quit and reopen the application)
@@ -29,6 +29,8 @@ claude mcp add mnemosyne-graph neem-mcp-server \
 # 4. Test it works
 # Ask Claude: "List my knowledge graphs"
 ```
+
+> The MCP server defaults to `http://127.0.0.1:8080` which matches `kubectl port-forward svc/mnemosyne-api 8080:80`. Override with `--env MNEMOSYNE_FASTAPI_URL=http://127.0.0.1:XXXX` if your port-forward differs.
 
 **That’s it!** Authentication is automatic after `neem init`; MCP clients just need the one-time registration step.
 
@@ -62,6 +64,8 @@ neem logout
 - "Run this SPARQL query: SELECT * WHERE { ?s ?p ?o } LIMIT 10" → `sparql_query`
 - "Insert this triple into my graph..." → `sparql_update`
 
+> **SPARQL Tip:** Always use `PREFIX doc: <http://mnemosyne.dev/doc#>` — never `urn:mnemosyne:schema:doc:`.
+
 **Document Operations (real-time via Y.js):**
 - "What document am I looking at in Mnemosyne?" → `get_active_context`
 - "Show me the folder structure of my-graph" → `get_workspace`
@@ -89,6 +93,8 @@ The MCP server will send `X-User-ID: alice` and `Sec-WebSocket-Protocol: Bearer.
 **Tools not showing?** → Make sure you reinstalled after updates: `uv cache clean && uv tool install --no-cache .`
 
 **Connection refused?** → Ensure the FastAPI backend is running and port-forwarded: `kubectl port-forward svc/mnemosyne-api 8080:80`
+
+**SPARQL returns empty results?** → Check your namespace prefix. Use `PREFIX doc: <http://mnemosyne.dev/doc#>`, not `urn:mnemosyne:schema:doc:`
 
 ---
 

@@ -141,7 +141,16 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         description=(
             "Executes a read-only SPARQL SELECT or CONSTRUCT query against a specific graph. "
             "The graph_id parameter is required to scope the query to a named graph. "
-            "Returns query results as JSON. Use this for searching and retrieving data from graphs."
+            "Returns query results as JSON. Use this for searching and retrieving data from graphs.\n\n"
+            "IMPORTANT - Use these exact namespace prefixes:\n"
+            "  PREFIX doc: <http://mnemosyne.dev/doc#>\n"
+            "  PREFIX dcterms: <http://purl.org/dc/terms/>\n"
+            "  PREFIX nfo: <http://www.semanticdesktop.org/ontologies/2007/03/22/nfo#>\n"
+            "  PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n"
+            "Do NOT use 'urn:mnemosyne:schema:doc:' - it will match nothing.\n\n"
+            "The graph_id is automatically resolved to a graph URI and injected as a FROM clause. "
+            "Common types: doc:TipTapDocument, doc:Folder, doc:Artifact. "
+            "Common predicates: dcterms:title, nfo:fileName, nfo:belongsToContainer, doc:order, doc:section."
         ),
     )
     async def sparql_query_tool(
@@ -227,7 +236,14 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         description=(
             "Executes a SPARQL INSERT, DELETE, or UPDATE operation to modify graph data. "
             "The graph_id parameter is required to scope the update to a specific graph. "
-            "Use this for adding, modifying, or removing triples from graphs."
+            "Use this for adding, modifying, or removing triples from graphs.\n\n"
+            "IMPORTANT - Use these exact namespace prefixes:\n"
+            "  PREFIX doc: <http://mnemosyne.dev/doc#>\n"
+            "  PREFIX dcterms: <http://purl.org/dc/terms/>\n"
+            "Do NOT use 'urn:mnemosyne:schema:doc:' - it will match nothing.\n\n"
+            "The graph_id is automatically resolved and injected as a GRAPH or WITH clause. "
+            "For INSERT DATA/DELETE DATA, the graph is wrapped automatically. "
+            "For DELETE/INSERT WHERE patterns, a WITH clause is prepended."
         ),
     )
     async def sparql_update_tool(
