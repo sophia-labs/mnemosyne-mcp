@@ -877,10 +877,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("document_id is required and cannot be empty")
 
         try:
-            await hp_client.connect_workspace(graph_id.strip())
+            await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
 
             # Verify document exists in workspace
-            channel = hp_client._workspace_channels.get(graph_id.strip())
+            channel = hp_client.get_workspace_channel(graph_id.strip(), user_id=auth.user_id)
             if channel is None:
                 raise RuntimeError(f"Workspace not connected: {graph_id}")
 
@@ -895,10 +895,11 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             await hp_client.transact_workspace(
                 graph_id.strip(),
                 lambda doc: WorkspaceWriter(doc).delete_document(document_id.strip()),
+                user_id=auth.user_id,
             )
             deleted = True
 
-            snapshot = hp_client.get_workspace_snapshot(graph_id.strip())
+            snapshot = hp_client.get_workspace_snapshot(graph_id.strip(), user_id=auth.user_id)
 
             result = {
                 "success": True,
