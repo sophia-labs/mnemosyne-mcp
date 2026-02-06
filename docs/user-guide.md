@@ -166,9 +166,10 @@ This deletes your token from `~/.mnemosyne/config.json`.
 - `delete_document` – Remove from workspace navigation
 
 ### Block-Level Operations
-- `get_block` – Read a specific block by ID
+- `get_block` – Read a specific block by ID (includes text length and formatting runs)
 - `query_blocks` – Search for blocks matching criteria
-- `update_block` – Update a block's attributes or content
+- `update_block` – Update a block's attributes or replace entire content
+- `edit_block_text` – Insert/delete text at character offsets (CRDT-safe collaborative editing)
 - `insert_block` – Insert a new block relative to another
 - `delete_block` – Delete a block
 - `batch_update_blocks` – Update multiple blocks at once

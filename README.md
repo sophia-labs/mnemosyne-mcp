@@ -52,33 +52,33 @@ neem init                     # Opens your browser to log in
 
 > `neem init` handles authentication only—the next steps show how to connect each MCP client manually.
 
-Before registering the MCP server, expose the FastAPI backend from your kubectl context (adjust service/namespace/ports as needed):
+Before registering the MCP server, expose the FastAPI backend from your kubectl context:
 
 ```bash
-kubectl port-forward svc/mnemosyne-fastapi 8001:8000
+kubectl port-forward svc/mnemosyne-api 8080:80
 ```
 
-### Step 2: Add MCP server to your agent
+The MCP server defaults to `http://127.0.0.1:8080` which matches this port-forward. Both HTTP and WebSocket connections go through port 8080.
 
-Skaffold’s default profile port-forwards `mnemosyne-api` on `8080` for HTTP and `mnemosyne-ws` on `8001` for WebSockets. Point `MNEMOSYNE_FASTAPI_URL` at the HTTP port and the MCP server will automatically assume the split WebSocket port on localhost (you can override it with `MNEMOSYNE_FASTAPI_WS_PORT` or `MNEMOSYNE_FASTAPI_WS_URL` if your layout differs).
+### Step 2: Add MCP server to your agent
 
 #### Using Claude Code:
 
 ```bash
 claude mcp add mnemosyne --scope user \
-  --env MNEMOSYNE_FASTAPI_URL=http://127.0.0.1:8001 \
-  --env LOG_LEVEL=ERROR \
   -- uv run neem-mcp-server
 ```
 
 #### Using Codex
 ```bash
-codex mcp add mnemosyne -- uv run neem-mcp-server \
-  --env MNEMOSYNE_FASTAPI_URL=http://127.0.0.1:8001 \
-  --env LOG_LEVEL=ERROR
+codex mcp add mnemosyne \
+  --env LOG_LEVEL=ERROR \
+  -- uv run neem-mcp-server
+```
 
-> Dev-mode shortcut: append `--env MNEMOSYNE_DEV_TOKEN=<user>` and `--env MNEMOSYNE_DEV_USER_ID=<user>` to the commands above when the backend runs with `MNEMOSYNE_AUTH__MODE=dev_no_auth`. Both transports will impersonate that user without going through OAuth.
-````
+> **Dev-mode shortcut:** Append `--env MNEMOSYNE_DEV_TOKEN=<user>` and `--env MNEMOSYNE_DEV_USER_ID=<user>` when the backend runs with `MNEMOSYNE_AUTH__MODE=dev_no_auth`. Both HTTP and WebSocket will impersonate that user without OAuth.
+>
+> **Custom port?** Add `--env MNEMOSYNE_FASTAPI_URL=http://127.0.0.1:XXXX` if your port-forward differs from the default 8080.
 
 ### Dev Mode (skip OAuth)
 
@@ -128,6 +128,18 @@ When the refresh token eventually expires, simply run `neem init` to re-authenti
 - `sparql_query` – Execute read-only SPARQL SELECT/CONSTRUCT queries against your graphs
 - `sparql_update` – Execute SPARQL INSERT/DELETE/UPDATE operations to modify graph data
 
+> **Namespace Reference:** When writing SPARQL queries, use these exact prefixes:
+> ```sparql
+> PREFIX doc: <http://mnemosyne.dev/doc#>
+> PREFIX dcterms: <http://purl.org/dc/terms/>
+> PREFIX nfo: <http://www.semanticdesktop.org/ontologies/2007/03/22/nfo#>
+> PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+> PREFIX nie: <http://www.semanticdesktop.org/ontologies/2007/01/19/nie#>
+> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+> ```
+> **WARNING:** Do NOT use `urn:mnemosyne:schema:doc:` as the doc namespace — it will match nothing.
+
 ### Context & Workspace
 - `get_active_context` – Get the currently active graph and document from the Mnemosyne UI
 - `get_workspace` – Get the folder/file structure of a graph
@@ -146,9 +158,10 @@ When the refresh token eventually expires, simply run `neem init` to re-authenti
 - `delete_document` – Remove a document from workspace navigation
 
 ### Block-Level Operations
-- `get_block` – Read a specific block by its ID
+- `get_block` – Read a specific block by its ID (includes text_length and formatting runs)
 - `query_blocks` – Search for blocks matching specific criteria
-- `update_block` – Update a block's attributes or content
+- `update_block` – Update a block's attributes or replace entire content
+- `edit_block_text` – Insert/delete text at character offsets within a block (CRDT-safe collaborative editing)
 - `insert_block` – Insert a new block relative to an existing block
 - `delete_block` – Delete a block (with optional cascade for children)
 - `batch_update_blocks` – Update multiple blocks in a single transaction
@@ -156,6 +169,12 @@ When the refresh token eventually expires, simply run `neem init` to re-authenti
 ### Artifact Operations
 - `move_artifact` – Move an artifact to a different folder
 - `rename_artifact` – Rename an artifact
+
+### Wire Operations (Semantic Connections)
+- `list_wire_predicates` – List available semantic predicates organized by category
+- `create_wire` – Create a semantic connection between documents or blocks (syncs via Y.js CRDT)
+- `get_wires` – Get all wires connected to a document (filter by direction: outgoing/incoming/both)
+- `traverse_wires` – BFS traversal of the wire graph from a starting document (up to depth 10)
 
 #### TipTap XML Format
 
@@ -174,7 +193,31 @@ Example:
 <paragraph>Text with <mark>highlight</mark> and a note<footnote data-footnote-content="This is a footnote"/></paragraph>
 ```
 
-All tools submit jobs to the FastAPI backend, stream realtime updates via WebSocket when available, and fall back to HTTP polling otherwise.
+Graph management and SPARQL tools submit jobs to the FastAPI backend, streaming realtime updates via WebSocket when available and falling back to HTTP polling otherwise. Document, block, folder, and wire operations use Y.js CRDT via Hocuspocus for real-time sync.
+
+#### SPARQL Data Model
+
+Documents, folders, and artifacts are materialized to RDF by two backend pipelines:
+- **Workspace materializer** – Syncs metadata (titles, folder structure, order) from the workspace Y.Doc
+- **Document materializer** – Syncs content (blocks, paragraphs, text nodes) from document Y.Docs
+
+**Common RDF types:** `doc:TipTapDocument`, `doc:Folder`, `doc:Artifact`, `doc:XmlFragment`, `doc:Paragraph`, `doc:Heading`, `doc:TextNode`
+
+**Common predicates:** `dcterms:title`, `nfo:fileName`, `nfo:belongsToContainer`, `doc:order`, `doc:section`, `doc:content`, `doc:childNode`, `doc:siblingOrder`, `doc:createdAt`, `doc:updatedAt`
+
+**Entity URI pattern:** `urn:mnemosyne:user:{user_id}:graph:{graph_id}:{type}:{entity_id}`
+Content fragments use `#` suffixes: `...doc:{id}#frag`, `...doc:{id}#block-{block_id}`, `...doc:{id}#node-{n}`
+
+Example query to list all documents with titles:
+```sparql
+PREFIX doc: <http://mnemosyne.dev/doc#>
+PREFIX dcterms: <http://purl.org/dc/terms/>
+
+SELECT ?doc ?title WHERE {
+  ?doc a doc:TipTapDocument .
+  ?doc dcterms:title ?title .
+} ORDER BY ?title
+```
 
 ## Configuration
 
@@ -224,12 +267,24 @@ uv run neem-mcp-server
 
 ```
 src/neem/
-├── cli.py                          # CLI commands
+├── cli.py                          # CLI commands (init, status, logout, config)
+├── hocuspocus/                     # Y.js CRDT client layer
+│   ├── client.py                   # WebSocket client for Hocuspocus
+│   ├── document.py                 # Document Y.Doc operations
+│   ├── protocol.py                 # Y.js sync protocol handler
+│   └── workspace.py                # Workspace Y.Doc operations
 ├── mcp/
 │   ├── server/
-│   │   ├── standalone_server.py    # FastAPI backend resolver + health probe (no tools yet)
+│   │   ├── standalone_server.py    # Backend resolver, health probe, tool registration
 │   │   └── standalone_server_stdio.py  # Stdio transport wrapper
+│   ├── tools/
+│   │   ├── basic.py                # list_graphs + job helpers
+│   │   ├── graph_ops.py            # create/delete graph, SPARQL query/update
+│   │   ├── hocuspocus.py           # Document, block, folder, artifact operations
+│   │   └── wire_tools.py           # Semantic connection tools
+│   ├── jobs/                       # Job streaming (WebSocket + polling)
 │   ├── session.py                  # Session management
+│   ├── auth.py                     # MCP auth context
 │   ├── errors.py                   # MCP-specific errors
 │   └── response_objects.py         # Formatted MCP responses
 └── utils/
@@ -295,37 +350,13 @@ Sessions are stored in-memory by default; no external cache service is required.
 2. **Check token**: `neem status` to see token details and expiry
 3. **Force refresh**: `neem init --force` to get completely fresh tokens
 
-### Upload Issues
+### SPARQL Returns Empty Results
 
-1. **File not found**: Ensure the file path is absolute or relative to working directory
-2. **Format detection**: Explicitly specify format with `rdf_format` parameter if auto-detection fails
-3. **Validation errors**: Try `validation_level="lenient"` for less strict parsing
-
-### Schema/Proto Errors (Goose/Gemini)
-
-If you see errors like "Unknown name 'type'" or "Proto field is not repeating, cannot start list":
-
-1. **Cause**: This was caused by using JSON Schema reserved keywords (`format`, `type`, etc.) as parameter names
-2. **Fixed in**: Latest version uses `result_format` and `rdf_format` instead of `format`
-3. **Solution**: Update to latest version with `pip install --upgrade neem`
-
-**Note**: Parameter names were changed to avoid conflicts with JSON Schema keywords:
-- `format` → `result_format` (in `sparql_query`)
-- `format` → `rdf_format` (in `upload_file_to_graph`)
-- `validation` → `validation_level` (in `upload_file_to_graph`)
-
-**Goose + Gemini users**: If you get proto errors even with the latest version, disable Goose's built-in extensions temporarily:
-
-```yaml
-# In ~/.config/goose/config.yaml
-extensions:
-  computercontroller:
-    enabled: false  # Temporarily disable
-  developer:
-    enabled: false  # Temporarily disable
+The most common cause is using the wrong namespace prefix. Use:
+```sparql
+PREFIX doc: <http://mnemosyne.dev/doc#>
 ```
-
-This is a known issue with Goose's built-in extensions and Gemini compatibility (not a Mnemosyne MCP issue).
+Do NOT use `urn:mnemosyne:schema:doc:` — it will silently match nothing.
 
 See the `docs/` directory for end-user quick start and detailed guides that can
 ship with the package or be published separately.

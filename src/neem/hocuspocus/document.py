@@ -551,6 +551,9 @@ class DocumentReader:
         import re
         plain_text = re.sub(r"<[^>]+>", "", text_content)
 
+        # Compute text_length from XmlText children
+        text_length = self._compute_text_length(elem)
+
         return {
             "block_id": block_id,
             "index": index,
@@ -558,6 +561,7 @@ class DocumentReader:
             "xml": str(elem),
             "attributes": attrs,
             "text_content": plain_text.strip(),
+            "text_length": text_length,
             "context": {
                 "total_blocks": total,
                 "prev_block_id": prev_id,
@@ -655,6 +659,105 @@ class DocumentReader:
             })
 
         return matches
+
+    def _compute_text_length(self, elem: Any) -> int:
+        """Compute the total text length of a block element.
+
+        Walks XmlText children (counting characters) and XmlElement children
+        (counting 1 position each for inline nodes like footnotes).
+
+        Args:
+            elem: A pycrdt.XmlElement block
+
+        Returns:
+            Total character count in the offset space.
+        """
+        total = 0
+        if not hasattr(elem, "children"):
+            return 0
+        for child in elem.children:
+            if isinstance(child, pycrdt.XmlText):
+                total += len(child)
+            elif isinstance(child, pycrdt.XmlElement):
+                # Inline elements (footnote, etc.) occupy 1 position
+                total += 1
+        return total
+
+    def get_block_text_info(self, block_id: str) -> dict[str, Any] | None:
+        """Get detailed text info for a block, optimized for the editing tool.
+
+        Returns formatting runs with offsets so agents can determine where
+        to insert/delete text and what formatting exists at each position.
+
+        Args:
+            block_id: The block ID to get text info for
+
+        Returns:
+            Dict with text info, or None if not found:
+            {
+                "block_id": "block-abc123",
+                "text": "Hello bold world",
+                "length": 16,
+                "runs": [
+                    {"text": "Hello ", "offset": 0, "length": 6, "attrs": None},
+                    {"text": "bold", "offset": 6, "length": 4, "attrs": {"bold": {}}},
+                    {"text": " world", "offset": 10, "length": 6, "attrs": None},
+                ],
+                "has_inline_nodes": False,
+            }
+        """
+        result = self.find_block_by_id(block_id)
+        if result is None:
+            return None
+
+        _, elem = result
+        children = list(elem.children)
+
+        has_inline_nodes = any(
+            isinstance(child, pycrdt.XmlElement) for child in children
+        )
+
+        # Build runs by walking children
+        runs: list[dict[str, Any]] = []
+        full_text_parts: list[str] = []
+        global_offset = 0
+
+        for child in children:
+            if isinstance(child, pycrdt.XmlText):
+                # Get formatting runs from diff()
+                diff_runs = child.diff()
+                for text_or_embed, attrs in diff_runs:
+                    if isinstance(text_or_embed, str):
+                        run_len = len(text_or_embed)
+                        runs.append({
+                            "text": text_or_embed,
+                            "offset": global_offset,
+                            "length": run_len,
+                            "attrs": attrs if attrs else None,
+                        })
+                        full_text_parts.append(text_or_embed)
+                        global_offset += run_len
+            elif isinstance(child, pycrdt.XmlElement):
+                # Inline element (footnote, etc.) — 1 position
+                runs.append({
+                    "text": None,
+                    "offset": global_offset,
+                    "length": 1,
+                    "attrs": None,
+                    "inline_element": child.tag,
+                })
+                full_text_parts.append("\ufffc")  # Object replacement char
+                global_offset += 1
+
+        full_text = "".join(full_text_parts)
+
+        return {
+            "block_id": block_id,
+            "text": full_text,
+            "length": global_offset,
+            "runs": runs,
+            "has_inline_nodes": has_inline_nodes,
+        }
 
     def get_comments_map(self) -> "pycrdt.Map[dict[str, Any]]":
         """Get the comments Y.Map for this document."""
@@ -764,6 +867,224 @@ class DocumentWriter:
                 "content_after": str(fragment)[:500],
             },
         )
+
+    # -------------------------------------------------------------------------
+    # Character-Level Edit Methods (CRDT-native, collaborative-safe)
+    # -------------------------------------------------------------------------
+
+    def edit_block_text(
+        self,
+        block_id: str,
+        operations: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Apply character-level insert/delete operations to a block's text.
+
+        Uses pycrdt's native XmlText.insert() and del text[start:end] for
+        CRDT-safe edits that merge cleanly with concurrent browser changes.
+
+        Operations are sorted by offset descending and applied in one
+        transaction so earlier offsets don't shift later ones.
+
+        Args:
+            block_id: The block to edit
+            operations: List of operation dicts, each with:
+                - type: "insert" or "delete" (required)
+                - offset: global character position, 0-indexed (required)
+                - text: string to insert (required for insert)
+                - length: number of chars to delete (required for delete)
+                - attrs: optional formatting dict, e.g. {"bold": {}} (for insert)
+                - inherit_format: bool, default True — inherit formatting from
+                  preceding character (for insert)
+
+        Returns:
+            Dict with updated block text info (same format as
+            DocumentReader.get_block_text_info).
+
+        Raises:
+            ValueError: If block not found, operations empty/invalid, or
+                       delete offset is out of bounds.
+        """
+        if not operations:
+            raise ValueError("Operations list cannot be empty")
+
+        result = self.find_block_by_id(block_id)
+        if result is None:
+            raise ValueError(f"Block not found: {block_id}")
+
+        _, block = result
+
+        # Validate all operations upfront
+        for i, op in enumerate(operations):
+            op_type = op.get("type")
+            if op_type not in ("insert", "delete"):
+                raise ValueError(
+                    f"Operation {i}: type must be 'insert' or 'delete', got {op_type!r}"
+                )
+            if "offset" not in op:
+                raise ValueError(f"Operation {i}: 'offset' is required")
+            if op_type == "insert" and "text" not in op:
+                raise ValueError(f"Operation {i}: 'text' is required for insert")
+            if op_type == "delete" and "length" not in op:
+                raise ValueError(f"Operation {i}: 'length' is required for delete")
+
+        # Sort by offset descending so earlier offsets don't shift later ones
+        sorted_ops = sorted(operations, key=lambda op: op["offset"], reverse=True)
+
+        with self._doc.transaction():
+            for op in sorted_ops:
+                op_type = op["type"]
+                offset = op["offset"]
+
+                if op_type == "insert":
+                    text = op["text"]
+                    if not text:
+                        continue  # Skip empty inserts
+
+                    text_node, local_offset = self._resolve_offset_to_text_node(
+                        block, offset, clamp=True
+                    )
+
+                    # Determine formatting attrs
+                    explicit_attrs = op.get("attrs")
+                    inherit_format = op.get("inherit_format", True)
+
+                    if explicit_attrs is not None:
+                        attrs = explicit_attrs
+                    elif inherit_format and local_offset > 0:
+                        attrs = self._get_format_at_offset(text_node, local_offset)
+                    else:
+                        attrs = None
+
+                    text_node.insert(local_offset, text, attrs=attrs)
+
+                elif op_type == "delete":
+                    length = op["length"]
+                    if length <= 0:
+                        continue  # Skip zero-length deletes
+
+                    text_node, local_offset = self._resolve_offset_to_text_node(
+                        block, offset, clamp=False
+                    )
+
+                    # Validate delete doesn't start past end
+                    text_len = len(text_node)
+                    if local_offset >= text_len:
+                        raise ValueError(
+                            f"Delete offset {offset} is beyond text length {text_len}"
+                        )
+
+                    # Clamp delete length to not exceed text end
+                    end = min(local_offset + length, text_len)
+                    del text_node[local_offset:end]
+
+        # Read back updated text info
+        reader = DocumentReader(self._doc)
+        return reader.get_block_text_info(block_id)
+
+    def _resolve_offset_to_text_node(
+        self,
+        block: Any,
+        global_offset: int,
+        clamp: bool = True,
+    ) -> tuple[pycrdt.XmlText, int]:
+        """Resolve a global character offset to a specific XmlText node and local offset.
+
+        Walks the block's children. Common case (single XmlText child) is a
+        direct lookup. For blocks with inline nodes (footnote, etc.), each
+        XmlText contributes len(node) positions, each inline XmlElement
+        contributes 1 position.
+
+        Args:
+            block: The pycrdt.XmlElement block
+            global_offset: The global character offset (0-indexed)
+            clamp: If True, clamp offset to text end (for inserts).
+                   If False, raise on out-of-bounds (for deletes).
+
+        Returns:
+            Tuple of (XmlText node, local offset within that node).
+
+        Raises:
+            ValueError: If offset points at an inline element, or if clamp=False
+                       and offset is out of bounds.
+        """
+        children = list(block.children)
+
+        # Fast path: single text node (vast majority of blocks)
+        if len(children) == 1 and isinstance(children[0], pycrdt.XmlText):
+            text_node = children[0]
+            text_len = len(text_node)
+            if clamp:
+                return (text_node, min(global_offset, text_len))
+            elif global_offset > text_len:
+                raise ValueError(
+                    f"Offset {global_offset} is beyond text length {text_len}"
+                )
+            return (text_node, global_offset)
+
+        # Walk children for blocks with inline nodes
+        running_offset = 0
+        last_text_node = None
+
+        for child in children:
+            if isinstance(child, pycrdt.XmlText):
+                last_text_node = child
+                child_len = len(child)
+                if global_offset <= running_offset + child_len:
+                    return (child, global_offset - running_offset)
+                running_offset += child_len
+            elif isinstance(child, pycrdt.XmlElement):
+                if global_offset == running_offset:
+                    raise ValueError(
+                        f"Offset {global_offset} points at an inline element "
+                        f"({child.tag}). Use offsets before or after inline elements."
+                    )
+                running_offset += 1
+
+        # Beyond end
+        if clamp and last_text_node is not None:
+            return (last_text_node, len(last_text_node))
+
+        if not clamp:
+            raise ValueError(
+                f"Offset {global_offset} is beyond total text length {running_offset}"
+            )
+
+        # Fallback: no text nodes at all (empty block or block with only inline elements)
+        raise ValueError(f"Block has no text content to edit")
+
+    def _get_format_at_offset(
+        self, text_node: pycrdt.XmlText, local_offset: int
+    ) -> dict[str, Any] | None:
+        """Get formatting attributes at a given offset by reading diff() runs.
+
+        Returns the attrs of the run containing the character just before
+        the offset (i.e., "inherit from preceding character"). This matches
+        browser typing behavior.
+
+        Args:
+            text_node: The XmlText node
+            local_offset: The local offset within the text node
+
+        Returns:
+            Formatting attrs dict, or None if no formatting at that position.
+        """
+        if local_offset <= 0:
+            return None
+
+        diff_runs = text_node.diff()
+        running = 0
+        for text_or_embed, attrs in diff_runs:
+            if isinstance(text_or_embed, str):
+                run_len = len(text_or_embed)
+            else:
+                run_len = 1  # embed
+
+            if local_offset <= running + run_len:
+                # The preceding character is in this run
+                return dict(attrs) if attrs else None
+            running += run_len
+
+        return None
 
     def insert_block_at(self, index: int, xml_str: str) -> None:
         """Insert a block element at a specific position.
