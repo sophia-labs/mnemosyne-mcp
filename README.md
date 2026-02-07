@@ -76,7 +76,6 @@ When connecting to the hosted API (e.g. `api.garden.sophia-labs.com`) rather tha
 ```bash
 claude mcp add mnemosyne --scope user \
   --env MNEMOSYNE_FASTAPI_URL=https://api.garden.sophia-labs.com \
-  --env MNEMOSYNE_FASTAPI_WS_DISABLE=true \
   -- uv run neem-mcp-server
 ```
 
@@ -90,7 +89,6 @@ Or add directly to `~/.claude.json`:
     "args": ["run", "neem-mcp-server"],
     "env": {
       "MNEMOSYNE_FASTAPI_URL": "https://api.garden.sophia-labs.com",
-      "MNEMOSYNE_FASTAPI_WS_DISABLE": "true"
     }
   }
 }
