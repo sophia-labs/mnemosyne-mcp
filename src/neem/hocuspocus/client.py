@@ -145,7 +145,8 @@ class HocuspocusClient:
 
         Supported formats:
         - internal.{user_id}.{secret} - internal service auth (preferred for sidecars)
-        - Bearer.{user_id} - dev mode fallback
+        - Bearer.{token} - JWT token auth (required for cognito_jwt mode)
+        - Bearer.{user_id} - dev mode fallback (dev_no_auth mode)
 
         Internal service auth via subprotocol is preferred because it survives
         proxies that may strip custom HTTP headers during WebSocket upgrade.
@@ -157,7 +158,11 @@ class HocuspocusClient:
         # Prefer internal service auth via subprotocol (survives proxies)
         if self._internal_service_secret and effective_user_id:
             return [f"internal.{effective_user_id}.{self._internal_service_secret}"]
-        # Fallback to bearer format for dev mode
+        # Use JWT token in subprotocol (required for cognito_jwt auth mode)
+        token = self._token_provider()
+        if token:
+            return [f"Bearer.{token}"]
+        # Fallback to user_id for dev_no_auth mode (server treats it as user identity)
         if effective_user_id:
             return [f"Bearer.{effective_user_id}"]
         return None

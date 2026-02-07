@@ -24,6 +24,7 @@ from neem.mcp.tools.basic import register_basic_tools
 from neem.mcp.tools.graph_ops import register_graph_ops_tools
 from neem.mcp.tools.hocuspocus import register_hocuspocus_tools
 from neem.mcp.tools.wire_tools import register_wire_tools
+from neem.mcp.trace import trace, trace_separator
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_dev_user_id, get_internal_service_secret, validate_token_and_load
 
@@ -261,6 +262,21 @@ def create_standalone_mcp_server() -> FastMCP:
     """
     backend_config = resolve_backend_config()
 
+    trace_separator("MCP SERVER STARTUP")
+    trace("Backend config resolved", {
+        "base_url": backend_config.base_url,
+        "health_url": backend_config.health_url,
+        "websocket_url": backend_config.websocket_url,
+        "has_websocket": backend_config.has_websocket,
+    })
+    trace("Environment", {
+        "MNEMOSYNE_FASTAPI_URL": os.getenv("MNEMOSYNE_FASTAPI_URL"),
+        "MNEMOSYNE_FASTAPI_WS_DISABLE": os.getenv("MNEMOSYNE_FASTAPI_WS_DISABLE"),
+        "MNEMOSYNE_FASTAPI_WS_URL": os.getenv("MNEMOSYNE_FASTAPI_WS_URL"),
+        "MNEMOSYNE_DEV_USER_ID": os.getenv("MNEMOSYNE_DEV_USER_ID"),
+        "has_dev_token": bool(os.getenv("MNEMOSYNE_DEV_TOKEN")),
+    })
+
     mcp_server = FastMCP(
         name="Mnemosyne Knowledge Graph",
         instructions=(
@@ -292,6 +308,8 @@ def create_standalone_mcp_server() -> FastMCP:
             "- delete_folder: Delete a folder (with cascade option)\n"
             "- move_artifact: Move an artifact to a different folder\n"
             "- rename_artifact: Rename an artifact\n"
+            "- read_artifact: Read artifact metadata and ingested document content\n"
+            "- ingest_artifact: Convert an artifact into a readable/editable document\n"
             "- move_document: Move a document to a folder\n\n"
             "**Wire Operations (Semantic Connections):**\n"
             "- list_wire_predicates: List available semantic predicates for wires\n"
@@ -341,18 +359,28 @@ def create_standalone_mcp_server() -> FastMCP:
     mcp_server._backend_config = backend_config  # type: ignore[attr-defined]
 
     if backend_config.has_websocket:
+        dev_uid = get_dev_user_id()
+        internal_secret = get_internal_service_secret()
+        trace("Creating RealtimeJobClient", {
+            "websocket_url": backend_config.websocket_url,
+            "dev_user_id": dev_uid,
+            "has_internal_secret": bool(internal_secret),
+            "token_provider": "validate_token_and_load",
+        })
         job_client = RealtimeJobClient(
             websocket_url=backend_config.websocket_url,  # type: ignore[arg-type]
             token_provider=validate_token_and_load,
-            dev_user_id=get_dev_user_id(),
-            internal_service_secret=get_internal_service_secret(),
+            dev_user_id=dev_uid,
+            internal_service_secret=internal_secret,
         )
         mcp_server._job_stream = job_client  # type: ignore[attr-defined]
+        trace("RealtimeJobClient created and attached to server")
         logger.info(
             "Realtime job streaming enabled",
             extra_context={"websocket_url": backend_config.websocket_url},
         )
     else:
+        trace("WebSocket DISABLED — will use HTTP polling only")
         logger.info("Realtime job streaming disabled (WebSocket URL not configured)")
 
     verify_backend_connectivity(backend_config)

@@ -7,8 +7,11 @@ CRDT synchronization, bypassing the job queue for lower latency operations.
 
 from __future__ import annotations
 
+import mimetypes
+from pathlib import Path
 from typing import Any, Dict, Optional
 
+import httpx
 from mcp.server.fastmcp import Context, FastMCP
 
 from neem.hocuspocus import HocuspocusClient, DocumentReader, DocumentWriter, WorkspaceWriter, WorkspaceReader
@@ -778,6 +781,244 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 },
             )
             raise RuntimeError(f"Failed to rename artifact: {e}")
+
+    @server.tool(
+        name="read_artifact",
+        title="Read Artifact Content",
+        description=(
+            "Read an artifact's metadata and, if the artifact has been ingested, its document content. "
+            "Returns metadata (name, fileType, mimeType, status, ingestedDocId, etc.) always. "
+            "If the artifact has been ingested into a document (ingestedDocId is set), also returns "
+            "the ingested document's TipTap XML content and comments.\n\n"
+            "If the artifact has not been ingested yet, the response will not include 'ingested_document'. "
+            "Use ingest_artifact to convert the artifact into a readable document first."
+        ),
+    )
+    async def read_artifact_tool(
+        graph_id: str,
+        artifact_id: str,
+        context: Context | None = None,
+    ) -> dict:
+        """Read artifact metadata and ingested document content if available."""
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required and cannot be empty")
+        if not artifact_id or not artifact_id.strip():
+            raise ValueError("artifact_id is required and cannot be empty")
+
+        try:
+            await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
+
+            channel = hp_client.get_workspace_channel(graph_id.strip(), user_id=auth.user_id)
+            if channel is None:
+                raise RuntimeError(f"Workspace not connected: {graph_id}")
+
+            reader = WorkspaceReader(channel.doc)
+            metadata = reader.get_artifact(artifact_id.strip())
+
+            if not metadata:
+                raise RuntimeError(f"Artifact '{artifact_id}' not found in graph '{graph_id}'")
+
+            result: dict[str, Any] = {
+                "graph_id": graph_id.strip(),
+                "artifact_id": artifact_id.strip(),
+                "metadata": metadata,
+            }
+
+            # If the artifact has been ingested, read the linked document content
+            ingested_doc_id = metadata.get("ingestedDocId")
+            if ingested_doc_id:
+                try:
+                    await hp_client.connect_document(graph_id.strip(), ingested_doc_id, user_id=auth.user_id)
+                    doc_channel = hp_client.get_document_channel(graph_id.strip(), ingested_doc_id, user_id=auth.user_id)
+                    if doc_channel is not None:
+                        doc_reader = DocumentReader(doc_channel.doc)
+                        result["ingested_document"] = {
+                            "document_id": ingested_doc_id,
+                            "content": doc_reader.to_xml(),
+                            "comments": doc_reader.get_all_comments(),
+                        }
+                except Exception as doc_err:
+                    logger.warning(
+                        "Artifact has ingestedDocId but document could not be read",
+                        extra_context={
+                            "artifact_id": artifact_id,
+                            "ingested_doc_id": ingested_doc_id,
+                            "error": str(doc_err),
+                        },
+                    )
+
+            return result
+
+        except Exception as e:
+            logger.error(
+                "Failed to read artifact",
+                extra_context={
+                    "graph_id": graph_id,
+                    "artifact_id": artifact_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to read artifact: {e}")
+
+    @server.tool(
+        name="upload_artifact",
+        title="Upload Artifact",
+        description=(
+            "Upload a local file as a new artifact in a graph. "
+            "Reads the file from the local filesystem and uploads it to the platform.\n\n"
+            "Supported formats: TXT, MD, HTML, and text-like files "
+            "(.log, .csv, .json, .xml, .yaml, .py, .js, .ts, .sql, etc.)\n"
+            "Maximum size: 50MB\n\n"
+            "After uploading, use ingest_artifact to convert the artifact into a "
+            "readable/editable document."
+        ),
+    )
+    async def upload_artifact_tool(
+        graph_id: str,
+        file_path: str,
+        parent_id: Optional[str] = None,
+        label: Optional[str] = None,
+        context: Context | None = None,
+    ) -> dict:
+        """Upload a local file as a new artifact via the backend API."""
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required and cannot be empty")
+        if not file_path or not file_path.strip():
+            raise ValueError("file_path is required and cannot be empty")
+
+        path = Path(file_path.strip())
+        if not path.exists():
+            raise ValueError(f"File not found: {path}")
+        if not path.is_file():
+            raise ValueError(f"Path is not a file: {path}")
+
+        file_size = path.stat().st_size
+        max_size = 50 * 1024 * 1024  # 50MB
+        if file_size > max_size:
+            raise ValueError(
+                f"File too large ({file_size / (1024 * 1024):.1f}MB). Maximum size: 50MB"
+            )
+
+        try:
+            content = path.read_bytes()
+            filename = label or path.name
+            mime_type, _ = mimetypes.guess_type(path.name)
+            if mime_type is None:
+                mime_type = "application/octet-stream"
+
+            url = f"{backend_config.base_url}/artifacts/{graph_id.strip()}/upload"
+
+            data: dict[str, str] = {}
+            if parent_id is not None and parent_id.strip():
+                data["parent_id"] = parent_id.strip()
+
+            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+                resp = await client.post(
+                    url,
+                    files={"file": (filename, content, mime_type)},
+                    data=data,
+                    headers=auth.http_headers(),
+                )
+                if resp.status_code != 201:
+                    raise RuntimeError(
+                        f"Backend returned {resp.status_code}: {resp.text[:300]}"
+                    )
+                result = resp.json()
+
+            return {
+                "success": True,
+                "artifact_id": result.get("artifactId"),
+                "file_type": result.get("fileType"),
+                "label": result.get("label"),
+                "storage_key": result.get("storageKey"),
+            }
+
+        except Exception as e:
+            logger.error(
+                "Failed to upload artifact",
+                extra_context={
+                    "graph_id": graph_id,
+                    "file_path": file_path,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to upload artifact: {e}")
+
+    @server.tool(
+        name="ingest_artifact",
+        title="Ingest Artifact",
+        description=(
+            "Ingest an artifact into a readable document. Converts uploaded files (PDFs, etc.) "
+            "into TipTap documents that can be read and searched.\n\n"
+            "Modes:\n"
+            "- 'ingest' (default): Creates a read-only e-reader document. Best for reference material.\n"
+            "- 'import': Creates a fully editable document. Best when you need to modify the content.\n\n"
+            "After ingestion, use read_artifact or read_document with the returned document_id "
+            "to access the content."
+        ),
+    )
+    async def ingest_artifact_tool(
+        graph_id: str,
+        artifact_id: str,
+        mode: str = "ingest",
+        title: Optional[str] = None,
+        context: Context | None = None,
+    ) -> dict:
+        """Ingest an artifact into a document via the backend API."""
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required and cannot be empty")
+        if not artifact_id or not artifact_id.strip():
+            raise ValueError("artifact_id is required and cannot be empty")
+        if mode not in ("ingest", "import"):
+            raise ValueError("mode must be 'ingest' or 'import'")
+
+        try:
+            url = f"{backend_config.base_url}/artifacts/{graph_id.strip()}/{artifact_id.strip()}/import"
+            body: dict[str, Any] = {
+                "readOnly": mode == "ingest",
+                "useYdocPath": True,
+            }
+            if title is not None:
+                body["title"] = title
+
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+                resp = await client.post(url, json=body, headers=auth.http_headers())
+                if resp.status_code not in (200, 201):
+                    raise RuntimeError(
+                        f"Backend returned {resp.status_code}: {resp.text[:300]}"
+                    )
+                data = resp.json()
+
+            return {
+                "success": True,
+                "graph_id": graph_id.strip(),
+                "artifact_id": artifact_id.strip(),
+                "document_id": data.get("documentId"),
+                "title": data.get("title"),
+                "mode": mode,
+                "read_only": mode == "ingest",
+            }
+
+        except Exception as e:
+            logger.error(
+                "Failed to ingest artifact",
+                extra_context={
+                    "graph_id": graph_id,
+                    "artifact_id": artifact_id,
+                    "mode": mode,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to ingest artifact: {e}")
 
     # -------------------------------------------------------------------------
     # Document Navigation Operations

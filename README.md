@@ -62,12 +62,41 @@ The MCP server defaults to `http://127.0.0.1:8080` which matches this port-forwa
 
 ### Step 2: Add MCP server to your agent
 
-#### Using Claude Code:
+#### Using Claude Code (local backend):
 
 ```bash
 claude mcp add mnemosyne --scope user \
   -- uv run neem-mcp-server
 ```
+
+#### Using Claude Code (hosted API):
+
+When connecting to the hosted API (e.g. `api.garden.sophia-labs.com`) rather than a local port-forward, disable WebSocket streaming. The WS endpoint is internal to the cluster and not exposed externally — without this flag, job-based tools like `list_graphs` will hang for up to 60 seconds before falling back to HTTP polling.
+
+```bash
+claude mcp add mnemosyne --scope user \
+  --env MNEMOSYNE_FASTAPI_URL=https://api.garden.sophia-labs.com \
+  --env MNEMOSYNE_FASTAPI_WS_DISABLE=true \
+  -- uv run neem-mcp-server
+```
+
+Or add directly to `~/.claude.json`:
+
+```json
+"mcpServers": {
+  "mnemosyne": {
+    "type": "stdio",
+    "command": "uv",
+    "args": ["run", "neem-mcp-server"],
+    "env": {
+      "MNEMOSYNE_FASTAPI_URL": "https://api.garden.sophia-labs.com",
+      "MNEMOSYNE_FASTAPI_WS_DISABLE": "true"
+    }
+  }
+}
+```
+
+Authenticate first with `neem init`. Tokens are stored at `~/.mnemosyne/config.json` and auto-refresh for ~30 days.
 
 #### Using Codex
 ```bash

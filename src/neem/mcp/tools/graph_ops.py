@@ -12,8 +12,9 @@ from typing import Any, Dict, Optional
 from mcp.server.fastmcp import Context, FastMCP
 
 from neem.mcp.auth import MCPAuthContext
-from neem.mcp.jobs import JobSubmitMetadata, RealtimeJobClient, WebSocketConnectionError
-from neem.mcp.tools.basic import poll_job_until_terminal, stream_job, submit_job
+from neem.mcp.jobs import JobSubmitMetadata, RealtimeJobClient
+from neem.mcp.tools.basic import await_job_completion, submit_job
+from neem.mcp.trace import trace
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_user_id_from_token
 
@@ -63,6 +64,12 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         if description:
             payload["description"] = description.strip()
 
+        if job_stream:
+            try:
+                await job_stream.ensure_ready()
+            except Exception:
+                pass
+
         metadata = await submit_job(
             base_url=backend_config.base_url,
             auth=auth,
@@ -111,6 +118,12 @@ def register_graph_ops_tools(server: FastMCP) -> None:
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required and cannot be empty")
+
+        if job_stream:
+            try:
+                await job_stream.ensure_ready()
+            except Exception:
+                pass
 
         metadata = await submit_job(
             base_url=backend_config.base_url,
@@ -197,6 +210,12 @@ def register_graph_ops_tools(server: FastMCP) -> None:
                     "sparql_query_from_injection_fallback",
                     extra_context={"graph_id": graph_id, "query_prefix": sparql[:50]},
                 )
+
+        if job_stream:
+            try:
+                await job_stream.ensure_ready()
+            except Exception:
+                pass
 
         metadata = await submit_job(
             base_url=backend_config.base_url,
@@ -307,6 +326,12 @@ def register_graph_ops_tools(server: FastMCP) -> None:
                 # For other updates (INSERT/DELETE WHERE), prepend WITH clause
                 sparql = f"WITH <{graph_uri}>\n{sparql}"
 
+        if job_stream:
+            try:
+                await job_stream.ensure_ready()
+            except Exception:
+                pass
+
         metadata = await submit_job(
             base_url=backend_config.base_url,
             auth=auth,
@@ -337,22 +362,22 @@ async def _wait_for_job_result(
     context: Optional[Context],
     auth: MCPAuthContext,
 ) -> JsonDict:
-    """Wait for job completion via WebSocket or polling, return result info including detail."""
-    events = None
-    if job_stream and metadata.links.websocket:
-        events = await stream_job(job_stream, metadata, timeout=STREAM_TIMEOUT_SECONDS)
+    """Wait for job completion via WS+poll race, return result info including detail."""
+    trace("  _wait_for_job_result: racing WS + poll")
+    ws_events, poll_payload = await await_job_completion(
+        job_stream, metadata, auth, timeout=STREAM_TIMEOUT_SECONDS,
+    )
 
-    if events:
+    # Try WS events first
+    if ws_events:
         if context:
             await context.report_progress(80, 100)
-        # Check for completion status in events and extract result
-        for event in reversed(events):
+        for event in reversed(ws_events):
             event_type = event.get("type", "")
             if event_type in ("job_completed", "completed", "succeeded"):
                 if context:
                     await context.report_progress(100, 100)
-                # Extract result from event payload
-                result: JsonDict = {"status": "succeeded", "events": len(events)}
+                result: JsonDict = {"status": "succeeded", "events": len(ws_events)}
                 payload = event.get("payload", {})
                 if isinstance(payload, dict):
                     detail = payload.get("detail")
@@ -362,25 +387,18 @@ async def _wait_for_job_result(
             if event_type in ("failed", "error"):
                 error = event.get("error", "Job failed")
                 return {"status": "failed", "error": error}
-        return {"status": "unknown", "event_count": len(events)}
+        return {"status": "unknown", "event_count": len(ws_events)}
 
-    # Fall back to polling
-    status_payload = (
-        await poll_job_until_terminal(metadata.links.status, auth)
-        if metadata.links.status
-        else None
-    )
-
+    # Try poll result
     if context:
         await context.report_progress(100, 100)
 
-    if status_payload:
-        status = status_payload.get("status", "unknown")
-        detail = status_payload.get("detail")
+    if poll_payload:
+        status = poll_payload.get("status", "unknown")
+        detail = poll_payload.get("detail")
         if status == "failed":
-            error = status_payload.get("error") or (detail.get("error") if isinstance(detail, dict) else None)
+            error = poll_payload.get("error") or (detail.get("error") if isinstance(detail, dict) else None)
             return {"status": "failed", "error": error}
-        # Include full detail in result for successful jobs
         result: JsonDict = {"status": status}
         if detail:
             result["detail"] = detail
