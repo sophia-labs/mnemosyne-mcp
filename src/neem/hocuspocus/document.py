@@ -111,6 +111,12 @@ MARK_ATTR_TO_XML: dict[str, dict[str, str]] = {
     },
 }
 
+# Reverse mapping: TipTap internal inline-node attr names back to XML names
+INLINE_NODE_ATTR_TO_XML: dict[str, dict[str, str]] = {
+    tag: {tiptap_key: xml_key for xml_key, tiptap_key in attr_map.items()}
+    for tag, attr_map in INLINE_NODE_ATTR_MAP.items()
+}
+
 # Map XML attribute names to TipTap internal attribute names for block elements
 # y-prosemirror stores ProseMirror internal attribute names, not HTML attribute names
 BLOCK_ATTR_MAP: dict[str, dict[str, str]] = {
@@ -126,6 +132,12 @@ BLOCK_ATTR_MAP: dict[str, dict[str, str]] = {
         "listType": "listType",   # Pass through (bullet/ordered/task)
         "checked": "checked",     # Pass through (for task items)
     },
+}
+
+# Reverse mapping: TipTap internal block attr names back to XML names
+BLOCK_ATTR_TO_XML: dict[str, dict[str, str]] = {
+    tag: {tiptap_key: xml_key for xml_key, tiptap_key in attr_map.items()}
+    for tag, attr_map in BLOCK_ATTR_MAP.items()
 }
 
 # Block types that need data-block-id (matches TipTap's BlockId extension)
@@ -311,6 +323,21 @@ def _map_block_attrs(tag: str, attrs: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _map_attrs_to_xml(tag: str, attrs: dict[str, Any]) -> dict[str, Any]:
+    """Map TipTap/internal attribute names back to XML attribute names."""
+    inline_attr_map = INLINE_NODE_ATTR_TO_XML.get(tag, {})
+    block_attr_map = BLOCK_ATTR_TO_XML.get(tag, {})
+
+    result: dict[str, Any] = {}
+    for key, value in attrs.items():
+        if key == "data-block-id":
+            result[key] = value
+            continue
+        xml_key = inline_attr_map.get(key, block_attr_map.get(key, key))
+        result[xml_key] = value
+    return result
+
+
 def extract_title_from_xml(xml_str: str) -> str | None:
     """Extract title from first heading element in TipTap XML.
 
@@ -411,7 +438,9 @@ class DocumentReader:
 
         # Build attributes string (convert XmlAttributesView to dict)
         attrs_parts = []
-        for key, value in dict(elem.attributes).items():
+        raw_attrs = dict(elem.attributes)
+        xml_attrs = _map_attrs_to_xml(tag, raw_attrs)
+        for key, value in xml_attrs.items():
             if value is None:
                 continue
             # Convert Python booleans to lowercase strings
@@ -439,29 +468,38 @@ class DocumentReader:
     def _serialize_text_with_marks(self, text_node: pycrdt.XmlText) -> str:
         """Serialize an XmlText node with its formatting marks.
 
-        pycrdt's XmlText.__str__() already produces proper XML with mark tags:
-            str(text_node) -> "Hello <bold>bold</bold> world"
-
-        However, pycrdt uses internal mark names (bold, italic) while TipTap XML
-        uses HTML element names (strong, em). We need to translate these.
+        Uses diff() runs so we can normalize both mark names and mark attributes
+        (e.g. commentId -> data-comment-id) when building TipTap XML.
         """
-        # Get the text content with pycrdt's built-in mark serialization
-        text_content = str(text_node)
-        if not text_content:
-            return ""
+        try:
+            runs = text_node.diff()
+        except Exception:
+            # Fallback for unexpected pycrdt behavior
+            text_content = str(text_node)
+            return _escape_xml(text_content) if text_content else ""
 
-        # pycrdt uses internal names like <bold>, <italic> but TipTap XML
-        # uses HTML names like <strong>, <em>. Translate them.
-        # Note: This is a simple replacement - if text content contains these
-        # literal strings, they would also be replaced. In practice this is rare.
-        result = text_content
-        result = result.replace("<bold>", "<strong>").replace("</bold>", "</strong>")
-        result = result.replace("<italic>", "<em>").replace("</italic>", "</em>")
-        result = result.replace("<highlight>", "<mark>").replace("</highlight>", "</mark>")
-        result = result.replace("<link ", "<a ").replace("</link>", "</a>")
-        # strike and code use the same names
+        parts: list[str] = []
+        for text_or_embed, attrs in runs:
+            if not isinstance(text_or_embed, str) or not text_or_embed:
+                continue
 
-        return result
+            segment = _escape_xml(text_or_embed)
+            if isinstance(attrs, dict) and attrs:
+                open_tags: list[str] = []
+                close_tags: list[str] = []
+                # Stable order so output is deterministic
+                for mark_name in sorted(attrs.keys()):
+                    xml_tag = _mark_name_to_xml_tag(mark_name) or mark_name
+                    mark_attrs = attrs.get(mark_name)
+                    mark_attrs_dict = mark_attrs if isinstance(mark_attrs, dict) else {}
+                    attrs_str = _build_mark_attrs_string(xml_tag, mark_attrs_dict)
+                    open_tags.append(f"<{xml_tag}{attrs_str}>")
+                    close_tags.append(f"</{xml_tag}>")
+                segment = "".join(open_tags) + segment + "".join(reversed(close_tags))
+
+            parts.append(segment)
+
+        return "".join(parts)
 
     def get_block_count(self) -> int:
         """Get the number of top-level blocks in the document."""

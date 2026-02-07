@@ -254,17 +254,41 @@ class HocuspocusClient:
                     extra_context={"channel": channel_name},
                 )
             except asyncio.TimeoutError:
-                logger.warning(
-                    "Hocuspocus sync timeout, continuing anyway",
-                    extra_context={"channel": channel_name},
+                logger.error(
+                    "Hocuspocus sync timeout",
+                    extra_context={
+                        "channel": channel_name,
+                        "timeout_seconds": 10.0,
+                    },
                 )
+                raise TimeoutError(f"Hocuspocus sync timed out for channel: {channel_name}")
 
         except Exception as exc:
+            await self._reset_channel(channel)
             logger.error(
                 "Failed to connect to Hocuspocus channel",
                 extra_context={"channel": channel_name, "error": str(exc)},
             )
             raise
+
+    async def _reset_channel(self, channel: ChannelState) -> None:
+        """Reset channel state after a failed connection attempt."""
+        if channel.receiver_task:
+            channel.receiver_task.cancel()
+            try:
+                await channel.receiver_task
+            except asyncio.CancelledError:
+                pass
+            finally:
+                channel.receiver_task = None
+
+        if channel.ws and not channel.ws.closed:
+            try:
+                await channel.ws.close()
+            except Exception:
+                pass
+        channel.ws = None
+        channel.synced.clear()
 
     async def _receiver_loop(self, channel: ChannelState, channel_name: str) -> None:
         """Receive and process messages from the WebSocket."""

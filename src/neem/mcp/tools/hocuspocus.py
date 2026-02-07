@@ -116,7 +116,18 @@ Lists: <bulletList><listItem><paragraph>item</paragraph></listItem></bulletList>
 
         try:
             # Connect to the document channel with user context
-            await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
+            try:
+                await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
+            except TimeoutError:
+                logger.warning(
+                    "read_document initial sync timed out, retrying once",
+                    extra_context={
+                        "graph_id": graph_id,
+                        "document_id": document_id,
+                    },
+                )
+                await hp_client.disconnect_document(graph_id, document_id, user_id=auth.user_id)
+                await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
 
             # Get the channel and read content
             channel = hp_client.get_document_channel(graph_id, document_id, user_id=auth.user_id)
