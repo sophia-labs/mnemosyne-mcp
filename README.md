@@ -167,9 +167,10 @@ When the refresh token eventually expires, simply run `neem init` to re-authenti
 > ```
 > **WARNING:** Do NOT use `urn:mnemosyne:schema:doc:` as the doc namespace — it will match nothing.
 
-### Context & Workspace
-- `get_active_context` – Get the currently active graph and document from the Mnemosyne UI
-- `get_workspace` – Get the folder/file structure of a graph
+### Orientation
+- `get_user_location` – Get the graph and document the user is currently viewing (minimal tokens)
+- `get_workspace` – Get the folder/file structure of a graph (primary exploration tool)
+- `get_session_state` – Get full session state including tabs and preferences (large payload, rarely needed)
 
 ### Folder Operations
 - `create_folder` – Create a new folder in the workspace

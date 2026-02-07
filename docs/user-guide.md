@@ -84,7 +84,7 @@ Authentication is **completely automatic**. Here's what you can do:
 - "Insert this triple into my graph..." → `sparql_update`
 
 **Document Operations (real-time via Y.js):**
-- "What document am I looking at in Mnemosyne?" → `get_active_context`
+- "What document am I looking at in Mnemosyne?" → `get_user_location`
 - "Show me the folder structure of my-graph" → `get_workspace`
 - "Read the document at /notes/meeting.md" → `read_document`
 - "Write this content to my document" → `write_document`
@@ -151,9 +151,10 @@ This deletes your token from `~/.mnemosyne/config.json`.
 - `sparql_query` – Execute read-only SPARQL SELECT/CONSTRUCT queries
 - `sparql_update` – Execute SPARQL INSERT/DELETE/UPDATE operations
 
-### Context & Workspace
-- `get_active_context` – Get the currently active graph/document from UI
-- `get_workspace` – Get the folder/file structure of a graph
+### Orientation
+- `get_user_location` – Get the graph and document the user is currently viewing (minimal tokens)
+- `get_workspace` – Get the folder/file structure of a graph (primary exploration tool)
+- `get_session_state` – Get full session state including tabs and preferences (large payload, rarely needed)
 
 ### Folder Operations
 - `create_folder`, `rename_folder`, `move_folder`, `delete_folder`
