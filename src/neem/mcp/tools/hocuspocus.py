@@ -141,7 +141,9 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
 
 Blocks: paragraph, heading (level="1-3"), bulletList, orderedList, blockquote, codeBlock (language="..."), taskList (taskItem checked="true"), horizontalRule
 Marks (nestable): strong, em, strike, code, mark (highlight), a (href="..."), footnote (data-footnote-content="..."), commentMark (data-comment-id="...")
-Lists: <bulletList><listItem><paragraph>item</paragraph></listItem></bulletList>""",
+Lists: <bulletList><listItem><paragraph>item</paragraph></listItem></bulletList>
+
+Each block element includes a data-block-id attribute. Use these IDs with block-level tools (get_block, update_block, insert_block, delete_block) and for block-level wire connections.""",
     )
     async def read_document_tool(
         graph_id: str,
@@ -205,6 +207,8 @@ WARNING: This REPLACES all content. For collaborative editing, prefer append_to_
 Blocks: paragraph, heading (level="1-3"), bulletList, orderedList, blockquote, codeBlock (language="..."), taskList (taskItem checked="true"), horizontalRule
 Marks (nestable): strong, em, strike, code, mark (highlight), a (href="..."), footnote (data-footnote-content="..."), commentMark (data-comment-id="...")
 Example: <paragraph>Text with <mark>highlight</mark> and a note<footnote data-footnote-content="This is a footnote"/></paragraph>
+
+Note: strong/em are accepted as input but output uses TipTap's canonical names bold/italic. Both work as input.
 
 Comments: Pass a dict mapping comment IDs to metadata. Comment IDs must match data-comment-id attributes in the content.
 Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}""",
@@ -293,7 +297,8 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             "Appends a block to the end of a document. Accepts TipTap XML for any block type. "
             "Use this for incremental additions without replacing existing content. "
             "For plain text, wrap in <paragraph>text</paragraph>. For structured content, "
-            "provide full XML like <heading level=\"2\">Title</heading> or <listItem listType=\"bullet\">...</listItem>."
+            "provide full XML like <heading level=\"2\">Title</heading> or <listItem listType=\"bullet\">...</listItem>. "
+            "Only accepts a single top-level XML block element per call. To append multiple blocks, make multiple calls."
         ),
     )
     async def append_to_document_tool(
@@ -1525,6 +1530,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             "Insert a new block relative to an existing block. Use position='after' or 'before' "
             "to specify where to insert. Returns the new block's generated ID. "
             "For appending to the end, use append_to_document instead."
+            "\n\nNote: strong/em are accepted as input but output uses TipTap's canonical names bold/italic."
         ),
     )
     async def insert_block_tool(
@@ -1693,8 +1699,9 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         title="Batch Update Blocks",
         description=(
             "Update multiple blocks in a single transaction. More efficient than "
-            "individual update_block calls. Each update can specify attributes to change "
-            "and/or new XML content. Returns results for each update."
+            "individual update_block calls. Each update object should have a block_id (required), "
+            "and optionally attributes (object) and/or xml_content (string), matching the "
+            "parameters of update_block. Returns results for each update."
         ),
     )
     async def batch_update_blocks_tool(
@@ -1737,10 +1744,22 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                         continue
 
                     try:
-                        if "content" in update:
-                            writer.replace_block_by_id(block_id, update["content"])
-                        if "attributes" in update:
-                            writer.update_block_attributes(block_id, update["attributes"])
+                        # Accept both "xml_content" (matches update_block param name)
+                        # and "content" (legacy) for the XML content key
+                        xml_content = update.get("xml_content") or update.get("content")
+                        attrs = update.get("attributes")
+
+                        if xml_content is None and attrs is None:
+                            results.append({
+                                "block_id": block_id,
+                                "error": "No xml_content or attributes provided — nothing to update",
+                            })
+                            continue
+
+                        if xml_content:
+                            writer.replace_block_by_id(block_id, xml_content)
+                        if attrs:
+                            writer.update_block_attributes(block_id, attrs)
                         results.append({"block_id": block_id, "success": True})
                     except Exception as e:
                         results.append({"block_id": block_id, "error": str(e)})

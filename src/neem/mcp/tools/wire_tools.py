@@ -258,8 +258,11 @@ def register_wire_tools(server: FastMCP) -> None:
         title="List Wire Predicates",
         description=(
             "Returns the taxonomy of semantic predicates available for wires. "
-            "Predicates are organized by philosophical category (Quantity, Quality, "
-            "Relation, Modality from Kant; Synthesis from Deleuze & Guattari). "
+            "Predicates are organized by philosophical category "
+            "(Quantity, Quality, Relation, Modality from Kant; Synthesis from Deleuze & Guattari). "
+            "Categories: Quantity (partOf, contains, exemplifies), Quality (supports, contradicts, qualifies), "
+            "Relation (causeOf, consequenceOf, relatedTo), Modality (requires, enables, precedes), "
+            "Synthesis (flowsInto, produces, divergesFrom, branchesTo, consumesWith, intensifiesWith). "
             "Also includes any custom predicates found in the graph's wires."
         ),
     )
@@ -323,7 +326,10 @@ def register_wire_tools(server: FastMCP) -> None:
             "syncs in real-time to the browser and materializes to RDF automatically. "
             "Use list_wire_predicates to see available predicate URIs. "
             "Title/snippet previews are not populated at creation time — use the "
-            "UI's refresh action or the backend API to fill them in later."
+            "UI's refresh action or the backend API to fill them in later.\n\n"
+            "Supports four connection modes: document-to-document (default), document-to-block, "
+            "block-to-document, and block-to-block. Use source_block_id and/or target_block_id "
+            "to wire at block granularity for precise conceptual connections."
         ),
     )
     async def create_wire_tool(
@@ -481,6 +487,8 @@ def register_wire_tools(server: FastMCP) -> None:
             "up to a specified depth. Returns all reachable documents and the paths "
             "connecting them. Useful for discovering related content, understanding "
             "document clusters, and exploring knowledge structure. "
+            "Results include document titles and wire metadata, making this useful for "
+            "quickly mapping the conceptual neighborhood of a document. "
             "Optionally filter by predicate to follow only specific relationship types."
         ),
     )

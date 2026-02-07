@@ -871,7 +871,16 @@ class DocumentWriter:
 
         fragment = self.get_content_fragment()
         block_count_before = len(list(fragment.children))
-        elem = ET.fromstring(xml_str)
+        try:
+            elem = ET.fromstring(xml_str)
+        except ET.ParseError as e:
+            if "junk after document element" in str(e):
+                raise ValueError(
+                    "append_block accepts a single top-level XML block element per call. "
+                    "To append multiple blocks, make multiple calls. "
+                    f"Original error: {e}"
+                ) from e
+            raise
 
         logger.info(
             "append_block: parsed XML",
@@ -1762,9 +1771,10 @@ class DocumentWriter:
             # by _extract_inline_content which creates XmlElement nodes for them
 
             # Tail text (after this child element)
-            # Use inherited_marks (not marks) because tail text is OUTSIDE the child element
+            # Use marks (not inherited_marks): tail is outside the CHILD but
+            # still inside the CURRENT element, so it carries the current marks.
             if child.tail:
-                runs.append({"text": child.tail, "marks": dict(inherited_marks or {})})
+                runs.append({"text": child.tail, "marks": dict(marks)})
 
         return runs
 
@@ -1775,7 +1785,10 @@ class DocumentWriter:
             for run in runs:
                 text = run["text"]
                 marks = run["marks"]
-                length = len(text)
+                # pycrdt/Yrs uses UTF-8 byte offsets, not Unicode code points.
+                # Python's len() counts code points, which differs for non-ASCII
+                # characters (e.g., em dash U+2014 is 1 code point but 3 UTF-8 bytes).
+                length = len(text.encode("utf-8"))
 
                 if marks:
                     # Apply each mark as a format attribute
@@ -1946,9 +1959,12 @@ class DocumentWriter:
                     process_element(child, marks)
 
                 # Tail text (after this child, outside the child element)
-                # Use inherited_marks, not marks, since tail is outside the child
+                # Use marks (not inherited_marks): tail is outside the CHILD but
+                # still inside the CURRENT element. E.g., in <strong>a <em>b</em> c</strong>,
+                # "c" is the tail of <em> — it's outside <em> but inside <strong>,
+                # so it should carry the strong mark.
                 if child.tail:
-                    current_runs.append({"text": child.tail, "marks": dict(inherited_marks or {})})
+                    current_runs.append({"text": child.tail, "marks": dict(marks)})
 
         # Process the root element (but don't treat the root itself as a mark)
         if elem.text:
