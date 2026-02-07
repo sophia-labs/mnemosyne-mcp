@@ -45,32 +45,70 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
             extra_context={"base_url": backend_config.base_url},
         )
 
-    @server.tool(
-        name="get_active_context",
-        title="Get Active Graph and Document",
-        description=(
-            "Returns the currently active graph ID and document ID from the user's session. "
-            "Use this to understand what the user is currently working on in the Mnemosyne UI. "
-            "The user_id is automatically derived from authentication if not provided."
-        ),
-    )
-    async def get_active_context_tool(
-        user_id: Optional[str] = None,
-        context: Context | None = None,
-    ) -> dict:
-        """Get the active graph and document from session state."""
-        auth = MCPAuthContext.from_context(context)
-        token = auth.require_auth()
-
-        # Auto-derive user_id if not provided
+    # ------------------------------------------------------------------
+    # Helper: resolve user_id from auth context
+    # ------------------------------------------------------------------
+    def _resolve_user_id(auth: MCPAuthContext, token: str, user_id: Optional[str] = None) -> str:
         if not user_id:
-            # Try auth context first, then token
             user_id = auth.user_id or (get_user_id_from_token(token) if token else None)
             if not user_id:
                 raise RuntimeError(
                     "Could not determine user ID. Either provide it explicitly or "
                     "ensure your token contains a 'sub' claim."
                 )
+        return user_id
+
+    @server.tool(
+        name="get_user_location",
+        title="Get Current Graph and Document",
+        description=(
+            "Returns the graph ID and document ID the user is currently viewing. "
+            "This is the lightest-weight context tool — use it when you just need to know "
+            "where the user is. Follow up with get_workspace to see the full graph structure, "
+            "or read_document to see the document content."
+        ),
+    )
+    async def get_user_location_tool(
+        user_id: Optional[str] = None,
+        context: Context | None = None,
+    ) -> dict:
+        """Get the user's current graph and document IDs."""
+        auth = MCPAuthContext.from_context(context)
+        token = auth.require_auth()
+        user_id = _resolve_user_id(auth, token, user_id)
+
+        try:
+            await hp_client.ensure_session_connected(user_id)
+
+            return {
+                "graph_id": hp_client.get_active_graph_id(),
+                "document_id": hp_client.get_active_document_id(),
+            }
+
+        except Exception as e:
+            logger.error(
+                "Failed to get user location",
+                extra_context={"error": str(e)},
+            )
+            raise RuntimeError(f"Failed to get user location: {e}")
+
+    @server.tool(
+        name="get_session_state",
+        title="Get Full Session State",
+        description=(
+            "Returns the complete session state including all tabs, preferences, and UI settings. "
+            "WARNING: This returns a large payload. Prefer get_user_location (for current graph/document) "
+            "or get_workspace (for graph structure) unless you specifically need full session details."
+        ),
+    )
+    async def get_session_state_tool(
+        user_id: Optional[str] = None,
+        context: Context | None = None,
+    ) -> dict:
+        """Get the full session state (tabs, preferences, UI settings)."""
+        auth = MCPAuthContext.from_context(context)
+        token = auth.require_auth()
+        user_id = _resolve_user_id(auth, token, user_id)
 
         try:
             await hp_client.ensure_session_connected(user_id)
@@ -88,10 +126,10 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
 
         except Exception as e:
             logger.error(
-                "Failed to get active context",
+                "Failed to get session state",
                 extra_context={"error": str(e)},
             )
-            raise RuntimeError(f"Failed to get active context: {e}")
+            raise RuntimeError(f"Failed to get session state: {e}")
 
     @server.tool(
         name="read_document",
@@ -325,8 +363,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         name="get_workspace",
         title="Get Workspace Structure",
         description=(
-            "Returns the folder and file structure of a graph's workspace. "
-            "Use this to understand the organization of documents in a graph."
+            "Returns the folder and file structure of a graph's workspace, including all documents, "
+            "artifacts, and folders with their titles and organization. This is the primary tool for "
+            "understanding what's in a graph. Use get_user_location first if you need to know which "
+            "graph the user is in."
         ),
     )
     async def get_workspace_tool(

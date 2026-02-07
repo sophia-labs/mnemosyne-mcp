@@ -67,7 +67,7 @@ neem logout
 > **SPARQL Tip:** Always use `PREFIX doc: <http://mnemosyne.dev/doc#>` — never `urn:mnemosyne:schema:doc:`.
 
 **Document Operations (real-time via Y.js):**
-- "What document am I looking at in Mnemosyne?" → `get_active_context`
+- "What document am I looking at in Mnemosyne?" → `get_user_location`
 - "Show me the folder structure of my-graph" → `get_workspace`
 - "Read the document at /notes/meeting.md" → `read_document`
 - "Write this content to my document" → `write_document`
