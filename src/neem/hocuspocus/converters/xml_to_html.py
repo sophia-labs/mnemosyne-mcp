@@ -558,7 +558,7 @@ def _convert_inline(elem: ET.Element, footnotes: list[str]) -> str:
         return _inline_content(elem, footnotes)
 
     if tag == FOOTNOTE_TAG:
-        fn_content = elem.get("data-footnote-content", "")
+        fn_content = elem.get("content") or elem.get("data-footnote-content", "")
         footnotes.append(fn_content)
         idx = len(footnotes)
         return f'<sup class="fn-ref"><a href="#fn-{idx}" id="fnref-{idx}">[{idx}]</a></sup>'

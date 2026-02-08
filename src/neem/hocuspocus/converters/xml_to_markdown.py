@@ -288,7 +288,7 @@ def _convert_inline(
 
     # Footnote (self-closing)
     if tag == FOOTNOTE_TAG:
-        fn_content = elem.get("data-footnote-content", "")
+        fn_content = elem.get("content") or elem.get("data-footnote-content", "")
         footnotes.append(fn_content)
         return f"[^{len(footnotes)}]"
 
