@@ -7,6 +7,7 @@ CRDT synchronization, bypassing the job queue for lower latency operations.
 
 from __future__ import annotations
 
+import html as html_mod
 import mimetypes
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -23,6 +24,38 @@ from neem.utils.token_storage import get_dev_user_id, get_internal_service_secre
 logger = LoggerFactory.get_logger("mcp.tools.hocuspocus")
 
 JsonDict = Dict[str, Any]
+
+
+def _ensure_xml(text: str) -> str:
+    """If text doesn't look like XML, wrap it in a <paragraph> element.
+
+    This lets callers pass plain text without worrying about XML structure.
+    If the (stripped) text already starts with '<', it's returned as-is.
+    """
+    content = text.strip()
+    if not content:
+        return content
+    if content.startswith("<"):
+        return content
+    return f"<paragraph>{html_mod.escape(content)}</paragraph>"
+
+
+def _ensure_xml_multiblock(text: str) -> str:
+    """Like _ensure_xml, but for write_document where input may contain
+    multiple paragraphs separated by blank lines.
+
+    Plain text is split on double-newlines into separate <paragraph> blocks.
+    If the text already starts with '<', it's returned as-is.
+    """
+    content = text.strip()
+    if not content:
+        return content
+    if content.startswith("<"):
+        return content
+    paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+    return "".join(
+        f"<paragraph>{html_mod.escape(p)}</paragraph>" for p in paragraphs
+    )
 
 
 def register_hocuspocus_tools(server: FastMCP) -> None:
@@ -141,7 +174,9 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
 
 Blocks: paragraph, heading (level="1-3"), bulletList, orderedList, blockquote, codeBlock (language="..."), taskList (taskItem checked="true"), horizontalRule
 Marks (nestable): strong, em, strike, code, mark (highlight), a (href="..."), footnote (data-footnote-content="..."), commentMark (data-comment-id="...")
-Lists: <bulletList><listItem><paragraph>item</paragraph></listItem></bulletList>""",
+Lists: <bulletList><listItem><paragraph>item</paragraph></listItem></bulletList>
+
+Each block element includes a data-block-id attribute. Use these IDs with block-level tools (get_block, update_block, insert_block, delete_block) and for block-level wire connections.""",
     )
     async def read_document_tool(
         graph_id: str,
@@ -202,6 +237,8 @@ Lists: <bulletList><listItem><paragraph>item</paragraph></listItem></bulletList>
 
 WARNING: This REPLACES all content. For collaborative editing, prefer append_to_document.
 
+Plain text is accepted: if the content doesn't start with '<', each paragraph (separated by blank lines) is auto-wrapped in <paragraph> tags. Use XML when you need formatting or specific block types.
+
 Blocks: paragraph, heading (level="1-3"), bulletList, orderedList, blockquote, codeBlock (language="..."), taskList (taskItem checked="true"), horizontalRule
 Marks (nestable): strong, em, strike, code, mark (highlight), a (href="..."), footnote (data-footnote-content="..."), commentMark (data-comment-id="...")
 Example: <paragraph>Text with <mark>highlight</mark> and a note<footnote data-footnote-content="This is a footnote"/></paragraph>
@@ -224,9 +261,11 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             # 1. Write document content and comments (with user context)
             await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
 
+            xml_content = _ensure_xml_multiblock(content)
+
             def write_content_and_comments(doc: Any) -> None:
                 writer = DocumentWriter(doc)
-                writer.replace_all_content(content)
+                writer.replace_all_content(xml_content)
                 # Write comments if provided
                 if comments:
                     for comment_id, comment_data in comments.items():
@@ -248,7 +287,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
 
             # 2. Update workspace navigation so document appears in file tree
             # Extract title from first heading, fallback to document_id
-            title = extract_title_from_xml(content) or document_id
+            title = extract_title_from_xml(xml_content) or document_id
             await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
             await hp_client.transact_workspace(
                 graph_id,
@@ -293,7 +332,9 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             "Appends a block to the end of a document. Accepts TipTap XML for any block type. "
             "Use this for incremental additions without replacing existing content. "
             "For plain text, wrap in <paragraph>text</paragraph>. For structured content, "
-            "provide full XML like <heading level=\"2\">Title</heading> or <listItem listType=\"bullet\">...</listItem>."
+            "provide full XML like <heading level=\"2\">Title</heading> or <listItem listType=\"bullet\">...</listItem>. "
+            "Plain text without XML tags is auto-wrapped in a <paragraph>. "
+            "Only accepts a single top-level XML block element per call. To append multiple blocks, make multiple calls."
         ),
     )
     async def append_to_document_tool(
@@ -323,13 +364,8 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             # Connect to the document channel with user context
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
-            # Determine if text is XML or plain text
-            content = text.strip()
-            if not content.startswith("<"):
-                # Plain text - escape and wrap in paragraph
-                import html
-                escaped_text = html.escape(content)
-                content = f"<paragraph>{escaped_text}</paragraph>"
+            # Auto-wrap plain text in a paragraph element
+            content = _ensure_xml(text)
 
             new_block_id: str = ""
 
@@ -1350,7 +1386,8 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         description=(
             "Update a block by its ID. Can update attributes (indent, checked, listType) "
             "without changing content, or replace the entire block content. "
-            "This is the most surgical edit - only modifies what you specify."
+            "This is the most surgical edit - only modifies what you specify. "
+            "Plain text in xml_content is auto-wrapped in a <paragraph>."
         ),
     )
     async def update_block_tool(
@@ -1382,14 +1419,17 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         if attributes is None and xml_content is None:
             raise ValueError("Either attributes or xml_content must be provided")
 
+        # Auto-wrap plain text in a paragraph element
+        resolved_xml = _ensure_xml(xml_content) if xml_content else None
+
         try:
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
             def perform_update(doc: Any) -> None:
                 writer = DocumentWriter(doc)
-                if xml_content:
+                if resolved_xml:
                     # Full content replacement (preserves block_id)
-                    writer.replace_block_by_id(block_id.strip(), xml_content)
+                    writer.replace_block_by_id(block_id.strip(), resolved_xml)
                 if attributes:
                     # Surgical attribute update
                     writer.update_block_attributes(block_id.strip(), attributes)
@@ -1524,7 +1564,8 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         description=(
             "Insert a new block relative to an existing block. Use position='after' or 'before' "
             "to specify where to insert. Returns the new block's generated ID. "
-            "For appending to the end, use append_to_document instead."
+            "For appending to the end, use append_to_document instead. "
+            "Plain text in xml_content is auto-wrapped in a <paragraph>."
         ),
     )
     async def insert_block_tool(
@@ -1558,6 +1599,9 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         if position not in ("after", "before"):
             raise ValueError("position must be 'after' or 'before'")
 
+        # Auto-wrap plain text in a paragraph element
+        resolved_xml = _ensure_xml(xml_content)
+
         try:
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
@@ -1568,11 +1612,11 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 writer = DocumentWriter(doc)
                 if position == "after":
                     new_block_id = writer.insert_block_after_id(
-                        reference_block_id.strip(), xml_content.strip()
+                        reference_block_id.strip(), resolved_xml
                     )
                 else:
                     new_block_id = writer.insert_block_before_id(
-                        reference_block_id.strip(), xml_content.strip()
+                        reference_block_id.strip(), resolved_xml
                     )
 
             await hp_client.transact_document(
@@ -1693,8 +1737,9 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         title="Batch Update Blocks",
         description=(
             "Update multiple blocks in a single transaction. More efficient than "
-            "individual update_block calls. Each update can specify attributes to change "
-            "and/or new XML content. Returns results for each update."
+            "individual update_block calls. Each update object should have a block_id (required), "
+            "and optionally attributes (object) and/or xml_content (string), matching the "
+            "parameters of update_block. Returns results for each update."
         ),
     )
     async def batch_update_blocks_tool(
@@ -1737,10 +1782,22 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                         continue
 
                     try:
-                        if "content" in update:
-                            writer.replace_block_by_id(block_id, update["content"])
-                        if "attributes" in update:
-                            writer.update_block_attributes(block_id, update["attributes"])
+                        # Accept both "xml_content" (matches update_block param name)
+                        # and "content" (legacy) for the XML content key
+                        xml_content = update.get("xml_content") or update.get("content")
+                        attrs = update.get("attributes")
+
+                        if xml_content is None and attrs is None:
+                            results.append({
+                                "block_id": block_id,
+                                "error": "No xml_content or attributes provided — nothing to update",
+                            })
+                            continue
+
+                        if xml_content:
+                            writer.replace_block_by_id(block_id, xml_content)
+                        if attrs:
+                            writer.update_block_attributes(block_id, attrs)
                         results.append({"block_id": block_id, "success": True})
                     except Exception as e:
                         results.append({"block_id": block_id, "error": str(e)})

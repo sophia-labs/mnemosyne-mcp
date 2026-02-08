@@ -871,7 +871,16 @@ class DocumentWriter:
 
         fragment = self.get_content_fragment()
         block_count_before = len(list(fragment.children))
-        elem = ET.fromstring(xml_str)
+        try:
+            elem = ET.fromstring(xml_str)
+        except ET.ParseError as e:
+            if "junk after document element" in str(e):
+                raise ValueError(
+                    "append_block accepts a single top-level XML block element per call. "
+                    "To append multiple blocks, make multiple calls. "
+                    f"Original error: {e}"
+                ) from e
+            raise
 
         logger.info(
             "append_block: parsed XML",
@@ -996,28 +1005,52 @@ class DocumentWriter:
                     text_node.insert(local_offset, text, attrs=attrs)
 
                 elif op_type == "delete":
-                    length = op["length"]
+                    length = op["length"]  # code-point length from agent
                     if length <= 0:
                         continue  # Skip zero-length deletes
 
-                    text_node, local_offset = self._resolve_offset_to_text_node(
+                    text_node, local_byte_offset = self._resolve_offset_to_text_node(
                         block, offset, clamp=False
                     )
 
                     # Validate delete doesn't start past end
-                    text_len = len(text_node)
-                    if local_offset >= text_len:
+                    text_byte_len = len(text_node)
+                    if local_byte_offset >= text_byte_len:
                         raise ValueError(
-                            f"Delete offset {offset} is beyond text length {text_len}"
+                            f"Delete offset {offset} is beyond text length"
                         )
 
-                    # Clamp delete length to not exceed text end
-                    end = min(local_offset + length, text_len)
-                    del text_node[local_offset:end]
+                    # Convert code-point delete length to UTF-8 byte length.
+                    # Use _get_plain_text (not str()) since str() includes markup tags.
+                    plain_text = self._get_plain_text(text_node)
+                    plain_bytes = plain_text.encode("utf-8")
+                    # Find the code-point position corresponding to byte offset
+                    cp_start = len(plain_bytes[:local_byte_offset].decode("utf-8"))
+                    # Slice the string by code points, then get byte length
+                    delete_substr = plain_text[cp_start:cp_start + length]
+                    byte_length = len(delete_substr.encode("utf-8"))
+
+                    # Clamp to not exceed text end
+                    end = min(local_byte_offset + byte_length, text_byte_len)
+                    del text_node[local_byte_offset:end]
 
         # Read back updated text info
         reader = DocumentReader(self._doc)
         return reader.get_block_text_info(block_id)
+
+    @staticmethod
+    def _get_plain_text(text_node: pycrdt.XmlText) -> str:
+        """Get plain text content of an XmlText node (without markup tags).
+
+        str(XmlText) includes XML markup (e.g., '<bold>text</bold>'), so it
+        cannot be used for offset calculations. This method extracts only the
+        text content from diff() runs.
+        """
+        parts: list[str] = []
+        for text_or_embed, _attrs in text_node.diff():
+            if isinstance(text_or_embed, str):
+                parts.append(text_or_embed)
+        return "".join(parts)
 
     def _resolve_offset_to_text_node(
         self,
@@ -1025,21 +1058,28 @@ class DocumentWriter:
         global_offset: int,
         clamp: bool = True,
     ) -> tuple[pycrdt.XmlText, int]:
-        """Resolve a global character offset to a specific XmlText node and local offset.
+        """Resolve a global code-point offset to a specific XmlText node and local UTF-8 byte offset.
+
+        Accepts offsets in Unicode code points (what agents/humans count) and
+        returns byte offsets (what pycrdt/Yrs uses internally). This bridges the
+        gap between the MCP API (code points) and pycrdt operations (UTF-8 bytes).
+
+        IMPORTANT: str(XmlText) includes XML markup tags, so we must use diff()
+        to get the plain text for offset calculation.
 
         Walks the block's children. Common case (single XmlText child) is a
         direct lookup. For blocks with inline nodes (footnote, etc.), each
-        XmlText contributes len(node) positions, each inline XmlElement
-        contributes 1 position.
+        XmlText contributes its plain-text code-point count, each inline
+        XmlElement contributes 1 position.
 
         Args:
             block: The pycrdt.XmlElement block
-            global_offset: The global character offset (0-indexed)
+            global_offset: The global code-point offset (0-indexed)
             clamp: If True, clamp offset to text end (for inserts).
                    If False, raise on out-of-bounds (for deletes).
 
         Returns:
-            Tuple of (XmlText node, local offset within that node).
+            Tuple of (XmlText node, local UTF-8 byte offset within that node).
 
         Raises:
             ValueError: If offset points at an inline element, or if clamp=False
@@ -1050,50 +1090,58 @@ class DocumentWriter:
         # Fast path: single text node (vast majority of blocks)
         if len(children) == 1 and isinstance(children[0], pycrdt.XmlText):
             text_node = children[0]
-            text_len = len(text_node)
+            plain_text = self._get_plain_text(text_node)
+            text_len_cp = len(plain_text)
             if clamp:
-                return (text_node, min(global_offset, text_len))
-            elif global_offset > text_len:
+                cp_offset = min(global_offset, text_len_cp)
+            elif global_offset > text_len_cp:
                 raise ValueError(
-                    f"Offset {global_offset} is beyond text length {text_len}"
+                    f"Offset {global_offset} is beyond text length {text_len_cp}"
                 )
-            return (text_node, global_offset)
+            else:
+                cp_offset = global_offset
+            # Convert code-point offset to UTF-8 byte offset
+            byte_offset = len(plain_text[:cp_offset].encode("utf-8"))
+            return (text_node, byte_offset)
 
         # Walk children for blocks with inline nodes
-        running_offset = 0
+        running_cp = 0
         last_text_node = None
 
         for child in children:
             if isinstance(child, pycrdt.XmlText):
                 last_text_node = child
-                child_len = len(child)
-                if global_offset <= running_offset + child_len:
-                    return (child, global_offset - running_offset)
-                running_offset += child_len
+                child_plain = self._get_plain_text(child)
+                child_len_cp = len(child_plain)
+                if global_offset <= running_cp + child_len_cp:
+                    local_cp = global_offset - running_cp
+                    byte_offset = len(child_plain[:local_cp].encode("utf-8"))
+                    return (child, byte_offset)
+                running_cp += child_len_cp
             elif isinstance(child, pycrdt.XmlElement):
-                if global_offset == running_offset:
+                if global_offset == running_cp:
                     raise ValueError(
                         f"Offset {global_offset} points at an inline element "
                         f"({child.tag}). Use offsets before or after inline elements."
                     )
-                running_offset += 1
+                running_cp += 1
 
-        # Beyond end
+        # Beyond end — return byte length for clamping
         if clamp and last_text_node is not None:
             return (last_text_node, len(last_text_node))
 
         if not clamp:
             raise ValueError(
-                f"Offset {global_offset} is beyond total text length {running_offset}"
+                f"Offset {global_offset} is beyond total text length {running_cp}"
             )
 
         # Fallback: no text nodes at all (empty block or block with only inline elements)
         raise ValueError(f"Block has no text content to edit")
 
     def _get_format_at_offset(
-        self, text_node: pycrdt.XmlText, local_offset: int
+        self, text_node: pycrdt.XmlText, local_byte_offset: int
     ) -> dict[str, Any] | None:
-        """Get formatting attributes at a given offset by reading diff() runs.
+        """Get formatting attributes at a given byte offset by reading diff() runs.
 
         Returns the attrs of the run containing the character just before
         the offset (i.e., "inherit from preceding character"). This matches
@@ -1101,23 +1149,24 @@ class DocumentWriter:
 
         Args:
             text_node: The XmlText node
-            local_offset: The local offset within the text node
+            local_byte_offset: The local UTF-8 byte offset within the text node
 
         Returns:
             Formatting attrs dict, or None if no formatting at that position.
         """
-        if local_offset <= 0:
+        if local_byte_offset <= 0:
             return None
 
         diff_runs = text_node.diff()
         running = 0
         for text_or_embed, attrs in diff_runs:
             if isinstance(text_or_embed, str):
-                run_len = len(text_or_embed)
+                # Use UTF-8 byte length to match pycrdt's offset system
+                run_len = len(text_or_embed.encode("utf-8"))
             else:
                 run_len = 1  # embed
 
-            if local_offset <= running + run_len:
+            if local_byte_offset <= running + run_len:
                 # The preceding character is in this run
                 return dict(attrs) if attrs else None
             running += run_len
@@ -1762,9 +1811,10 @@ class DocumentWriter:
             # by _extract_inline_content which creates XmlElement nodes for them
 
             # Tail text (after this child element)
-            # Use inherited_marks (not marks) because tail text is OUTSIDE the child element
+            # Use marks (not inherited_marks): tail is outside the CHILD but
+            # still inside the CURRENT element, so it carries the current marks.
             if child.tail:
-                runs.append({"text": child.tail, "marks": dict(inherited_marks or {})})
+                runs.append({"text": child.tail, "marks": dict(marks)})
 
         return runs
 
@@ -1775,7 +1825,10 @@ class DocumentWriter:
             for run in runs:
                 text = run["text"]
                 marks = run["marks"]
-                length = len(text)
+                # pycrdt/Yrs uses UTF-8 byte offsets, not Unicode code points.
+                # Python's len() counts code points, which differs for non-ASCII
+                # characters (e.g., em dash U+2014 is 1 code point but 3 UTF-8 bytes).
+                length = len(text.encode("utf-8"))
 
                 if marks:
                     # Apply each mark as a format attribute
@@ -1946,9 +1999,12 @@ class DocumentWriter:
                     process_element(child, marks)
 
                 # Tail text (after this child, outside the child element)
-                # Use inherited_marks, not marks, since tail is outside the child
+                # Use marks (not inherited_marks): tail is outside the CHILD but
+                # still inside the CURRENT element. E.g., in <strong>a <em>b</em> c</strong>,
+                # "c" is the tail of <em> — it's outside <em> but inside <strong>,
+                # so it should carry the strong mark.
                 if child.tail:
-                    current_runs.append({"text": child.tail, "marks": dict(inherited_marks or {})})
+                    current_runs.append({"text": child.tail, "marks": dict(marks)})
 
         # Process the root element (but don't treat the root itself as a mark)
         if elem.text:

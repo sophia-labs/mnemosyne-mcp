@@ -282,6 +282,11 @@ def create_standalone_mcp_server() -> FastMCP:
         instructions=(
             "This MCP server provides real-time access to Mnemosyne knowledge graphs. "
             "Available tools:\n\n"
+            "**Quick-start workflow:**\n"
+            "(1) Orient — get_user_location then get_workspace.\n"
+            "(2) Read — read_document to see content and block IDs.\n"
+            "(3) Edit — use block tools for surgical changes or write_document for full replacement.\n"
+            "(4) Connect — create_wire with predicates from list_wire_predicates, using block IDs for precision.\n\n"
             "**Graph Management:**\n"
             "- list_graphs: List all graphs owned by the authenticated user\n"
             "- create_graph: Create a new knowledge graph with ID, title, description\n"
