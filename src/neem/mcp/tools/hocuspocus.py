@@ -16,7 +16,7 @@ import httpx
 from mcp.server.fastmcp import Context, FastMCP
 
 from neem.hocuspocus import HocuspocusClient, DocumentReader, DocumentWriter, WorkspaceWriter, WorkspaceReader
-from neem.hocuspocus.converters import looks_like_markdown, markdown_to_tiptap_xml, tiptap_xml_to_markdown
+from neem.hocuspocus.converters import looks_like_markdown, markdown_to_tiptap_xml, tiptap_xml_to_html, tiptap_xml_to_markdown
 from neem.hocuspocus.document import extract_title_from_xml
 from neem.mcp.auth import MCPAuthContext
 from neem.utils.logging import LoggerFactory
@@ -231,6 +231,9 @@ Each block element includes a data-block-id attribute. Use these IDs with block-
             # Convert to requested format
             if format == "markdown":
                 content = tiptap_xml_to_markdown(xml_content)
+            elif format == "html":
+                title = extract_title_from_xml(xml_content) or document_id
+                content = tiptap_xml_to_html(xml_content, title=title, themed=True)
             else:
                 content = xml_content
 
@@ -262,7 +265,8 @@ Each block element includes a data-block-id attribute. Use these IDs with block-
             "converted to the requested format along with the document title.\n\n"
             "Formats:\n"
             "- 'xml': Raw TipTap XML (lossless, includes block IDs and all attributes)\n"
-            "- 'markdown': Clean Markdown with headings, lists, code blocks, bold/italic/etc.\n\n"
+            "- 'markdown': Clean Markdown with headings, lists, code blocks, bold/italic/etc.\n"
+            "- 'html': Self-contained HTML with Garden theming (serif typography, dark/light mode)\n\n"
             "Use this for clipboard export, backups, or feeding document content to other tools."
         ),
     )
@@ -272,18 +276,18 @@ Each block element includes a data-block-id attribute. Use these IDs with block-
         format: str = "markdown",
         context: Context | None = None,
     ) -> dict:
-        """Export a document in xml or markdown format.
+        """Export a document in xml, markdown, or html format.
 
         Args:
             graph_id: The graph containing the document
             document_id: The document to export
-            format: Export format - "xml" or "markdown" (default)
+            format: Export format - "xml", "markdown" (default), or "html"
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
-        if format not in ("xml", "markdown"):
-            raise ValueError("format must be 'xml' or 'markdown'")
+        if format not in ("xml", "markdown", "html"):
+            raise ValueError("format must be 'xml', 'markdown', or 'html'")
 
         try:
             # Connect to the document channel
@@ -302,6 +306,8 @@ Each block element includes a data-block-id attribute. Use these IDs with block-
             # Convert to requested format
             if format == "markdown":
                 content = tiptap_xml_to_markdown(xml_content)
+            elif format == "html":
+                content = tiptap_xml_to_html(xml_content, title=title, themed=True)
             else:
                 content = xml_content
 
