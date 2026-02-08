@@ -29,6 +29,7 @@ dependencies = [
     "uvicorn>=0.38.0",
     "websockets>=15.0.1",
     "playwright>=1.57.0",
+    "mistune>=3.0.0",
 ]
 
 [project.urls]

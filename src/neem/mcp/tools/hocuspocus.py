@@ -16,6 +16,7 @@ import httpx
 from mcp.server.fastmcp import Context, FastMCP
 
 from neem.hocuspocus import HocuspocusClient, DocumentReader, DocumentWriter, WorkspaceWriter, WorkspaceReader
+from neem.hocuspocus.converters import looks_like_markdown, markdown_to_tiptap_xml, tiptap_xml_to_markdown
 from neem.hocuspocus.document import extract_title_from_xml
 from neem.mcp.auth import MCPAuthContext
 from neem.utils.logging import LoggerFactory
@@ -27,31 +28,37 @@ JsonDict = Dict[str, Any]
 
 
 def _ensure_xml(text: str) -> str:
-    """If text doesn't look like XML, wrap it in a <paragraph> element.
+    """Convert text to TipTap XML if needed.
 
-    This lets callers pass plain text without worrying about XML structure.
-    If the (stripped) text already starts with '<', it's returned as-is.
+    - If text starts with '<', it's returned as-is (assumed XML).
+    - If text looks like markdown, it's parsed via markdown_to_tiptap_xml().
+    - Otherwise, it's wrapped in a <paragraph> element as plain text.
     """
     content = text.strip()
     if not content:
         return content
     if content.startswith("<"):
         return content
+    if looks_like_markdown(content):
+        return markdown_to_tiptap_xml(content)
     return f"<paragraph>{html_mod.escape(content)}</paragraph>"
 
 
 def _ensure_xml_multiblock(text: str) -> str:
     """Like _ensure_xml, but for write_document where input may contain
-    multiple paragraphs separated by blank lines.
+    multiple paragraphs or full markdown documents.
 
-    Plain text is split on double-newlines into separate <paragraph> blocks.
-    If the text already starts with '<', it's returned as-is.
+    - If text starts with '<', it's returned as-is (assumed XML).
+    - If text looks like markdown, it's parsed via markdown_to_tiptap_xml().
+    - Otherwise, plain text is split on double-newlines into <paragraph> blocks.
     """
     content = text.strip()
     if not content:
         return content
     if content.startswith("<"):
         return content
+    if looks_like_markdown(content):
+        return markdown_to_tiptap_xml(content)
     paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
     return "".join(
         f"<paragraph>{html_mod.escape(p)}</paragraph>" for p in paragraphs
@@ -181,11 +188,21 @@ Each block element includes a data-block-id attribute. Use these IDs with block-
     async def read_document_tool(
         graph_id: str,
         document_id: str,
+        format: Optional[str] = None,
         context: Context | None = None,
     ) -> dict:
-        """Read document content as TipTap XML."""
+        """Read document content as TipTap XML or markdown.
+
+        Args:
+            graph_id: The graph containing the document
+            document_id: The document to read
+            format: Output format - "xml" (default) or "markdown"
+        """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
+
+        if format and format not in ("xml", "markdown"):
+            raise ValueError("format must be 'xml' or 'markdown'")
 
         try:
             # Connect to the document channel with user context
@@ -211,10 +228,17 @@ Each block element includes a data-block-id attribute. Use these IDs with block-
             xml_content = reader.to_xml()
             comments = reader.get_all_comments()
 
+            # Convert to requested format
+            if format == "markdown":
+                content = tiptap_xml_to_markdown(xml_content)
+            else:
+                content = xml_content
+
             result = {
                 "graph_id": graph_id,
                 "document_id": document_id,
-                "content": xml_content,
+                "format": format or "xml",
+                "content": content,
                 "comments": comments,
             }
             return result
@@ -229,6 +253,77 @@ Each block element includes a data-block-id attribute. Use these IDs with block-
                 },
             )
             raise RuntimeError(f"Failed to read document: {e}")
+
+    @server.tool(
+        name="export_document",
+        title="Export Document",
+        description=(
+            "Export a document in a specified format. Returns the document content "
+            "converted to the requested format along with the document title.\n\n"
+            "Formats:\n"
+            "- 'xml': Raw TipTap XML (lossless, includes block IDs and all attributes)\n"
+            "- 'markdown': Clean Markdown with headings, lists, code blocks, bold/italic/etc.\n\n"
+            "Use this for clipboard export, backups, or feeding document content to other tools."
+        ),
+    )
+    async def export_document_tool(
+        graph_id: str,
+        document_id: str,
+        format: str = "markdown",
+        context: Context | None = None,
+    ) -> dict:
+        """Export a document in xml or markdown format.
+
+        Args:
+            graph_id: The graph containing the document
+            document_id: The document to export
+            format: Export format - "xml" or "markdown" (default)
+        """
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        if format not in ("xml", "markdown"):
+            raise ValueError("format must be 'xml' or 'markdown'")
+
+        try:
+            # Connect to the document channel
+            await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
+
+            channel = hp_client.get_document_channel(graph_id, document_id, user_id=auth.user_id)
+            if channel is None:
+                raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
+
+            reader = DocumentReader(channel.doc)
+            xml_content = reader.to_xml()
+
+            # Extract title from content
+            title = extract_title_from_xml(xml_content) or document_id
+
+            # Convert to requested format
+            if format == "markdown":
+                content = tiptap_xml_to_markdown(xml_content)
+            else:
+                content = xml_content
+
+            return {
+                "graph_id": graph_id,
+                "document_id": document_id,
+                "title": title,
+                "format": format,
+                "content": content,
+            }
+
+        except Exception as e:
+            logger.error(
+                "Failed to export document",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "format": format,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to export document: {e}")
 
     @server.tool(
         name="write_document",
