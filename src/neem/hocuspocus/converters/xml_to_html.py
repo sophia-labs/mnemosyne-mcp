@@ -381,11 +381,6 @@ def _convert_block(
     if tag == HORIZONTAL_RULE_TAG:
         return f"<hr{bid} />"
 
-    if tag == "image":
-        src = html.escape(elem.get("src", ""))
-        alt = html.escape(elem.get("alt", ""))
-        return f'<img{bid} src="{src}" alt="{alt}" style="max-width:100%;height:auto;display:block;margin:1em 0" />'
-
     if tag in (BULLET_LIST_TAG, ORDERED_LIST_TAG, TASK_LIST_TAG):
         # Wrapper list element — convert children
         items = "\n".join(

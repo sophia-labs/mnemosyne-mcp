@@ -132,11 +132,6 @@ BLOCK_ATTR_MAP: dict[str, dict[str, str]] = {
         "listType": "listType",   # Pass through (bullet/ordered/task)
         "checked": "checked",     # Pass through (for task items)
     },
-    "image": {
-        "src": "src",             # Image source URL
-        "alt": "alt",             # Alt text / description
-        "title": "title",         # Optional tooltip
-    },
 }
 
 # Reverse mapping: TipTap internal block attr names back to XML names
@@ -155,7 +150,6 @@ BLOCK_TYPES = frozenset({
     "blockquote",
     "codeBlock",
     "horizontalRule",
-    "image",         # Block-level void node for inline images
 })
 
 # List container elements that should be flattened to listItem blocks
