@@ -1,13 +1,15 @@
 """Workspace navigation helpers for Y.js collaboration.
 
 Provides high-level operations for reading and modifying workspace navigation
-state stored as Y.Maps (folders, artifacts, documents, ui).
+state stored as Y.Maps (folders, documents, ui).
 
 The workspace Y.Doc is separate from document content Y.Docs. It contains:
 - folders: Map of folder entities (id -> {name, parentId, order, section})
-- artifacts: Map of artifact entities (id -> {name, parentId, mimeType, status, order})
-- documents: Map of document navigation entries (id -> {title, parentId, order, ...})
+- documents: Map of document navigation entries (id -> {title, parentId, order, readOnly, sf_*...})
 - ui: Map of UI state (expanded folders, selections, etc.)
+
+Uploaded files (artifacts) are documents with readOnly=true and sf_* metadata
+(sf_fileType, sf_storageKey, sf_originalFilename, sf_mimeType, sf_sizeBytes).
 
 This module provides:
 - WorkspaceWriter: Create, update, and delete workspace entities
@@ -32,7 +34,7 @@ _UNSET = object()
 class WorkspaceWriter:
     """Write operations for workspace navigation Y.Doc.
 
-    Used to create, update, and delete entities (folders, artifacts, documents)
+    Used to create, update, and delete entities (folders, documents)
     in the workspace navigation. This ensures changes made via MCP appear in
     the browser's file tree.
 
@@ -50,12 +52,11 @@ class WorkspaceWriter:
         """Initialize the workspace writer.
 
         Args:
-            doc: The workspace Y.Doc (contains folders, artifacts, documents, ui maps)
+            doc: The workspace Y.Doc (contains folders, documents, ui maps)
         """
         self._doc = doc
         self._documents: pycrdt.Map = doc.get("documents", type=pycrdt.Map)
         self._folders: pycrdt.Map = doc.get("folders", type=pycrdt.Map)
-        self._artifacts: pycrdt.Map = doc.get("artifacts", type=pycrdt.Map)
 
     def upsert_document(
         self,
@@ -347,73 +348,6 @@ class WorkspaceWriter:
         return True
 
     # -------------------------------------------------------------------------
-    # Artifact Operations
-    # -------------------------------------------------------------------------
-
-    def get_artifact(self, artifact_id: str) -> dict[str, Any] | None:
-        """Get an artifact entry from workspace navigation.
-
-        Args:
-            artifact_id: The artifact ID
-
-        Returns:
-            Artifact data dict or None if not found.
-        """
-        artifact_map = self._artifacts.get(artifact_id)
-        if isinstance(artifact_map, pycrdt.Map):
-            return {key: artifact_map.get(key) for key in artifact_map.keys()}
-        return None
-
-    def artifact_exists(self, artifact_id: str) -> bool:
-        """Check if an artifact exists in workspace navigation.
-
-        Args:
-            artifact_id: The artifact ID
-
-        Returns:
-            True if artifact exists in workspace.
-        """
-        return artifact_id in self._artifacts
-
-    def update_artifact(
-        self,
-        artifact_id: str,
-        *,
-        name: str | None = None,
-        parent_id: Any = _UNSET,
-        order: float | None = None,
-    ) -> bool:
-        """Update an existing artifact's properties.
-
-        Args:
-            artifact_id: The artifact ID to update
-            name: New name (if provided)
-            parent_id: New parent folder ID (use None for root, _UNSET to not change)
-            order: New sort order (if provided)
-
-        Returns:
-            True if artifact was updated, False if not found.
-        """
-        artifact_map = self._artifacts.get(artifact_id)
-        if not isinstance(artifact_map, pycrdt.Map):
-            return False
-
-        now = time.time() * 1000
-        if name is not None:
-            artifact_map["name"] = name
-        if parent_id is not _UNSET:
-            artifact_map["parentId"] = parent_id
-        if order is not None:
-            artifact_map["order"] = order
-        artifact_map["updatedAt"] = now
-
-        logger.debug(
-            "Updated artifact in workspace",
-            extra_context={"artifact_id": artifact_id},
-        )
-        return True
-
-    # -------------------------------------------------------------------------
     # Helper Methods
     # -------------------------------------------------------------------------
 
@@ -434,13 +368,7 @@ class WorkspaceWriter:
             if isinstance(folder, pycrdt.Map) and folder.get("parentId") == parent_id:
                 children.append(("folder", fid))
 
-        # Check artifacts
-        for aid in self._artifacts.keys():
-            artifact = self._artifacts.get(aid)
-            if isinstance(artifact, pycrdt.Map) and artifact.get("parentId") == parent_id:
-                children.append(("artifact", aid))
-
-        # Check documents
+        # Check documents (includes uploaded files / artifacts)
         for did in self._documents.keys():
             doc = self._documents.get(did)
             if isinstance(doc, pycrdt.Map) and doc.get("parentId") == parent_id:
@@ -460,8 +388,6 @@ class WorkspaceWriter:
                 # Recursively delete subfolder children first
                 self._delete_children_recursive(entity_id)
                 del self._folders[entity_id]
-            elif entity_type == "artifact":
-                del self._artifacts[entity_id]
             elif entity_type == "document":
                 del self._documents[entity_id]
 
@@ -482,12 +408,11 @@ class WorkspaceReader:
         """Initialize the workspace reader.
 
         Args:
-            doc: The workspace Y.Doc (contains folders, artifacts, documents, ui maps)
+            doc: The workspace Y.Doc (contains folders, documents, ui maps)
         """
         self._doc = doc
         self._documents: pycrdt.Map = doc.get("documents", type=pycrdt.Map)
         self._folders: pycrdt.Map = doc.get("folders", type=pycrdt.Map)
-        self._artifacts: pycrdt.Map = doc.get("artifacts", type=pycrdt.Map)
 
     def get_folder(self, folder_id: str) -> dict[str, Any] | None:
         """Get a folder entry from workspace navigation.
@@ -501,20 +426,6 @@ class WorkspaceReader:
         folder_map = self._folders.get(folder_id)
         if isinstance(folder_map, pycrdt.Map):
             return {key: folder_map.get(key) for key in folder_map.keys()}
-        return None
-
-    def get_artifact(self, artifact_id: str) -> dict[str, Any] | None:
-        """Get an artifact entry from workspace navigation.
-
-        Args:
-            artifact_id: The artifact ID
-
-        Returns:
-            Artifact data dict or None if not found.
-        """
-        artifact_map = self._artifacts.get(artifact_id)
-        if isinstance(artifact_map, pycrdt.Map):
-            return {key: artifact_map.get(key) for key in artifact_map.keys()}
         return None
 
     def get_document(self, doc_id: str) -> dict[str, Any] | None:
@@ -549,14 +460,7 @@ class WorkspaceReader:
                 data = {key: folder.get(key) for key in folder.keys()}
                 children.append(("folder", fid, data))
 
-        # Check artifacts
-        for aid in self._artifacts.keys():
-            artifact = self._artifacts.get(aid)
-            if isinstance(artifact, pycrdt.Map) and artifact.get("parentId") == parent_id:
-                data = {key: artifact.get(key) for key in artifact.keys()}
-                children.append(("artifact", aid, data))
-
-        # Check documents
+        # Check documents (includes uploaded files / artifacts with readOnly=true)
         for did in self._documents.keys():
             doc = self._documents.get(did)
             if isinstance(doc, pycrdt.Map) and doc.get("parentId") == parent_id:

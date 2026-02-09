@@ -600,13 +600,13 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
     def _build_workspace_tree(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
         """Transform flat workspace snapshot into a nested tree.
 
-        Converts the flat {folders, documents, artifacts} maps with parentId
-        pointers into a pre-computed nested tree. Drops metadata the LLM
-        doesn't need (timestamps, sort orders, storage paths, UI state).
+        Converts the flat {folders, documents} maps with parentId pointers
+        into a pre-computed nested tree. Drops metadata the LLM doesn't
+        need (timestamps, sort orders, storage paths, UI state).
+        Uploaded files appear as documents with readOnly=true and fileType.
         """
         folders = snapshot.get("folders", {})
         documents = snapshot.get("documents", {})
-        artifacts = snapshot.get("artifacts", {})
 
         # Build node for each entity
         nodes: dict[str, dict[str, Any]] = {}
@@ -622,17 +622,12 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             node = {"id": did, "type": "document", "title": ddata.get("title", "Untitled")}
             if ddata.get("readOnly"):
                 node["readOnly"] = True
+            sf_file_type = ddata.get("sf_fileType")
+            if sf_file_type:
+                node["fileType"] = sf_file_type
             node["_parent"] = ddata.get("parentId")
             node["_order"] = ddata.get("order", 0)
             nodes[did] = node
-
-        for aid, adata in artifacts.items():
-            node = {"id": aid, "type": "artifact", "name": adata.get("name", "Untitled")}
-            if adata.get("ingestedDocId"):
-                node["ingestedDocId"] = adata["ingestedDocId"]
-            node["_parent"] = adata.get("parentId")
-            node["_order"] = adata.get("order", 0)
-            nodes[aid] = node
 
         # Build tree by inserting children into parent folders
         root: list[dict[str, Any]] = []
@@ -661,7 +656,7 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
         title="Get Workspace Structure",
         description=(
             "Returns the folder and file structure of a graph's workspace, including all documents, "
-            "artifacts, and folders with their titles and organization. This is the primary tool for "
+            "folders, and their titles and organization. This is the primary tool for "
             "understanding what's in a graph. Use get_user_location first if you need to know which "
             "graph the user is in.\n\n"
             "This is always complete — prefer it over sparql_query for discovering what documents exist."
@@ -681,11 +676,10 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
 
             has_docs = bool(snapshot.get("documents"))
             has_folders = bool(snapshot.get("folders"))
-            has_artifacts = bool(snapshot.get("artifacts"))
-            if not has_docs and not has_folders and not has_artifacts:
+            if not has_docs and not has_folders:
                 raise RuntimeError(
                     f"Graph '{graph_id}' not found — workspace is completely empty "
-                    f"(no documents, folders, or artifacts). This usually means the "
+                    f"(no documents or folders). This usually means the "
                     f"graph ID is wrong or you're connected to the wrong backend. "
                     f"Use list_graphs to see available graphs."
                 )
@@ -1031,57 +1025,14 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
         new_order: Optional[float] = None,
         context: Context | None = None,
     ) -> dict:
-        """Move an artifact to a different folder via Y.js."""
-        auth = MCPAuthContext.from_context(context)
-        auth.require_auth()
-
-        if not graph_id or not graph_id.strip():
-            raise ValueError("graph_id is required and cannot be empty")
-        if not artifact_id or not artifact_id.strip():
-            raise ValueError("artifact_id is required and cannot be empty")
-
-        try:
-            await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
-
-            # Read current artifact state from Y.js
-            channel = hp_client.get_workspace_channel(graph_id.strip(), user_id=auth.user_id)
-            if channel is None:
-                raise RuntimeError(f"Workspace not connected: {graph_id}")
-
-            reader = WorkspaceReader(channel.doc)
-            current = reader.get_artifact(artifact_id.strip())
-
-            if not current:
-                raise RuntimeError(f"Artifact '{artifact_id}' not found in graph '{graph_id}'")
-
-            # Update artifact with new parent/order via Y.js
-            await hp_client.transact_workspace(
-                graph_id.strip(),
-                lambda doc: WorkspaceWriter(doc).update_artifact(
-                    artifact_id.strip(),
-                    parent_id=new_parent_id.strip() if new_parent_id else None,
-                    order=new_order,
-                ),
-                user_id=auth.user_id,
-            )
-
-            return {
-                "success": True,
-                "artifact_id": artifact_id.strip(),
-                "graph_id": graph_id.strip(),
-                "new_parent_id": new_parent_id.strip() if new_parent_id else None,
-            }
-
-        except Exception as e:
-            logger.error(
-                "Failed to move artifact",
-                extra_context={
-                    "graph_id": graph_id,
-                    "artifact_id": artifact_id,
-                    "error": str(e),
-                },
-            )
-            raise RuntimeError(f"Failed to move artifact: {e}")
+        """Move an artifact (document with readOnly) to a different folder."""
+        # Artifacts are documents — delegate to move_document
+        return await move_document_tool(
+            graph_id=graph_id,
+            document_id=artifact_id,
+            new_parent_id=new_parent_id,
+            context=context,
+        )
 
     @server.tool(
         name="rename_artifact",
@@ -1094,7 +1045,7 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
         new_label: str,
         context: Context | None = None,
     ) -> dict:
-        """Rename an artifact via Y.js."""
+        """Rename an artifact (document with readOnly)."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -1108,23 +1059,12 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
         try:
             await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
 
-            # Verify artifact exists
-            channel = hp_client.get_workspace_channel(graph_id.strip(), user_id=auth.user_id)
-            if channel is None:
-                raise RuntimeError(f"Workspace not connected: {graph_id}")
-
-            reader = WorkspaceReader(channel.doc)
-            current = reader.get_artifact(artifact_id.strip())
-
-            if not current:
-                raise RuntimeError(f"Artifact '{artifact_id}' not found in graph '{graph_id}'")
-
-            # Update artifact name via Y.js
+            # Artifacts are documents — update title in documents map
             await hp_client.transact_workspace(
                 graph_id.strip(),
-                lambda doc: WorkspaceWriter(doc).update_artifact(
+                lambda doc: WorkspaceWriter(doc).update_document(
                     artifact_id.strip(),
-                    name=new_label.strip(),
+                    title=new_label.strip(),
                 ),
                 user_id=auth.user_id,
             )
@@ -1164,7 +1104,11 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
         artifact_id: str,
         context: Context | None = None,
     ) -> dict:
-        """Read artifact metadata and ingested document content if available."""
+        """Read artifact metadata and document content.
+
+        Artifacts are documents with readOnly=true and sf_* metadata.
+        The artifact_id IS the document_id.
+        """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -1181,7 +1125,8 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 raise RuntimeError(f"Workspace not connected: {graph_id}")
 
             reader = WorkspaceReader(channel.doc)
-            metadata = reader.get_artifact(artifact_id.strip())
+            # Artifacts are documents — look in documents map
+            metadata = reader.get_document(artifact_id.strip())
 
             if not metadata:
                 raise RuntimeError(f"Artifact '{artifact_id}' not found in graph '{graph_id}'")
@@ -1192,28 +1137,25 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 "metadata": metadata,
             }
 
-            # If the artifact has been ingested, read the linked document content
-            ingested_doc_id = metadata.get("ingestedDocId")
-            if ingested_doc_id:
-                try:
-                    await hp_client.connect_document(graph_id.strip(), ingested_doc_id, user_id=auth.user_id)
-                    doc_channel = hp_client.get_document_channel(graph_id.strip(), ingested_doc_id, user_id=auth.user_id)
-                    if doc_channel is not None:
-                        doc_reader = DocumentReader(doc_channel.doc)
-                        result["ingested_document"] = {
-                            "document_id": ingested_doc_id,
-                            "content": doc_reader.to_xml(),
-                            "comments": doc_reader.get_all_comments(),
-                        }
-                except Exception as doc_err:
-                    logger.warning(
-                        "Artifact has ingestedDocId but document could not be read",
-                        extra_context={
-                            "artifact_id": artifact_id,
-                            "ingested_doc_id": ingested_doc_id,
-                            "error": str(doc_err),
-                        },
-                    )
+            # Read the document content (artifact_id IS the document_id)
+            try:
+                await hp_client.connect_document(graph_id.strip(), artifact_id.strip(), user_id=auth.user_id)
+                doc_channel = hp_client.get_document_channel(graph_id.strip(), artifact_id.strip(), user_id=auth.user_id)
+                if doc_channel is not None:
+                    doc_reader = DocumentReader(doc_channel.doc)
+                    result["ingested_document"] = {
+                        "document_id": artifact_id.strip(),
+                        "content": doc_reader.to_xml(),
+                        "comments": doc_reader.get_all_comments(),
+                    }
+            except Exception as doc_err:
+                logger.warning(
+                    "Could not read artifact document content",
+                    extra_context={
+                        "artifact_id": artifact_id,
+                        "error": str(doc_err),
+                    },
+                )
 
             return result
 
@@ -1241,8 +1183,6 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             "readable/editable document."
         ),
     )
-    # NOTE: The backend now auto-ingests on upload. The return value contains
-    # document_id instead of artifact_id. ingest_artifact is now optional.
     async def upload_artifact_tool(
         graph_id: str,
         file_path: str,
@@ -1330,7 +1270,9 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             "- 'ingest' (default): Creates a read-only e-reader document. Best for reference material.\n"
             "- 'import': Creates a fully editable document. Best when you need to modify the content.\n\n"
             "After ingestion, use read_artifact or read_document with the returned document_id "
-            "to access the content."
+            "to access the content.\n\n"
+            "Note: New uploads are auto-ingested. This tool is only needed for legacy artifacts "
+            "that were uploaded before auto-ingestion was enabled."
         ),
     )
     async def ingest_artifact_tool(
