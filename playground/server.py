@@ -169,9 +169,10 @@ async def document_websocket(
         logger.info(f"Remaining connections to {graph_id}/{doc_id}: {len(document.connections)}")
 
 
-@app.websocket("/hocuspocus/workspace/{graph_id}")
+@app.websocket("/hocuspocus/workspace/{user_id}/{graph_id}")
 async def workspace_websocket(
     websocket: WebSocket,
+    user_id: str,  # noqa: ARG001
     graph_id: str,
 ):
     """Y.js WebSocket endpoint for workspace (simplified)."""
