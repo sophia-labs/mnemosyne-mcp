@@ -300,7 +300,7 @@ Also returns wire counts: document-level (outgoing, incoming, total) and block-l
                 "comments": comments,
             }
 
-            # Add wire counts (lightweight signal for connectedness)
+            # Add wire counts — overall totals + per-block breakdown
             try:
                 await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
                 ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
@@ -309,11 +309,23 @@ Also returns wire counts: document-level (outgoing, incoming, total) and block-l
                     incoming = _get_wires_for_document(ws_channel.doc, document_id, "incoming")
                     total = len(outgoing) + len(incoming)
                     if total > 0:
-                        result["wires"] = {
+                        block_counts: Dict[str, int] = {}
+                        for wire in outgoing:
+                            bid = wire.get("sourceBlockId")
+                            if bid:
+                                block_counts[bid] = block_counts.get(bid, 0) + 1
+                        for wire in incoming:
+                            bid = wire.get("targetBlockId")
+                            if bid:
+                                block_counts[bid] = block_counts.get(bid, 0) + 1
+                        wires_info: Dict[str, Any] = {
                             "outgoing": len(outgoing),
                             "incoming": len(incoming),
                             "total": total,
                         }
+                        if block_counts:
+                            wires_info["by_block"] = block_counts
+                        result["wires"] = wires_info
             except Exception as e:
                 logger.debug(
                     "Failed to fetch wire counts for read_document (non-fatal)",

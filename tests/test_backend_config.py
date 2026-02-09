@@ -28,7 +28,7 @@ def test_backend_config_derives_ws_url(monkeypatch):
     config = resolve_backend_config()
 
     assert config.base_url == DEFAULT_LOCAL_BACKEND_URL
-    assert config.websocket_url == "ws://127.0.0.1:8001/ws"
+    assert config.websocket_url == "ws://127.0.0.1:8080/ws"
     assert config.has_websocket is True
 
 
