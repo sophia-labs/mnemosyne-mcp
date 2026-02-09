@@ -163,7 +163,10 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             "Do NOT use 'urn:mnemosyne:schema:doc:' - it will match nothing.\n\n"
             "The graph_id is automatically resolved to a graph URI and injected as a FROM clause. "
             "Common types: doc:TipTapDocument, doc:Folder, doc:Artifact. "
-            "Common predicates: dcterms:title, nfo:fileName, nfo:belongsToContainer, doc:order, doc:section."
+            "Common predicates: dcterms:title, nfo:fileName, nfo:belongsToContainer, doc:order, doc:section.\n\n"
+            "NOT for: discovering what documents exist (use get_workspace instead — it's always complete). "
+            "SPARQL is best for searching content across documents (doc:content triples), "
+            "querying block structure, and counting entities. Document-level metadata may be incomplete in RDF."
         ),
     )
     async def sparql_query_tool(

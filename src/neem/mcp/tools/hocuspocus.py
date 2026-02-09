@@ -19,6 +19,7 @@ from neem.hocuspocus import HocuspocusClient, DocumentReader, DocumentWriter, Wo
 from neem.hocuspocus.converters import looks_like_markdown, markdown_to_tiptap_xml, tiptap_xml_to_html, tiptap_xml_to_markdown
 from neem.hocuspocus.document import extract_title_from_xml
 from neem.mcp.auth import MCPAuthContext
+from neem.mcp.tools.wire_tools import _get_wires_for_document
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_dev_user_id, get_internal_service_secret, get_user_id_from_token, validate_token_and_load
 
@@ -100,6 +101,52 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
                     "ensure your token contains a 'sub' claim."
                 )
         return user_id
+
+    # ------------------------------------------------------------------
+    # Validation helpers
+    # ------------------------------------------------------------------
+    async def _validate_document_in_workspace(
+        graph_id: str, document_id: str, user_id: str,
+    ) -> None:
+        """Verify a document exists in the workspace metadata.
+
+        Raises RuntimeError with a helpful message listing available
+        documents when the requested document is not found.
+        """
+        await hp_client.connect_workspace(graph_id, user_id=user_id)
+        ws_channel = hp_client.get_workspace_channel(graph_id, user_id=user_id)
+        if ws_channel is None:
+            raise RuntimeError(
+                f"Could not connect to workspace for graph '{graph_id}'. "
+                f"The graph may not exist or the backend may be unreachable. "
+                f"Use list_graphs to see available graphs."
+            )
+        reader = WorkspaceReader(ws_channel.doc)
+        if reader.get_document(document_id) is not None:
+            return  # Document exists
+
+        # Build a helpful error with available documents
+        snapshot = hp_client.get_workspace_snapshot(graph_id, user_id=user_id)
+        available: list[str] = []
+        if snapshot:
+            docs = snapshot.get("documents") or {}
+            for doc_id, doc_info in docs.items():
+                title = doc_info.get("title", doc_id) if isinstance(doc_info, dict) else doc_id
+                available.append(f"  - {title} ({doc_id})")
+
+        msg = f"Document '{document_id}' not found in graph '{graph_id}'."
+        if available:
+            shown = available[:15]
+            msg += "\n\nAvailable documents:\n" + "\n".join(shown)
+            if len(available) > 15:
+                msg += f"\n  ... and {len(available) - 15} more"
+        else:
+            msg += (
+                " The graph workspace is empty — this may mean the graph "
+                "doesn't exist or you're connected to the wrong backend."
+            )
+        msg += "\n\nUse get_workspace to see the full graph structure."
+        raise RuntimeError(msg)
 
     @server.tool(
         name="get_user_location",
@@ -183,7 +230,9 @@ Blocks: paragraph, heading (level="1-3"), bulletList, orderedList, blockquote, c
 Marks (nestable): strong, em, strike, code, mark (highlight), a (href="..."), footnote (data-footnote-content="..."), commentMark (data-comment-id="...")
 Lists: <bulletList><listItem><paragraph>item</paragraph></listItem></bulletList>
 
-Each block element includes a data-block-id attribute. Use these IDs with block-level tools (get_block, update_block, insert_block, delete_block) and for block-level wire connections.""",
+Each block element includes a data-block-id attribute. Use these IDs with block-level tools (get_block, update_block, insert_block, delete_block) and for block-level wire connections.
+
+Also returns wire counts: document-level (outgoing, incoming, total) and block-level (which blocks have wires attached). Use get_wires for full wire details.""",
     )
     async def read_document_tool(
         graph_id: str,
@@ -205,6 +254,9 @@ Each block element includes a data-block-id attribute. Use these IDs with block-
             raise ValueError("format must be 'xml' or 'markdown'")
 
         try:
+            # Validate document exists in workspace before connecting
+            await _validate_document_in_workspace(graph_id, document_id, auth.user_id)
+
             # Connect to the document channel with user context
             try:
                 await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
@@ -244,6 +296,47 @@ Each block element includes a data-block-id attribute. Use these IDs with block-
                 "content": content,
                 "comments": comments,
             }
+
+            # Add wire counts (document-level and block-level)
+            try:
+                await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
+                ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
+                if ws_channel and ws_channel.doc:
+                    outgoing = _get_wires_for_document(ws_channel.doc, document_id, "outgoing")
+                    incoming = _get_wires_for_document(ws_channel.doc, document_id, "incoming")
+
+                    # Separate document-level vs block-level wires
+                    doc_level = 0
+                    block_wire_counts: Dict[str, int] = {}
+                    for wire in outgoing:
+                        block_id = wire.get("sourceBlockId")
+                        if block_id:
+                            block_wire_counts[block_id] = block_wire_counts.get(block_id, 0) + 1
+                        else:
+                            doc_level += 1
+                    for wire in incoming:
+                        block_id = wire.get("targetBlockId")
+                        if block_id:
+                            block_wire_counts[block_id] = block_wire_counts.get(block_id, 0) + 1
+                        else:
+                            doc_level += 1
+
+                    result["wires"] = {
+                        "outgoing": len(outgoing),
+                        "incoming": len(incoming),
+                        "total": len(outgoing) + len(incoming),
+                        "document_level": doc_level,
+                        "by_block": block_wire_counts if block_wire_counts else None,
+                    }
+                else:
+                    result["wires"] = {"outgoing": 0, "incoming": 0, "total": 0, "by_block": None}
+            except Exception as e:
+                logger.debug(
+                    "Failed to fetch wire counts for read_document (non-fatal)",
+                    extra_context={"document_id": document_id, "error": str(e)},
+                )
+                result["wires"] = None
+
             return result
 
         except Exception as e:
@@ -290,6 +383,9 @@ Each block element includes a data-block-id attribute. Use these IDs with block-
             raise ValueError("format must be 'xml', 'markdown', or 'html'")
 
         try:
+            # Validate document exists in workspace before connecting
+            await _validate_document_in_workspace(graph_id, document_id, auth.user_id)
+
             # Connect to the document channel
             await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
 
@@ -345,7 +441,11 @@ Marks (nestable): strong, em, strike, code, mark (highlight), a (href="..."), fo
 Example: <paragraph>Text with <mark>highlight</mark> and a note<footnote data-footnote-content="This is a footnote"/></paragraph>
 
 Comments: Pass a dict mapping comment IDs to metadata. Comment IDs must match data-comment-id attributes in the content.
-Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}""",
+Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}
+
+Markdown is also accepted and auto-converted to TipTap XML.
+
+NOT for: editing existing documents (use edit_block_text, update_block, or insert_block instead). Only use write_document for brand-new documents or when the user explicitly asks for a full rewrite.""",
     )
     async def write_document_tool(
         graph_id: str,
@@ -396,24 +496,12 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
                 user_id=auth.user_id,
             )
 
-            # 3. Read back document content and comments to confirm
-            channel = hp_client.get_document_channel(graph_id, document_id, user_id=auth.user_id)
-            if channel is None:
-                raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
-
-            reader = DocumentReader(channel.doc)
-            xml_content = reader.to_xml()
-            result_comments = reader.get_all_comments()
-
-            result = {
+            return {
                 "success": True,
                 "graph_id": graph_id,
                 "document_id": document_id,
                 "title": title,
-                "content": xml_content,
-                "comments": result_comments,
             }
-            return result
 
         except Exception as e:
             logger.error(
@@ -435,7 +523,8 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             "For plain text, wrap in <paragraph>text</paragraph>. For structured content, "
             "provide full XML like <heading level=\"2\">Title</heading> or <listItem listType=\"bullet\">...</listItem>. "
             "Plain text without XML tags is auto-wrapped in a <paragraph>. "
-            "Only accepts a single top-level XML block element per call. To append multiple blocks, make multiple calls."
+            "Only accepts a single top-level XML block element per call. To append multiple blocks, make multiple calls. "
+            "Markdown is also accepted and auto-converted."
         ),
     )
     async def append_to_document_tool(
@@ -462,6 +551,9 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("text is required")
 
         try:
+            # Validate document exists in workspace before appending
+            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id)
+
             # Connect to the document channel with user context
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
@@ -517,7 +609,8 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             "Returns the folder and file structure of a graph's workspace, including all documents, "
             "artifacts, and folders with their titles and organization. This is the primary tool for "
             "understanding what's in a graph. Use get_user_location first if you need to know which "
-            "graph the user is in."
+            "graph the user is in.\n\n"
+            "This is always complete — prefer it over sparql_query for discovering what documents exist."
         ),
     )
     async def get_workspace_tool(
@@ -535,10 +628,24 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             # Get workspace snapshot
             snapshot = hp_client.get_workspace_snapshot(graph_id, user_id=auth.user_id)
 
-            result = {
+            result: dict[str, Any] = {
                 "graph_id": graph_id,
                 "workspace": snapshot,
             }
+
+            # Fail if workspace is completely empty — almost certainly a
+            # nonexistent graph or wrong backend connection.
+            has_docs = bool(snapshot.get("documents"))
+            has_folders = bool(snapshot.get("folders"))
+            has_artifacts = bool(snapshot.get("artifacts"))
+            if not has_docs and not has_folders and not has_artifacts:
+                raise RuntimeError(
+                    f"Graph '{graph_id}' not found — workspace is completely empty "
+                    f"(no documents, folders, or artifacts). This usually means the "
+                    f"graph ID is wrong or you're connected to the wrong backend. "
+                    f"Use list_graphs to see available graphs."
+                )
+
             return result
 
         except Exception as e:
@@ -1248,7 +1355,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             current = reader.get_document(document_id.strip())
 
             if not current:
-                raise RuntimeError(f"Document '{document_id}' not found in workspace '{graph_id}'")
+                raise RuntimeError(
+                    f"Document '{document_id}' not found in graph '{graph_id}'. "
+                    f"Use get_workspace to see available documents."
+                )
 
             # Update document parent via Y.js
             await hp_client.transact_workspace(
@@ -1317,7 +1427,10 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             current = reader.get_document(document_id.strip())
 
             if not current:
-                raise RuntimeError(f"Document '{document_id}' not found in workspace '{graph_id}'")
+                raise RuntimeError(
+                    f"Document '{document_id}' not found in graph '{graph_id}'. "
+                    f"Use get_workspace to see available documents."
+                )
 
             # Delete document from workspace via Y.js
             deleted = False
@@ -1381,6 +1494,9 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("block_id is required")
 
         try:
+            # Validate document exists in workspace
+            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id)
+
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
             channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
@@ -1391,7 +1507,7 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             block_info = reader.get_block_info(block_id.strip())
 
             if block_info is None:
-                raise RuntimeError(f"Block not found: {block_id}")
+                raise RuntimeError(f"Block '{block_id}' not found in document '{document_id}'.")
 
             result = {
                 "graph_id": graph_id.strip(),
@@ -1444,6 +1560,9 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("document_id is required")
 
         try:
+            # Validate document exists in workspace
+            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id)
+
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
             channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
@@ -1488,7 +1607,8 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             "Update a block by its ID. Can update attributes (indent, checked, listType) "
             "without changing content, or replace the entire block content. "
             "This is the most surgical edit - only modifies what you specify. "
-            "Plain text in xml_content is auto-wrapped in a <paragraph>."
+            "Plain text in xml_content is auto-wrapped in a <paragraph>. "
+            "Markdown is also accepted and auto-converted."
         ),
     )
     async def update_block_tool(
@@ -1524,6 +1644,9 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         resolved_xml = _ensure_xml(xml_content) if xml_content else None
 
         try:
+            # Validate document exists in workspace
+            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id)
+
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
             def perform_update(doc: Any) -> None:
@@ -1618,6 +1741,9 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("operations list is required and cannot be empty")
 
         try:
+            # Validate document exists in workspace
+            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id)
+
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
             updated_text_info: dict = {}
@@ -1666,7 +1792,8 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             "Insert a new block relative to an existing block. Use position='after' or 'before' "
             "to specify where to insert. Returns the new block's generated ID. "
             "For appending to the end, use append_to_document instead. "
-            "Plain text in xml_content is auto-wrapped in a <paragraph>."
+            "Plain text in xml_content is auto-wrapped in a <paragraph>. "
+            "Markdown is also accepted and auto-converted."
         ),
     )
     async def insert_block_tool(
@@ -1704,6 +1831,9 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
         resolved_xml = _ensure_xml(xml_content)
 
         try:
+            # Validate document exists in workspace
+            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id)
+
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
             new_block_id: str = ""
@@ -1790,6 +1920,9 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("block_id is required")
 
         try:
+            # Validate document exists in workspace
+            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id)
+
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
             deleted_ids: list[str] = []
@@ -1870,6 +2003,9 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}"""
             raise ValueError("updates list is required and cannot be empty")
 
         try:
+            # Validate document exists in workspace
+            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id)
+
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
             results: list[Dict[str, Any]] = []

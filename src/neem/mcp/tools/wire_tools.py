@@ -19,7 +19,7 @@ import httpx
 import pycrdt
 from mcp.server.fastmcp import Context, FastMCP
 
-from neem.hocuspocus import HocuspocusClient
+from neem.hocuspocus import HocuspocusClient, WorkspaceReader
 from neem.mcp.auth import MCPAuthContext
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_dev_user_id, get_internal_service_secret, validate_token_and_load
@@ -250,6 +250,21 @@ def register_wire_tools(server: FastMCP) -> None:
         server._hocuspocus_client = hp_client  # type: ignore[attr-defined]
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Validation helper
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _validate_document_in_ws(
+        ws_doc: pycrdt.Doc, graph_id: str, document_id: str,
+    ) -> None:
+        """Verify a document exists in workspace. Raises RuntimeError if not."""
+        reader = WorkspaceReader(ws_doc)
+        if reader.get_document(document_id) is None:
+            raise RuntimeError(
+                f"Document '{document_id}' not found in graph '{graph_id}'. "
+                f"Use get_workspace to see available documents."
+            )
+
+    # ─────────────────────────────────────────────────────────────────────────
     # list_wire_predicates
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -329,7 +344,10 @@ def register_wire_tools(server: FastMCP) -> None:
             "UI's refresh action or the backend API to fill them in later.\n\n"
             "Supports four connection modes: document-to-document (default), document-to-block, "
             "block-to-document, and block-to-block. Use source_block_id and/or target_block_id "
-            "to wire at block granularity for precise conceptual connections."
+            "to wire at block granularity for precise conceptual connections.\n\n"
+            "Always read both documents before wiring — choose predicates based on actual content, not just titles. "
+            "Prefer block-level wires for precise links. Don't default to 'relatedTo' when a more specific "
+            "predicate fits (supports, exemplifies, flowsInto, etc.)."
         ),
     )
     async def create_wire_tool(
@@ -361,6 +379,17 @@ def register_wire_tools(server: FastMCP) -> None:
 
         try:
             await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
+
+            # Validate source document exists in workspace
+            channel = hp_client.get_workspace_channel(graph_id.strip(), user_id=auth.user_id)
+            if channel is None:
+                raise RuntimeError(f"Workspace not connected: {graph_id}")
+            _validate_document_in_ws(channel.doc, graph_id.strip(), source_document_id.strip())
+            # Validate target document if it's in the same graph
+            if effective_target_graph.strip() == graph_id.strip():
+                _validate_document_in_ws(
+                    channel.doc, graph_id.strip(), target_document_id.strip(),
+                )
 
             def _do_create(doc: pycrdt.Doc) -> None:
                 _create_wire_in_doc(
@@ -457,6 +486,9 @@ def register_wire_tools(server: FastMCP) -> None:
             if channel is None:
                 raise RuntimeError(f"Workspace not connected: {graph_id}")
 
+            # Validate document exists
+            _validate_document_in_ws(channel.doc, graph_id, document_id)
+
             wires = _get_wires_for_document(channel.doc, document_id, direction)
 
             # Filter by predicate if specified
@@ -515,6 +547,9 @@ def register_wire_tools(server: FastMCP) -> None:
             channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
             if channel is None:
                 raise RuntimeError(f"Workspace not connected: {graph_id}")
+
+            # Validate starting document exists
+            _validate_document_in_ws(channel.doc, graph_id, document_id)
 
             doc = channel.doc
 
