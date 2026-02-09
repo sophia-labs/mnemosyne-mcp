@@ -88,9 +88,6 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             "success": True,
             "graph_id": graph_id.strip(),
             "title": title.strip(),
-            "description": description.strip() if description else None,
-            "job_id": metadata.job_id,
-            **result,
         })
 
     @server.tool(
@@ -142,10 +139,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         return _render_json({
             "success": True,
             "graph_id": graph_id.strip(),
-            "deleted": True,
             "hard_delete": hard,
-            "job_id": metadata.job_id,
-            **result,
         })
 
     @server.tool(
@@ -240,17 +234,9 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         # Extract query results from job output
         query_result = _extract_query_result(result)
         if query_result is not None:
-            return _render_json({
-                "success": True,
-                "results": query_result,
-                "job_id": metadata.job_id,
-            })
+            return _render_json({"results": query_result})
 
-        return _render_json({
-            "success": True,
-            "job_id": metadata.job_id,
-            **result,
-        })
+        return _render_json({"success": True, **result})
 
     @server.tool(
         name="sparql_update",
@@ -350,11 +336,9 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         )
 
         job_succeeded = result.get("status") != "failed"
-        return _render_json({
-            "success": job_succeeded,
-            "job_id": metadata.job_id,
-            **result,
-        })
+        if job_succeeded:
+            return _render_json({"success": True})
+        return _render_json({"success": False, "error": result.get("error", "Update failed")})
 
     logger.info("Registered graph operations tools (create, delete, query, update)")
 
@@ -433,4 +417,4 @@ def _extract_query_result(result: JsonDict) -> Optional[Any]:
 
 
 def _render_json(payload: JsonDict) -> str:
-    return json.dumps(payload, indent=2, sort_keys=True, default=str)
+    return json.dumps(payload, sort_keys=True, default=str)

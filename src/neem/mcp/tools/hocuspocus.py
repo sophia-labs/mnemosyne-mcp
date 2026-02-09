@@ -8,6 +8,7 @@ CRDT synchronization, bypassing the job queue for lower latency operations.
 from __future__ import annotations
 
 import html as html_mod
+import json
 import mimetypes
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -299,45 +300,25 @@ Also returns wire counts: document-level (outgoing, incoming, total) and block-l
                 "comments": comments,
             }
 
-            # Add wire counts (document-level and block-level)
+            # Add wire counts (lightweight signal for connectedness)
             try:
                 await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
                 ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
                 if ws_channel and ws_channel.doc:
                     outgoing = _get_wires_for_document(ws_channel.doc, document_id, "outgoing")
                     incoming = _get_wires_for_document(ws_channel.doc, document_id, "incoming")
-
-                    # Separate document-level vs block-level wires
-                    doc_level = 0
-                    block_wire_counts: Dict[str, int] = {}
-                    for wire in outgoing:
-                        block_id = wire.get("sourceBlockId")
-                        if block_id:
-                            block_wire_counts[block_id] = block_wire_counts.get(block_id, 0) + 1
-                        else:
-                            doc_level += 1
-                    for wire in incoming:
-                        block_id = wire.get("targetBlockId")
-                        if block_id:
-                            block_wire_counts[block_id] = block_wire_counts.get(block_id, 0) + 1
-                        else:
-                            doc_level += 1
-
-                    result["wires"] = {
-                        "outgoing": len(outgoing),
-                        "incoming": len(incoming),
-                        "total": len(outgoing) + len(incoming),
-                        "document_level": doc_level,
-                        "by_block": block_wire_counts if block_wire_counts else None,
-                    }
-                else:
-                    result["wires"] = {"outgoing": 0, "incoming": 0, "total": 0, "by_block": None}
+                    total = len(outgoing) + len(incoming)
+                    if total > 0:
+                        result["wires"] = {
+                            "outgoing": len(outgoing),
+                            "incoming": len(incoming),
+                            "total": total,
+                        }
             except Exception as e:
                 logger.debug(
                     "Failed to fetch wire counts for read_document (non-fatal)",
                     extra_context={"document_id": document_id, "error": str(e)},
                 )
-                result["wires"] = None
 
             return result
 
@@ -604,6 +585,65 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             )
             raise RuntimeError(f"Failed to append to document: {e}")
 
+    def _build_workspace_tree(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+        """Transform flat workspace snapshot into a nested tree.
+
+        Converts the flat {folders, documents, artifacts} maps with parentId
+        pointers into a pre-computed nested tree. Drops metadata the LLM
+        doesn't need (timestamps, sort orders, storage paths, UI state).
+        """
+        folders = snapshot.get("folders", {})
+        documents = snapshot.get("documents", {})
+        artifacts = snapshot.get("artifacts", {})
+
+        # Build node for each entity
+        nodes: dict[str, dict[str, Any]] = {}
+
+        for fid, fdata in folders.items():
+            node: dict[str, Any] = {"id": fid, "type": "folder", "name": fdata.get("name", "Untitled")}
+            node["_parent"] = fdata.get("parentId")
+            node["_order"] = fdata.get("order", 0)
+            node["children"] = []
+            nodes[fid] = node
+
+        for did, ddata in documents.items():
+            node = {"id": did, "type": "document", "title": ddata.get("title", "Untitled")}
+            if ddata.get("readOnly"):
+                node["readOnly"] = True
+            node["_parent"] = ddata.get("parentId")
+            node["_order"] = ddata.get("order", 0)
+            nodes[did] = node
+
+        for aid, adata in artifacts.items():
+            node = {"id": aid, "type": "artifact", "name": adata.get("name", "Untitled")}
+            if adata.get("ingestedDocId"):
+                node["ingestedDocId"] = adata["ingestedDocId"]
+            node["_parent"] = adata.get("parentId")
+            node["_order"] = adata.get("order", 0)
+            nodes[aid] = node
+
+        # Build tree by inserting children into parent folders
+        root: list[dict[str, Any]] = []
+        for nid, node in nodes.items():
+            parent_id = node.pop("_parent", None)
+            if parent_id and parent_id in nodes and "children" in nodes[parent_id]:
+                nodes[parent_id]["children"].append(node)
+            else:
+                root.append(node)
+
+        # Sort children by order, then strip internal _order keys
+        def _sort_and_clean(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            items.sort(key=lambda x: x.get("_order", 0))
+            for item in items:
+                item.pop("_order", None)
+                if "children" in item:
+                    _sort_and_clean(item["children"])
+                    if not item["children"]:
+                        del item["children"]
+            return items
+
+        return _sort_and_clean(root)
+
     @server.tool(
         name="get_workspace",
         title="Get Workspace Structure",
@@ -618,25 +658,15 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
     async def get_workspace_tool(
         graph_id: str,
         context: Context | None = None,
-    ) -> dict:
-        """Get workspace folder structure."""
+    ) -> str:
+        """Get workspace folder structure as a nested tree."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
         try:
-            # Connect to the workspace channel with user context
             await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
-
-            # Get workspace snapshot
             snapshot = hp_client.get_workspace_snapshot(graph_id, user_id=auth.user_id)
 
-            result: dict[str, Any] = {
-                "graph_id": graph_id,
-                "workspace": snapshot,
-            }
-
-            # Fail if workspace is completely empty — almost certainly a
-            # nonexistent graph or wrong backend connection.
             has_docs = bool(snapshot.get("documents"))
             has_folders = bool(snapshot.get("folders"))
             has_artifacts = bool(snapshot.get("artifacts"))
@@ -648,15 +678,13 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                     f"Use list_graphs to see available graphs."
                 )
 
-            return result
+            tree = _build_workspace_tree(snapshot)
+            return json.dumps({"graph_id": graph_id, "tree": tree})
 
         except Exception as e:
             logger.error(
                 "Failed to get workspace",
-                extra_context={
-                    "graph_id": graph_id,
-                    "error": str(e),
-                },
+                extra_context={"graph_id": graph_id, "error": str(e)},
             )
             raise RuntimeError(f"Failed to get workspace: {e}")
 
@@ -1201,6 +1229,8 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             "readable/editable document."
         ),
     )
+    # NOTE: The backend now auto-ingests on upload. The return value contains
+    # document_id instead of artifact_id. ingest_artifact is now optional.
     async def upload_artifact_tool(
         graph_id: str,
         file_path: str,
@@ -1256,12 +1286,15 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                     )
                 result = resp.json()
 
+            # New upload endpoint returns documentId (auto-ingested).
+            # Fall back to artifactId for backward compat with old backend.
+            doc_id = result.get("documentId") or result.get("artifactId")
             return {
                 "success": True,
-                "artifact_id": result.get("artifactId"),
+                "document_id": doc_id,
                 "file_type": result.get("fileType"),
-                "label": result.get("label"),
-                "storage_key": result.get("storageKey"),
+                "title": result.get("title") or result.get("label"),
+                "read_only": result.get("readOnly", True),
             }
 
         except Exception as e:

@@ -83,6 +83,26 @@ def _get_predicate_label(uri: str) -> str:
     return uri.split("#")[-1] if "#" in uri else uri.split("/")[-1]
 
 
+def _get_predicate_short_name(uri: str) -> str:
+    """Extract short name from a predicate URI (e.g. 'supports' from 'http://mnemosyne.ai/vocab#supports')."""
+    if "#" in uri:
+        return uri.split("#")[-1]
+    return uri.split("/")[-1]
+
+
+# Reverse lookup: short name -> full URI
+_SHORT_TO_URI: Dict[str, str] = {
+    _get_predicate_short_name(uri): uri for uri in BUILTIN_PREDICATES
+}
+
+
+def _resolve_predicate(predicate: str) -> str:
+    """Resolve a predicate that may be a short name or full URI to a full URI."""
+    if predicate.startswith("http://") or predicate.startswith("https://"):
+        return predicate
+    return _SHORT_TO_URI.get(predicate, f"{MNEMO_NS}{predicate}")
+
+
 def _get_all_wires(doc: pycrdt.Doc) -> List[Dict[str, Any]]:
     """Read all wires from a workspace Y.Doc."""
     wires_map = _read_wires_map(doc)
@@ -122,24 +142,62 @@ def _get_wires_for_document(
     return result
 
 
-def _format_wire_summary(wire: Dict[str, Any]) -> Dict[str, Any]:
-    """Format a wire dict for display, adding predicate label."""
-    predicate = wire.get("predicate", "")
-    return {
+def _resolve_title_from_workspace(
+    ws_doc: Optional[pycrdt.Doc], doc_id: Optional[str],
+) -> Optional[str]:
+    """Look up a document's title from the workspace documents map.
+
+    This mirrors how the frontend resolves wire titles — the wire snapshot
+    fields (sourceTitle/targetTitle) are often null because the backend's
+    SPARQL-based title fetch depends on RDF materialization which can lag.
+    The workspace Y.Doc documents map always has current titles.
+    """
+    if ws_doc is None or not doc_id:
+        return None
+    reader = WorkspaceReader(ws_doc)
+    doc_data = reader.get_document(doc_id)
+    if doc_data:
+        return doc_data.get("title")
+    return None
+
+
+def _format_wire_summary(
+    wire: Dict[str, Any],
+    ws_doc: Optional[pycrdt.Doc] = None,
+) -> Dict[str, Any]:
+    """Format a wire dict for display, adding predicate label.
+
+    When ws_doc is provided, resolves titles from the workspace documents map
+    as a fallback when wire snapshot titles are null (matching frontend behavior).
+    """
+    predicate_uri = wire.get("predicate", "")
+    source_title = wire.get("sourceTitle") or _resolve_title_from_workspace(
+        ws_doc, wire.get("sourceDocumentId"),
+    )
+    target_title = wire.get("targetTitle") or _resolve_title_from_workspace(
+        ws_doc, wire.get("targetDocumentId"),
+    )
+    result: Dict[str, Any] = {
         "id": wire["id"],
         "sourceDocumentId": wire.get("sourceDocumentId"),
         "targetDocumentId": wire.get("targetDocumentId"),
-        "predicate": predicate,
-        "predicateLabel": _get_predicate_label(predicate),
+        "predicate": _get_predicate_short_name(predicate_uri),
+        "predicateLabel": _get_predicate_label(predicate_uri),
         "bidirectional": bool(wire.get("bidirectional")),
-        "sourceBlockId": wire.get("sourceBlockId"),
-        "targetBlockId": wire.get("targetBlockId"),
-        "sourceTitle": wire.get("sourceTitle"),
-        "targetTitle": wire.get("targetTitle"),
-        "sourceSnippet": wire.get("sourceSnippet"),
-        "targetSnippet": wire.get("targetSnippet"),
-        "createdAt": wire.get("createdAt"),
     }
+    if wire.get("sourceBlockId"):
+        result["sourceBlockId"] = wire["sourceBlockId"]
+    if wire.get("targetBlockId"):
+        result["targetBlockId"] = wire["targetBlockId"]
+    if source_title:
+        result["sourceTitle"] = source_title
+    if target_title:
+        result["targetTitle"] = target_title
+    if wire.get("sourceSnippet"):
+        result["sourceSnippet"] = wire["sourceSnippet"]
+    if wire.get("targetSnippet"):
+        result["targetSnippet"] = wire["targetSnippet"]
+    return result
 
 
 async def _refresh_wire_snapshot(
@@ -289,14 +347,13 @@ def register_wire_tools(server: FastMCP) -> None:
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
-        # Start with built-in predicates
+        # Start with built-in predicates (short names only)
         predicates: List[Dict[str, Any]] = []
         for uri, info in BUILTIN_PREDICATES.items():
             predicates.append({
-                "uri": uri,
+                "name": _get_predicate_short_name(uri),
                 "label": info["label"],
                 "category": info["category"],
-                "builtin": True,
             })
 
         # Scan workspace wires for any custom predicates
@@ -315,10 +372,9 @@ def register_wire_tools(server: FastMCP) -> None:
 
                 for uri in sorted(custom_uris):
                     predicates.append({
-                        "uri": uri,
+                        "name": _get_predicate_short_name(uri),
                         "label": _get_predicate_label(uri),
                         "category": "Custom",
-                        "builtin": False,
                     })
         except Exception as e:
             logger.warning(
@@ -326,7 +382,7 @@ def register_wire_tools(server: FastMCP) -> None:
                 extra_context={"graph_id": graph_id, "error": str(e)},
             )
 
-        return json.dumps({"predicates": predicates, "count": len(predicates)}, indent=2)
+        return json.dumps({"predicates": predicates, "count": len(predicates)})
 
     # ─────────────────────────────────────────────────────────────────────────
     # create_wire
@@ -372,7 +428,7 @@ def register_wire_tools(server: FastMCP) -> None:
         if not target_document_id or not target_document_id.strip():
             raise ValueError("target_document_id is required")
 
-        effective_predicate = predicate or f"{MNEMO_NS}isWiredTo"
+        effective_predicate = _resolve_predicate(predicate) if predicate else f"{MNEMO_NS}isWiredTo"
         effective_target_graph = target_graph_id or graph_id
         wire_id = f"w-{uuid4().hex[:12]}"
         inverse_wire_id = f"{wire_id}-inv" if bidirectional else None
@@ -427,26 +483,21 @@ def register_wire_tools(server: FastMCP) -> None:
             )
 
             result: Dict[str, Any] = {
-                "success": True,
                 "wire_id": wire_id,
-                "source_document_id": source_document_id.strip(),
-                "target_document_id": target_document_id.strip(),
-                "predicate": effective_predicate,
-                "predicate_label": _get_predicate_label(effective_predicate),
-                "bidirectional": bidirectional,
+                "predicate": _get_predicate_short_name(effective_predicate),
+                "predicateLabel": _get_predicate_label(effective_predicate),
             }
+            if bidirectional:
+                result["bidirectional"] = True
             if inverse_wire_id:
                 result["inverse_wire_id"] = inverse_wire_id
 
-            # Trigger snippet refresh via backend API — this fetches document
-            # titles and block text from RDF and writes them back to the wire's
-            # snapshot fields in the Y.Doc. Best-effort; wire is already created.
-            refresh_result = await _refresh_wire_snapshot(
+            # Trigger snippet refresh via backend API (best-effort)
+            await _refresh_wire_snapshot(
                 backend_config.base_url, auth, graph_id.strip(), wire_id
             )
-            result["snapshot_refreshed"] = refresh_result
 
-            return json.dumps(result, indent=2)
+            return json.dumps(result)
 
         except Exception as e:
             raise RuntimeError(f"Failed to create wire: {e}")
@@ -491,18 +542,14 @@ def register_wire_tools(server: FastMCP) -> None:
 
             wires = _get_wires_for_document(channel.doc, document_id, direction)
 
-            # Filter by predicate if specified
+            # Filter by predicate if specified (accept short names or full URIs)
             if predicate:
-                wires = [w for w in wires if w.get("predicate") == predicate]
+                resolved = _resolve_predicate(predicate)
+                wires = [w for w in wires if w.get("predicate") == resolved]
 
-            formatted = [_format_wire_summary(w) for w in wires]
+            formatted = [_format_wire_summary(w, ws_doc=channel.doc) for w in wires]
 
-            return json.dumps({
-                "document_id": document_id,
-                "direction": direction,
-                "wires": formatted,
-                "count": len(formatted),
-            }, indent=2)
+            return json.dumps({"wires": formatted, "count": len(formatted)})
 
         except Exception as e:
             raise RuntimeError(f"Failed to get wires: {e}")
@@ -555,8 +602,9 @@ def register_wire_tools(server: FastMCP) -> None:
 
             # BFS traversal
             visited: set[str] = {document_id}
+            start_title = _resolve_title_from_workspace(doc, document_id)
             nodes: Dict[str, Dict[str, Any]] = {
-                document_id: {"id": document_id, "depth": 0, "title": None},
+                document_id: {"id": document_id, "depth": 0, "title": start_title},
             }
             edges: List[Dict[str, Any]] = []
             queue: deque[tuple[str, int]] = deque([(document_id, 0)])
@@ -569,20 +617,16 @@ def register_wire_tools(server: FastMCP) -> None:
                 wires = _get_wires_for_document(doc, current_doc_id, direction)
 
                 if predicate:
-                    wires = [w for w in wires if w.get("predicate") == predicate]
+                    resolved = _resolve_predicate(predicate)
+                    wires = [w for w in wires if w.get("predicate") == resolved]
 
                 for wire in wires:
                     source_id = wire.get("sourceDocumentId")
                     target_id = wire.get("targetDocumentId")
-                    pred = wire.get("predicate", "")
+                    pred_uri = wire.get("predicate", "")
 
                     # Determine which end is "the other document"
-                    if source_id == current_doc_id:
-                        other_id = target_id
-                        other_title = wire.get("targetTitle")
-                    else:
-                        other_id = source_id
-                        other_title = wire.get("sourceTitle")
+                    other_id = target_id if source_id == current_doc_id else source_id
 
                     if not other_id:
                         continue
@@ -591,14 +635,14 @@ def register_wire_tools(server: FastMCP) -> None:
                         "wireId": wire["id"],
                         "source": source_id,
                         "target": target_id,
-                        "predicate": pred,
-                        "predicateLabel": _get_predicate_label(pred),
+                        "predicate": _get_predicate_short_name(pred_uri),
+                        "predicateLabel": _get_predicate_label(pred_uri),
                         "bidirectional": bool(wire.get("bidirectional")),
-                        "depth": depth + 1,
                     })
 
                     if other_id not in visited:
                         visited.add(other_id)
+                        other_title = _resolve_title_from_workspace(doc, other_id)
                         nodes[other_id] = {
                             "id": other_id,
                             "depth": depth + 1,
@@ -606,24 +650,10 @@ def register_wire_tools(server: FastMCP) -> None:
                         }
                         queue.append((other_id, depth + 1))
 
-            # Try to fill in the starting document's title
-            all_wires = _get_all_wires(doc)
-            for w in all_wires:
-                if w.get("sourceDocumentId") == document_id and w.get("sourceTitle"):
-                    nodes[document_id]["title"] = w["sourceTitle"]
-                    break
-                if w.get("targetDocumentId") == document_id and w.get("targetTitle"):
-                    nodes[document_id]["title"] = w["targetTitle"]
-                    break
-
             return json.dumps({
-                "startDocument": document_id,
-                "maxDepth": max_depth,
                 "nodes": list(nodes.values()),
                 "edges": edges,
-                "nodeCount": len(nodes),
-                "edgeCount": len(edges),
-            }, indent=2)
+            })
 
         except Exception as e:
             raise RuntimeError(f"Failed to traverse wires: {e}")

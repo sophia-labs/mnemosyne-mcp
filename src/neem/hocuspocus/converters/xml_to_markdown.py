@@ -114,6 +114,11 @@ def _convert_children(
         elif tag == HORIZONTAL_RULE_TAG:
             lines.extend(["", "---", ""])
 
+        elif tag == "image":
+            src = elem.get("src", "")
+            alt = elem.get("alt", "")
+            lines.extend([f"![{alt}]({src})", ""])
+
         elif tag in (BULLET_LIST_TAG, ORDERED_LIST_TAG, TASK_LIST_TAG):
             # Wrapper elements — descend into children
             lines.extend(_convert_children(elem, footnotes))

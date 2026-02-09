@@ -131,7 +131,14 @@ def _convert_heading(node: dict, footnotes: dict[str, str]) -> str:
 
 
 def _convert_paragraph(node: dict, footnotes: dict[str, str]) -> str:
-    content = _convert_inline_children(node.get("children", []), footnotes)
+    children = node.get("children", [])
+    # If the paragraph contains only a single image, lift it out as a block-level image
+    if len(children) == 1 and children[0].get("type") == "image":
+        img = children[0]
+        src = html.escape(img.get("attrs", {}).get("url", img.get("destination", "")))
+        alt = html.escape(_plain_text_from_node(img))
+        return f'<image src="{src}" alt="{alt}"/>'
+    content = _convert_inline_children(children, footnotes)
     return f"<paragraph>{content}</paragraph>"
 
 
@@ -304,9 +311,9 @@ def _convert_inline(node: dict, footnotes: dict[str, str]) -> str:
         return f'<a href="{html.escape(url)}">{content}</a>'
 
     if ntype == "image":
-        # TipTap doesn't have a standard image inline — skip gracefully
-        alt = _plain_text_from_node(node)
-        return html.escape(alt) if alt else ""
+        src = html.escape(node.get("attrs", {}).get("url", node.get("destination", "")))
+        alt = html.escape(_plain_text_from_node(node))
+        return f'<image src="{src}" alt="{alt}"/>'
 
     if ntype == "softbreak":
         # Soft line break within a paragraph — TipTap ignores these
