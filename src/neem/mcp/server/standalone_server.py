@@ -362,9 +362,29 @@ def create_standalone_mcp_server() -> FastMCP:
     register_hocuspocus_tools(mcp_server)
     register_wire_tools(mcp_server)
 
+    # Remove excluded tools based on MCP_EXCLUDED_TOOLS env var.
+    # Comma-separated list of tool names, e.g. "export_document,upload_artifact,sparql_update"
+    excluded_raw = os.getenv("MCP_EXCLUDED_TOOLS", "")
+    if excluded_raw.strip():
+        excluded_names = [name.strip() for name in excluded_raw.split(",") if name.strip()]
+        for name in excluded_names:
+            try:
+                mcp_server.remove_tool(name)
+                logger.info("Excluded tool", extra_context={"tool": name})
+            except KeyError:
+                logger.warning(
+                    "MCP_EXCLUDED_TOOLS references unknown tool",
+                    extra_context={"tool": name},
+                )
+
+    registered_tools = mcp_server.list_tools()
     logger.info(
-        "Standalone MCP server created with graph, document, navigation, and wire tools",
-        extra_context={"backend_url": backend_config.base_url},
+        "Standalone MCP server created",
+        extra_context={
+            "backend_url": backend_config.base_url,
+            "tool_count": len(registered_tools) if hasattr(registered_tools, '__len__') else "unknown",
+            "excluded": excluded_raw or "(none)",
+        },
     )
 
     return mcp_server
