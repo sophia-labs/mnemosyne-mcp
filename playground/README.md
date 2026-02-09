@@ -136,7 +136,7 @@ To test with MCP:
 | `/api/documents` | GET | List all documents in memory |
 | `/api/document/{graph}/{doc}` | GET | Get document XML content |
 | `/hocuspocus/docs/{graph}/{doc}` | WS | Y.js document sync |
-| `/hocuspocus/workspace/{graph}` | WS | Y.js workspace sync |
+| `/hocuspocus/workspace/{user}/{graph}` | WS | Y.js workspace sync |
 | `/hocuspocus/session/{user}` | WS | Y.js session sync |
 
 ### How It Works

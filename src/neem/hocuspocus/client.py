@@ -571,7 +571,8 @@ class HocuspocusClient:
             graph_id: The graph ID
             user_id: The user ID for auth (uses _dev_user_id if not provided)
         """
-        channel_key = f"{user_id or self._dev_user_id}:{graph_id}"
+        effective_user_id = user_id or self._dev_user_id
+        channel_key = f"{effective_user_id}:{graph_id}"
         if channel_key in self._workspace_channels:
             channel = self._workspace_channels[channel_key]
             if channel.ws and not channel.ws.closed and channel.synced.is_set():
@@ -583,7 +584,7 @@ class HocuspocusClient:
         async with channel.lock:
             await self._connect_channel(
                 channel,
-                f"/hocuspocus/workspace/{graph_id}",
+                f"/hocuspocus/workspace/{effective_user_id}/{graph_id}",
                 f"workspace:{graph_id}",
                 user_id=user_id,
             )
