@@ -709,19 +709,14 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 user_id=auth.user_id,
             )
 
-            # Return workspace snapshot for confirmation
-            snapshot = hp_client.get_workspace_snapshot(graph_id.strip(), user_id=auth.user_id)
-
-            result = {
+            return {
                 "success": True,
                 "folder_id": folder_id.strip(),
                 "graph_id": graph_id.strip(),
                 "label": label.strip(),
                 "parent_id": parent_id.strip() if parent_id else None,
                 "section": section,
-                "workspace": snapshot,
             }
-            return result
 
         except Exception as e:
             logger.error(
@@ -784,16 +779,12 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 user_id=auth.user_id,
             )
 
-            snapshot = hp_client.get_workspace_snapshot(graph_id.strip(), user_id=auth.user_id)
-
-            result = {
+            return {
                 "success": True,
                 "folder_id": folder_id.strip(),
                 "graph_id": graph_id.strip(),
                 "new_parent_id": new_parent_id.strip() if new_parent_id else None,
-                "workspace": snapshot,
             }
-            return result
 
         except Exception as e:
             logger.error(
@@ -852,16 +843,12 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 user_id=auth.user_id,
             )
 
-            snapshot = hp_client.get_workspace_snapshot(graph_id.strip(), user_id=auth.user_id)
-
-            result = {
+            return {
                 "success": True,
                 "folder_id": folder_id.strip(),
                 "graph_id": graph_id.strip(),
                 "new_label": new_label.strip(),
-                "workspace": snapshot,
             }
-            return result
 
         except Exception as e:
             logger.error(
@@ -908,17 +895,13 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 user_id=auth.user_id,
             )
 
-            snapshot = hp_client.get_workspace_snapshot(graph_id.strip(), user_id=auth.user_id)
-
-            result = {
+            return {
                 "success": True,
                 "deleted": True,
                 "folder_id": folder_id.strip(),
                 "graph_id": graph_id.strip(),
                 "cascade": cascade,
-                "workspace": snapshot,
             }
-            return result
 
         except ValueError as ve:
             # Cascade error - folder has children
@@ -987,16 +970,12 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 user_id=auth.user_id,
             )
 
-            snapshot = hp_client.get_workspace_snapshot(graph_id.strip(), user_id=auth.user_id)
-
-            result = {
+            return {
                 "success": True,
                 "artifact_id": artifact_id.strip(),
                 "graph_id": graph_id.strip(),
                 "new_parent_id": new_parent_id.strip() if new_parent_id else None,
-                "workspace": snapshot,
             }
-            return result
 
         except Exception as e:
             logger.error(
@@ -1055,16 +1034,12 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 user_id=auth.user_id,
             )
 
-            snapshot = hp_client.get_workspace_snapshot(graph_id.strip(), user_id=auth.user_id)
-
-            result = {
+            return {
                 "success": True,
                 "artifact_id": artifact_id.strip(),
                 "graph_id": graph_id.strip(),
                 "new_label": new_label.strip(),
-                "workspace": snapshot,
             }
-            return result
 
         except Exception as e:
             logger.error(
@@ -1370,16 +1345,12 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 user_id=auth.user_id,
             )
 
-            snapshot = hp_client.get_workspace_snapshot(graph_id.strip(), user_id=auth.user_id)
-
-            result = {
+            return {
                 "success": True,
                 "document_id": document_id.strip(),
                 "graph_id": graph_id.strip(),
                 "new_parent_id": new_parent_id.strip() if new_parent_id else None,
-                "workspace": snapshot,
             }
-            return result
 
         except Exception as e:
             logger.error(
@@ -1441,16 +1412,14 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             )
             deleted = True
 
-            snapshot = hp_client.get_workspace_snapshot(graph_id.strip(), user_id=auth.user_id)
-
-            result = {
+            return {
                 "success": True,
                 "deleted": deleted,
                 "document_id": document_id.strip(),
                 "graph_id": graph_id.strip(),
-                "workspace": snapshot,
+                "title": current.get("title", "Untitled"),
+                "parent_id": current.get("parentId"),
             }
-            return result
 
         except Exception as e:
             logger.error(
