@@ -10,6 +10,7 @@ from __future__ import annotations
 import html as html_mod
 import json
 import mimetypes
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -227,15 +228,18 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
     @server.tool(
         name="read_document",
         title="Read Document Content",
-        description="""Reads document content as TipTap XML with full formatting.
+        description="""Reads document content with wire counts. Supports multiple output formats.
 
-Blocks: paragraph, heading (level="1-3"), bulletList, orderedList, blockquote, codeBlock (language="..."), taskList (taskItem checked="true"), horizontalRule, image (src="...", alt="...")
-Marks (nestable): strong, em, strike, code, mark (highlight), a (href="..."), footnote (data-footnote-content="..."), commentMark (data-comment-id="...")
-Lists: <bulletList><listItem><paragraph>item</paragraph></listItem></bulletList>
+Formats (set via 'format' parameter):
+- default (None): TipTap XML with full formatting and data-block-id attributes on every block. Use this when you need block IDs for surgical editing (edit_block_text, update_block, insert_block, delete_block) or block-level wire connections.
+- 'markdown': Clean Markdown. Use this when you just need to read/understand a document's content without editing it. Much more compact than XML.
 
-Each block element includes a data-block-id attribute. Use these IDs with block-level tools (get_block, update_block, insert_block, delete_block) and for block-level wire connections.
+XML block types: paragraph, heading (level="1-3"), bulletList, orderedList, blockquote, codeBlock (language="..."), taskList (taskItem checked="true"), horizontalRule, image (src="...", alt="...")
+XML marks (nestable): strong, em, strike, code, mark (highlight), a (href="..."), footnote (data-footnote-content="..."), commentMark (data-comment-id="...")
 
-Also returns wire counts: document-level (outgoing, incoming, total) and block-level (which blocks have wires attached). Use get_wires for full wire details.""",
+Also returns wire counts: document-level (outgoing, incoming, total) and block-level (which blocks have wires attached). Use get_wires for full wire details.
+
+Works for all documents including uploaded files (which are documents with readOnly=true).""",
     )
     async def read_document_tool(
         graph_id: str,
@@ -243,12 +247,12 @@ Also returns wire counts: document-level (outgoing, incoming, total) and block-l
         format: Optional[str] = None,
         context: Context | None = None,
     ) -> dict:
-        """Read document content as TipTap XML or markdown.
+        """Read document content in the requested format, with wire counts.
 
         Args:
             graph_id: The graph containing the document
             document_id: The document to read
-            format: Output format - "xml" (default) or "markdown"
+            format: Output format - None/"xml" (default, includes block IDs) or "markdown" (compact, readable)
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
@@ -349,13 +353,16 @@ Also returns wire counts: document-level (outgoing, incoming, total) and block-l
         name="export_document",
         title="Export Document",
         description=(
+            "DEPRECATED: Prefer read_document with format='markdown' instead, which also "
+            "includes wire counts.\n\n"
             "Export a document in a specified format. Returns the document content "
             "converted to the requested format along with the document title.\n\n"
             "Formats:\n"
             "- 'xml': Raw TipTap XML (lossless, includes block IDs and all attributes)\n"
             "- 'markdown': Clean Markdown with headings, lists, code blocks, bold/italic/etc.\n"
             "- 'html': Self-contained HTML with Garden theming (serif typography, dark/light mode)\n\n"
-            "Use this for clipboard export, backups, or feeding document content to other tools."
+            "The only unique capability here is 'html' export (themed HTML). For xml or markdown, "
+            "use read_document instead."
         ),
     )
     async def export_document_tool(
@@ -364,7 +371,7 @@ Also returns wire counts: document-level (outgoing, incoming, total) and block-l
         format: str = "markdown",
         context: Context | None = None,
     ) -> dict:
-        """Export a document in xml, markdown, or html format.
+        """Export a document (deprecated — prefer read_document with format param).
 
         Args:
             graph_id: The graph containing the document
@@ -2082,5 +2089,104 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 },
             )
             raise RuntimeError(f"Failed to batch update blocks: {e}")
+
+    # ------------------------------------------------------------------
+    # dump_chat — Save conversation content to a timestamped document
+    # ------------------------------------------------------------------
+
+    CHAT_LOGS_FOLDER_ID = "chat-logs"
+    CHAT_LOGS_FOLDER_LABEL = "Chat Logs"
+
+    @server.tool(
+        name="dump_chat",
+        title="Save Chat to Document",
+        description=(
+            "Saves conversation content to a timestamped document in a 'Chat Logs' folder. "
+            "Pass the formatted conversation as markdown in the content parameter. "
+            "Creates the Chat Logs folder automatically if it doesn't exist."
+        ),
+    )
+    async def dump_chat_tool(
+        graph_id: str,
+        content: str,
+        title: Optional[str] = None,
+        context: Context | None = None,
+    ) -> dict:
+        """Save chat content to a new timestamped document in Chat Logs folder.
+
+        Args:
+            graph_id: The graph to save the chat log in
+            content: Formatted conversation content (markdown or XML)
+            title: Optional title; defaults to "Chat Log — <timestamp>"
+        """
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required")
+        if not content or not content.strip():
+            raise ValueError("content is required")
+
+        graph_id = graph_id.strip()
+        now = datetime.now(timezone.utc)
+        doc_id = f"chat-log-{now.strftime('%Y-%m-%d-%H%M%S')}"
+        doc_title = title or f"Chat Log — {now.strftime('%b %d, %Y %I:%M %p')} UTC"
+
+        try:
+            # 1. Ensure Chat Logs folder exists
+            await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
+            ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
+            if ws_channel is None:
+                raise RuntimeError(f"Could not connect to workspace for graph '{graph_id}'.")
+
+            reader = WorkspaceReader(ws_channel.doc)
+            if not reader.folder_exists(CHAT_LOGS_FOLDER_ID):
+                await hp_client.transact_workspace(
+                    graph_id,
+                    lambda doc: WorkspaceWriter(doc).upsert_folder(
+                        CHAT_LOGS_FOLDER_ID,
+                        CHAT_LOGS_FOLDER_LABEL,
+                        section="documents",
+                    ),
+                    user_id=auth.user_id,
+                )
+
+            # 2. Write document content
+            xml_content = _ensure_xml_multiblock(content)
+            await hp_client.connect_document(graph_id, doc_id, user_id=auth.user_id)
+            await hp_client.transact_document(
+                graph_id,
+                doc_id,
+                lambda doc: DocumentWriter(doc).replace_all_content(xml_content),
+                user_id=auth.user_id,
+            )
+
+            # 3. Register document in workspace under Chat Logs folder
+            await hp_client.transact_workspace(
+                graph_id,
+                lambda doc: WorkspaceWriter(doc).upsert_document(
+                    doc_id, doc_title, parent_id=CHAT_LOGS_FOLDER_ID,
+                ),
+                user_id=auth.user_id,
+            )
+
+            return {
+                "success": True,
+                "graph_id": graph_id,
+                "document_id": doc_id,
+                "title": doc_title,
+                "folder_id": CHAT_LOGS_FOLDER_ID,
+            }
+
+        except Exception as e:
+            logger.error(
+                "Failed to dump chat",
+                extra_context={
+                    "graph_id": graph_id,
+                    "doc_id": doc_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to save chat log: {e}")
 
     logger.info("Registered hocuspocus tools (documents, navigation, and block operations)")
