@@ -861,22 +861,60 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             )
             raise RuntimeError(f"Failed to rename folder: {e}")
 
+    # ------------------------------------------------------------------
+    # Helper: hard-delete a document via backend REST API
+    # ------------------------------------------------------------------
+
+    async def _hard_delete_document(auth: MCPAuthContext, graph_id: str, doc_id: str) -> None:
+        """Submit a DOC_DELETE job to the backend for permanent deletion.
+
+        This removes the document's RDF triples, S3 Y.Doc, and Redis keys.
+        """
+        url = f"{backend_config.base_url}/documents/{graph_id}/{doc_id}"
+        headers = auth.http_headers()
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.delete(url, headers=headers)
+            # 200 = completed inline, 202 = queued async — both are success
+            if resp.status_code not in (200, 202):
+                logger.warning(
+                    "hard_delete_document_failed",
+                    extra_context={
+                        "graph_id": graph_id,
+                        "doc_id": doc_id,
+                        "status": resp.status_code,
+                        "body": resp.text[:200] if resp.text else None,
+                    },
+                )
+
+    def _collect_document_ids_recursive(reader: WorkspaceReader, folder_id: str) -> list[str]:
+        """Recursively collect all document IDs under a folder."""
+        doc_ids: list[str] = []
+        for entity_type, entity_id, _ in reader.get_children_of(folder_id):
+            if entity_type == "document":
+                doc_ids.append(entity_id)
+            elif entity_type == "folder":
+                doc_ids.extend(_collect_document_ids_recursive(reader, entity_id))
+        return doc_ids
+
     @server.tool(
         name="delete_folder",
         title="Delete Folder",
         description=(
             "Delete a folder from the workspace. "
             "Set cascade=true to delete all contents (subfolders, documents, artifacts). "
-            "Without cascade, deletion fails if the folder has children."
+            "Without cascade, deletion fails if the folder has children. "
+            "By default, permanently deletes document data (RDF, S3, Redis). "
+            "Set hard=false to only remove from workspace navigation."
         ),
     )
     async def delete_folder_tool(
         graph_id: str,
         folder_id: str,
         cascade: bool = False,
+        hard: bool = True,
         context: Context | None = None,
     ) -> dict:
-        """Delete a folder via Y.js."""
+        """Delete a folder via Y.js, optionally hard-deleting child documents."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -888,12 +926,25 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
         try:
             await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
 
-            # Delete folder via Y.js
+            # Collect document IDs before cascade removes them from CRDT
+            hard_deleted_docs: list[str] = []
+            if hard and cascade:
+                channel = hp_client.get_workspace_channel(graph_id.strip(), user_id=auth.user_id)
+                if channel:
+                    reader = WorkspaceReader(channel.doc)
+                    hard_deleted_docs = _collect_document_ids_recursive(reader, folder_id.strip())
+
+            # Delete folder from workspace CRDT
             await hp_client.transact_workspace(
                 graph_id.strip(),
                 lambda doc: WorkspaceWriter(doc).delete_folder(folder_id.strip(), cascade=cascade),
                 user_id=auth.user_id,
             )
+
+            # Hard-delete child documents via backend
+            if hard and hard_deleted_docs:
+                for doc_id in hard_deleted_docs:
+                    await _hard_delete_document(auth, graph_id.strip(), doc_id)
 
             return {
                 "success": True,
@@ -901,6 +952,8 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 "folder_id": folder_id.strip(),
                 "graph_id": graph_id.strip(),
                 "cascade": cascade,
+                "hard": hard,
+                "hard_deleted_documents": hard_deleted_docs if hard_deleted_docs else None,
             }
 
         except ValueError as ve:
@@ -1367,17 +1420,19 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
         name="delete_document",
         title="Delete Document",
         description=(
-            "Delete a document from workspace navigation. "
-            "This removes the document from the file tree but does not destroy the underlying data. "
-            "The document can be recreated by writing to the same document_id."
+            "Delete a document. By default, permanently deletes the document "
+            "including its content, RDF triples, and stored data. "
+            "Set hard=false to only remove from workspace navigation (soft delete) "
+            "— the document can then be recreated by writing to the same document_id."
         ),
     )
     async def delete_document_tool(
         graph_id: str,
         document_id: str,
+        hard: bool = True,
         context: Context | None = None,
     ) -> dict:
-        """Delete a document from workspace navigation via Y.js."""
+        """Delete a document, optionally with permanent data destruction."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -1403,18 +1458,21 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                     f"Use get_workspace to see available documents."
                 )
 
-            # Delete document from workspace via Y.js
-            deleted = False
+            # Remove document from workspace CRDT
             await hp_client.transact_workspace(
                 graph_id.strip(),
                 lambda doc: WorkspaceWriter(doc).delete_document(document_id.strip()),
                 user_id=auth.user_id,
             )
-            deleted = True
+
+            # Hard delete: also destroy backend data (RDF, S3, Redis)
+            if hard:
+                await _hard_delete_document(auth, graph_id.strip(), document_id.strip())
 
             return {
                 "success": True,
-                "deleted": deleted,
+                "deleted": True,
+                "hard": hard,
                 "document_id": document_id.strip(),
                 "graph_id": graph_id.strip(),
                 "title": current.get("title", "Untitled"),
