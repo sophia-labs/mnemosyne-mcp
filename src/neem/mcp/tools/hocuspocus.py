@@ -168,7 +168,9 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
         user_id = _resolve_user_id(auth, token, user_id)
 
         try:
-            await hp_client.ensure_session_connected(user_id)
+            # Reconnect to get fresh session state (the persistent WebSocket
+            # doesn't receive incremental Y.js updates after initial sync)
+            await hp_client.refresh_session(user_id)
 
             return {
                 "graph_id": hp_client.get_active_graph_id(),
@@ -201,7 +203,7 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
         user_id = _resolve_user_id(auth, token, user_id)
 
         try:
-            await hp_client.ensure_session_connected(user_id)
+            await hp_client.refresh_session(user_id)
 
             active_graph = hp_client.get_active_graph_id()
             active_doc = hp_client.get_active_document_id()
@@ -226,7 +228,7 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
         title="Read Document Content",
         description="""Reads document content as TipTap XML with full formatting.
 
-Blocks: paragraph, heading (level="1-3"), bulletList, orderedList, blockquote, codeBlock (language="..."), taskList (taskItem checked="true"), horizontalRule
+Blocks: paragraph, heading (level="1-3"), bulletList, orderedList, blockquote, codeBlock (language="..."), taskList (taskItem checked="true"), horizontalRule, image (src="...", alt="...")
 Marks (nestable): strong, em, strike, code, mark (highlight), a (href="..."), footnote (data-footnote-content="..."), commentMark (data-comment-id="...")
 Lists: <bulletList><listItem><paragraph>item</paragraph></listItem></bulletList>
 
@@ -436,7 +438,7 @@ WARNING: This REPLACES all content. For collaborative editing, prefer append_to_
 
 Plain text is accepted: if the content doesn't start with '<', each paragraph (separated by blank lines) is auto-wrapped in <paragraph> tags. Use XML when you need formatting or specific block types.
 
-Blocks: paragraph, heading (level="1-3"), bulletList, orderedList, blockquote, codeBlock (language="..."), taskList (taskItem checked="true"), horizontalRule
+Blocks: paragraph, heading (level="1-3"), bulletList, orderedList, blockquote, codeBlock (language="..."), taskList (taskItem checked="true"), horizontalRule, image (src="...", alt="...")
 Marks (nestable): strong, em, strike, code, mark (highlight), a (href="..."), footnote (data-footnote-content="..."), commentMark (data-comment-id="...")
 Example: <paragraph>Text with <mark>highlight</mark> and a note<footnote data-footnote-content="This is a footnote"/></paragraph>
 

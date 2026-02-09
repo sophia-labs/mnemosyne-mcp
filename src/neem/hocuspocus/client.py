@@ -194,6 +194,17 @@ class HocuspocusClient:
                 user_id=user_id,
             )
 
+    async def refresh_session(self, user_id: str) -> None:
+        """Close and reconnect the session channel to get fresh state.
+
+        The session WebSocket doesn't receive incremental Y.js updates
+        after initial sync, so we reconnect to get the latest state.
+        """
+        if self._session_channel is not None:
+            await self._close_channel(self._session_channel)
+            self._session_channel = None
+        await self.ensure_session_connected(user_id)
+
     async def _connect_channel(
         self,
         channel: ChannelState,
