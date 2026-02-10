@@ -634,10 +634,12 @@ class DocumentReader:
             List of matching block summaries.
         """
         fragment = self.get_content_fragment()
+        children_list = list(fragment.children)
+        total = len(children_list)
         matches = []
         import re
 
-        for i, child in enumerate(fragment.children):
+        for i, child in enumerate(children_list):
             if len(matches) >= limit:
                 break
 
@@ -684,6 +686,18 @@ class DocumentReader:
             if text_contains and text_contains.lower() not in plain_text.lower():
                 continue
 
+            # Get prev/next block IDs for navigation
+            prev_id = None
+            next_id = None
+            if i > 0:
+                prev_elem = children_list[i - 1]
+                if hasattr(prev_elem, "attributes"):
+                    prev_id = prev_elem.attributes.get("data-block-id")
+            if i < total - 1:
+                next_elem = children_list[i + 1]
+                if hasattr(next_elem, "attributes"):
+                    next_id = next_elem.attributes.get("data-block-id")
+
             # Build match summary
             matches.append({
                 "block_id": attrs.get("data-block-id"),
@@ -694,6 +708,8 @@ class DocumentReader:
                     k: v for k, v in attrs.items()
                     if k not in ("data-block-id",)  # Exclude redundant fields
                 },
+                "prev_block_id": prev_id,
+                "next_block_id": next_id,
             })
 
         return matches

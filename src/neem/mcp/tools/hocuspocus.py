@@ -1495,14 +1495,21 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
         title="Get Block by ID",
         description=(
             "Read a specific block by its data-block-id. Returns detailed info including "
-            "the block's XML content, attributes, text content, and context (prev/next block IDs). "
-            "Use this for targeted reads without fetching the entire document."
+            "the block's content and context (prev/next block IDs). "
+            "Use this for targeted reads without fetching the entire document.\n\n"
+            "Formats (set via 'format' parameter):\n"
+            "- default (None): Full TipTap XML with attributes — shows exactly what the user sees. "
+            "Use when you need raw markup or precise formatting details.\n"
+            "- 'markdown': Compact markdown rendering of the block. Recommended for agent workflows "
+            "that just need to read content.\n"
+            "- 'text': Plain text only. Most compact — use when you only need the text, not structure."
         ),
     )
     async def get_block_tool(
         graph_id: str,
         document_id: str,
         block_id: str,
+        format: Optional[str] = None,
         context: Context | None = None,
     ) -> dict:
         """Get detailed information about a block by its ID."""
@@ -1515,6 +1522,8 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             raise ValueError("document_id is required")
         if not block_id or not block_id.strip():
             raise ValueError("block_id is required")
+        if format is not None and format not in ("markdown", "text"):
+            raise ValueError("format must be None, 'markdown', or 'text'")
 
         try:
             # Validate document exists in workspace
@@ -1532,12 +1541,29 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             if block_info is None:
                 raise RuntimeError(f"Block '{block_id}' not found in document '{document_id}'.")
 
-            result = {
-                "graph_id": graph_id.strip(),
-                "document_id": document_id.strip(),
-                "block": block_info,
-            }
-            return result
+            # Format the block based on requested format
+            if format == "markdown":
+                block = {
+                    "block_id": block_info["block_id"],
+                    "index": block_info["index"],
+                    "type": block_info["type"],
+                    "markdown": tiptap_xml_to_markdown(block_info["xml"]),
+                    "text_length": block_info["text_length"],
+                    "context": block_info["context"],
+                }
+            elif format == "text":
+                block = {
+                    "block_id": block_info["block_id"],
+                    "index": block_info["index"],
+                    "type": block_info["type"],
+                    "text_content": block_info["text_content"],
+                    "text_length": block_info["text_length"],
+                    "context": block_info["context"],
+                }
+            else:
+                block = block_info
+
+            return {"block": block}
 
         except Exception as e:
             logger.error(
@@ -1604,13 +1630,7 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 limit=limit,
             )
 
-            result = {
-                "graph_id": graph_id.strip(),
-                "document_id": document_id.strip(),
-                "count": len(matches),
-                "blocks": matches,
-            }
-            return result
+            return {"count": len(matches), "blocks": matches}
 
         except Exception as e:
             logger.error(
@@ -1688,21 +1708,7 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 user_id=auth.user_id,
             )
 
-            # Read back the updated block
-            channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
-            if channel is None:
-                raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
-
-            reader = DocumentReader(channel.doc)
-            block_info = reader.get_block_info(block_id.strip())
-
-            result = {
-                "success": True,
-                "graph_id": graph_id.strip(),
-                "document_id": document_id.strip(),
-                "block": block_info,
-            }
-            return result
+            return {"success": True, "block_id": block_id.strip()}
 
         except Exception as e:
             logger.error(
@@ -1785,13 +1791,7 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 user_id=auth.user_id,
             )
 
-            result = {
-                "success": True,
-                "graph_id": graph_id.strip(),
-                "document_id": document_id.strip(),
-                "block": updated_text_info,
-            }
-            return result
+            return {"success": True, "block": updated_text_info}
 
         except ValueError as ve:
             # Validation errors - return as-is for clear agent feedback
@@ -1880,22 +1880,7 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 user_id=auth.user_id,
             )
 
-            # Read back the new block
-            channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
-            if channel is None:
-                raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
-
-            reader = DocumentReader(channel.doc)
-            block_info = reader.get_block_info(new_block_id) if new_block_id else None
-
-            result = {
-                "success": True,
-                "graph_id": graph_id.strip(),
-                "document_id": document_id.strip(),
-                "new_block_id": new_block_id,
-                "block": block_info,
-            }
-            return result
+            return {"success": True, "new_block_id": new_block_id}
 
         except Exception as e:
             logger.error(
@@ -1964,14 +1949,10 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 user_id=auth.user_id,
             )
 
-            result = {
+            return {
                 "success": True,
-                "graph_id": graph_id.strip(),
-                "document_id": document_id.strip(),
                 "deleted_block_ids": deleted_ids,
-                "cascade": cascade,
             }
-            return result
 
         except Exception as e:
             logger.error(
@@ -2071,8 +2052,6 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
 
             return {
                 "success": all(r.get("success") for r in results),
-                "graph_id": graph_id.strip(),
-                "document_id": document_id.strip(),
                 "results": results,
                 "updated_count": sum(1 for r in results if r.get("success")),
                 "error_count": sum(1 for r in results if "error" in r),

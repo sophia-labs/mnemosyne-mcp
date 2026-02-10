@@ -602,6 +602,7 @@ def register_wire_tools(server: FastMCP) -> None:
 
             # BFS traversal
             visited: set[str] = {document_id}
+            seen_wires: set[str] = set()
             start_title = _resolve_title_from_workspace(doc, document_id)
             nodes: Dict[str, Dict[str, Any]] = {
                 document_id: {"id": document_id, "depth": 0, "title": start_title},
@@ -621,6 +622,27 @@ def register_wire_tools(server: FastMCP) -> None:
                     wires = [w for w in wires if w.get("predicate") == resolved]
 
                 for wire in wires:
+                    wire_id = wire["id"]
+
+                    # Deduplicate: each wire appears once regardless of traversal path
+                    if wire_id in seen_wires:
+                        # Still need to enqueue the other end for BFS even if edge is deduped
+                        source_id = wire.get("sourceDocumentId")
+                        target_id = wire.get("targetDocumentId")
+                        other_id = target_id if source_id == current_doc_id else source_id
+                        if other_id and other_id not in visited:
+                            visited.add(other_id)
+                            other_title = _resolve_title_from_workspace(doc, other_id)
+                            nodes[other_id] = {
+                                "id": other_id,
+                                "depth": depth + 1,
+                                "title": other_title,
+                            }
+                            queue.append((other_id, depth + 1))
+                        continue
+
+                    seen_wires.add(wire_id)
+
                     source_id = wire.get("sourceDocumentId")
                     target_id = wire.get("targetDocumentId")
                     pred_uri = wire.get("predicate", "")
@@ -631,14 +653,30 @@ def register_wire_tools(server: FastMCP) -> None:
                     if not other_id:
                         continue
 
-                    edges.append({
-                        "wireId": wire["id"],
+                    edge: Dict[str, Any] = {
+                        "wireId": wire_id,
                         "source": source_id,
                         "target": target_id,
                         "predicate": _get_predicate_short_name(pred_uri),
                         "predicateLabel": _get_predicate_label(pred_uri),
                         "bidirectional": bool(wire.get("bidirectional")),
-                    })
+                    }
+
+                    # Include block IDs when present — block-level precision matters
+                    if wire.get("sourceBlockId"):
+                        edge["sourceBlockId"] = wire["sourceBlockId"]
+                    if wire.get("targetBlockId"):
+                        edge["targetBlockId"] = wire["targetBlockId"]
+
+                    # Include truncated snippets for semantic context without full payload
+                    src_snip = wire.get("sourceSnippet")
+                    tgt_snip = wire.get("targetSnippet")
+                    if src_snip:
+                        edge["sourceSnippet"] = src_snip[:80] + ("..." if len(src_snip) > 80 else "")
+                    if tgt_snip:
+                        edge["targetSnippet"] = tgt_snip[:80] + ("..." if len(tgt_snip) > 80 else "")
+
+                    edges.append(edge)
 
                     if other_id not in visited:
                         visited.add(other_id)
