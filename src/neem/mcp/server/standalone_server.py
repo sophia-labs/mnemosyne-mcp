@@ -24,6 +24,7 @@ from neem.mcp.tools.basic import register_basic_tools
 from neem.mcp.tools.graph_ops import register_graph_ops_tools
 from neem.mcp.tools.hocuspocus import register_hocuspocus_tools
 from neem.mcp.tools.wire_tools import register_wire_tools
+from neem.mcp.tools.geist import register_geist_tools
 from neem.mcp.trace import trace, trace_separator
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_dev_user_id, get_internal_service_secret, validate_token_and_load
@@ -321,6 +322,17 @@ def create_standalone_mcp_server() -> FastMCP:
             "  Content fragments use # suffixes: ...doc:{id}#frag, ...doc:{id}#block-{block_id}\n\n"
             "Documents are synced in real-time via Y.js CRDT, so changes appear "
             "immediately in the Mnemosyne web UI.\n\n"
+            "**Geist (Sophia Memory Tools):**\n"
+            "Memory, valuation, and self-narrative tools for agent continuity.\n"
+            "- Orientation flow: get_user_location → music() → recall() → get_workspace()\n"
+            "- music/sing: Read/write the Song (narrative orientation before structural orientation)\n"
+            "- store_memory/recall/bubble: Working memory queue (FIFO, numbered, append-only)\n"
+            "- valuate/get_block_values: Block-level importance (0-5) and valence (-5 to +5) scoring\n"
+            "- get_values/revaluate: Read/update scoring configuration\n"
+            "- recall only searches the memory queue — use get_block_values for graph-wide retrieval\n"
+            "- valuate works on any block in any document, not just the queue\n"
+            "- store_memory is for the agent's own working memory; append_to_document is for user-facing content\n"
+            "- Wires express relationships between things; valuation expresses judgment about a single thing\n\n"
             "When making function calls using tools that accept array or object parameters "
             "ensure those are structured using JSON."
         ),
@@ -361,6 +373,7 @@ def create_standalone_mcp_server() -> FastMCP:
     register_graph_ops_tools(mcp_server)
     register_hocuspocus_tools(mcp_server)
     register_wire_tools(mcp_server)
+    register_geist_tools(mcp_server)
 
     # Remove excluded tools based on MCP_EXCLUDED_TOOLS env var.
     # Comma-separated list of tool names, e.g. "export_document,upload_artifact,sparql_update"
