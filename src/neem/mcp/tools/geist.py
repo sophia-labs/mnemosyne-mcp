@@ -2,7 +2,7 @@
 MCP tools for Project Geist — Sophia's persistent memory, valuation, and self-narrative.
 
 Provides 10 tools organized in three groups:
-- Memory Queue: store_memory, recall, bubble
+- Memory Queue: store_memory, recall, care
 - Valuation: valuate, batch_valuate, get_block_values, get_values, revaluate
 - Song: music, sing
 
@@ -124,6 +124,9 @@ SEED_WEIGHTS = (
     "<paragraph>block_wires_ref: 3</paragraph>"
     "<paragraph>doc_wires_ref: 8</paragraph>"
     "<paragraph>half_life_days: 7</paragraph>"
+    '<heading level="2">Workspace Defaults</heading>'
+    "<paragraph>workspace_depth: 2</paragraph>"
+    "<paragraph>workspace_min_score: 0</paragraph>"
 )
 
 SEED_MEMORY_QUEUE = (
@@ -143,6 +146,9 @@ DEFAULT_WEIGHTS = {
     "block_wires_ref": 3.0,
     "doc_wires_ref": 8.0,
     "half_life_days": 7.0,
+    # Workspace view defaults (used by get_workspace when params not explicit)
+    "workspace_depth": 2.0,
+    "workspace_min_score": 0.0,
 }
 
 
@@ -668,17 +674,18 @@ def register_geist_tools(server: FastMCP) -> None:
         return _render_json({"memories": memories, "count": len(memories)})
 
     @server.tool(
-        name="bubble",
-        title="Bubble Memories",
+        name="care",
+        title="Care for Memories",
         description=(
             "Update last_active timestamps for specified memory numbers. This makes them "
             "reappear in the default recall window without changing their content or number. "
             "No content is returned — the agent already has the content from a prior recall.\n\n"
-            "Use this after reading a memory that is still relevant: 'I've read this, "
-            "it's still important, keep it in my attention.'"
+            "Use this after reading a memory that is still relevant: 'I care about these — "
+            "keep them in my attention.' Care in the Heideggerian sense: maintaining something "
+            "within the horizon of concern."
         ),
     )
-    async def bubble_tool(
+    async def care_tool(
         graph_id: str,
         numbers: List[int],
         context: Context | None = None,
@@ -697,27 +704,27 @@ def register_geist_tools(server: FastMCP) -> None:
         meta, meta_block_id = _read_geist_meta(reader)
         mem_entries = meta.get("memories", {})
         now = _now_iso()
-        bubbled: list[int] = []
+        cared: list[int] = []
 
         # Update last_active timestamps in-memory
         for num in numbers:
             entry = mem_entries.get(str(num))
             if isinstance(entry, dict):
                 entry["a"] = now
-                bubbled.append(num)
+                cared.append(num)
 
-        if bubbled and meta_block_id:
+        if cared and meta_block_id:
             meta["memories"] = mem_entries
 
-            def do_bubble(doc: pycrdt.Doc) -> None:
+            def do_care(doc: pycrdt.Doc) -> None:
                 writer = DocumentWriter(doc)
                 _write_geist_meta(writer, meta, meta_block_id)
 
             await hp_client.transact_document(
-                graph_id, MEMORY_QUEUE_DOC_ID, do_bubble, user_id=auth.user_id
+                graph_id, MEMORY_QUEUE_DOC_ID, do_care, user_id=auth.user_id
             )
 
-        return _render_json({"bubbled": bubbled, "timestamp": now})
+        return _render_json({"cared": cared, "timestamp": now})
 
     # ================================================================
     # SONG TOOLS

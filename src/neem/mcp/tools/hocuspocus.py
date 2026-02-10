@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import html as html_mod
 import json
+import math
 import mimetypes
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -21,6 +23,8 @@ from neem.hocuspocus import HocuspocusClient, DocumentReader, DocumentWriter, Wo
 from neem.hocuspocus.converters import looks_like_markdown, markdown_to_tiptap_xml, tiptap_xml_to_html, tiptap_xml_to_markdown
 from neem.hocuspocus.document import extract_title_from_xml
 from neem.mcp.auth import MCPAuthContext
+from neem.mcp.jobs import RealtimeJobClient
+from neem.mcp.tools.basic import await_job_completion, submit_job
 from neem.mcp.tools.wire_tools import _get_wires_for_document
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_dev_user_id, get_internal_service_secret, get_user_id_from_token, validate_token_and_load
@@ -91,6 +95,9 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
             extra_context={"base_url": backend_config.base_url},
         )
 
+    # Get job stream for SPARQL queries (used by scoring filter)
+    job_stream: Optional[RealtimeJobClient] = getattr(server, "_job_stream", None)
+
     # ------------------------------------------------------------------
     # Helper: resolve user_id from auth context
     # ------------------------------------------------------------------
@@ -103,6 +110,134 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
                     "ensure your token contains a 'sub' claim."
                 )
         return user_id
+
+    # ------------------------------------------------------------------
+    # Helper: get document-level scores for workspace filtering
+    # ------------------------------------------------------------------
+    async def _get_excluded_docs_by_score(
+        graph_id: str,
+        min_score: float,
+        auth: MCPAuthContext,
+    ) -> set[str]:
+        """Query block valuations and compute per-document scores.
+
+        Returns (excluded_doc_ids, valued_doc_ids) where:
+        - excluded_doc_ids: docs that have been valuated but score below min_score
+        - valued_doc_ids: all docs that have any valuations (for enriched collapse counts)
+
+        Documents with no valuations are NOT excluded (unscored docs always pass).
+        Documents in the Agent Scratchpad are never excluded (infrastructure protection).
+
+        Document score uses bicameral approach: avg importance + avg valence are
+        normalized for doc size, but max importance ensures a single extraordinary
+        block can carry a document.
+        """
+        user_id = auth.user_id or (get_user_id_from_token(auth.token) if auth.token else None)
+        if not user_id:
+            return set(), set()
+
+        graph_uri = f"urn:mnemosyne:user:{user_id}:graph:{graph_id}"
+
+        sparql = f"""
+PREFIX doc: <http://mnemosyne.dev/doc#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+SELECT ?docId
+       (AVG(xsd:float(?cumImp)) AS ?avgImp)
+       (MAX(xsd:float(?cumImp)) AS ?maxImp)
+       (AVG(ABS(xsd:float(?cumVal))) AS ?avgAbsVal)
+FROM <{graph_uri}>
+WHERE {{
+  ?val doc:blockRef ?blockRef .
+  ?val doc:cumulativeImportance ?cumImp .
+  ?val doc:cumulativeValence ?cumVal .
+  BIND(STRBEFORE(STRAFTER(STR(?blockRef), ":doc:"), "#") AS ?docId)
+}}
+GROUP BY ?docId
+"""
+        try:
+            if job_stream:
+                try:
+                    await job_stream.ensure_ready()
+                except Exception:
+                    pass
+
+            metadata = await submit_job(
+                base_url=backend_config.base_url,
+                auth=auth,
+                task_type="run_query",
+                payload={"sparql": sparql, "result_format": "json"},
+            )
+
+            ws_events, poll_payload = await await_job_completion(
+                job_stream, metadata, auth, timeout=30.0,
+            )
+
+            # Extract results from WS events or poll
+            raw = None
+            if ws_events:
+                for event in reversed(ws_events):
+                    if event.get("type") in ("job_completed", "completed", "succeeded"):
+                        payload = event.get("payload", {})
+                        if isinstance(payload, dict):
+                            detail = payload.get("detail")
+                            if isinstance(detail, dict):
+                                inline = detail.get("result_inline")
+                                if isinstance(inline, dict) and "raw" in inline:
+                                    raw = inline["raw"]
+                                elif inline is not None:
+                                    raw = inline
+                        break
+            elif poll_payload:
+                detail = poll_payload.get("detail")
+                if isinstance(detail, dict):
+                    inline = detail.get("result_inline")
+                    if isinstance(inline, dict) and "raw" in inline:
+                        raw = inline["raw"]
+                    elif inline is not None:
+                        raw = inline
+
+            if not raw or not isinstance(raw, dict):
+                return set(), set()
+
+            bindings = raw.get("results", {}).get("bindings", [])
+
+            # Infrastructure doc IDs that should never be filtered
+            protected_prefixes = ("geist-",)
+
+            # Compute per-document scores and find those below threshold
+            excluded = set()
+            valued = set()
+            for binding in bindings:
+                doc_id = binding.get("docId", {}).get("value", "")
+                if not doc_id:
+                    continue
+
+                valued.add(doc_id)
+
+                # Never exclude infrastructure documents
+                if any(doc_id.startswith(p) for p in protected_prefixes):
+                    continue
+
+                avg_imp = float(binding.get("avgImp", {}).get("value", 0))
+                max_imp = float(binding.get("maxImp", {}).get("value", 0))
+                avg_abs_val = float(binding.get("avgAbsVal", {}).get("value", 0))
+
+                # Bicameral with max component: a single extraordinary block
+                # can carry a document (max), but uniformly solid content also
+                # surfaces (avg). Valence adds affective intensity.
+                doc_score = max_imp * 0.4 + avg_imp * 0.3 + avg_abs_val * 0.3
+                if doc_score < min_score:
+                    excluded.add(doc_id)
+
+            return excluded, valued
+
+        except Exception as e:
+            logger.warning(
+                "Failed to query document scores for workspace filter, showing all docs",
+                extra_context={"graph_id": graph_id, "error": str(e)},
+            )
+            return set(), set()  # Graceful degradation: show everything
 
     # ------------------------------------------------------------------
     # Validation helpers
@@ -604,13 +739,28 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             )
             raise RuntimeError(f"Failed to append to document: {e}")
 
-    def _build_workspace_tree(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    def _build_workspace_tree(
+        snapshot: dict[str, Any],
+        max_depth: int = 0,
+        folder_id: str | None = None,
+        excluded_doc_ids: set[str] | None = None,
+        valued_doc_ids: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Transform flat workspace snapshot into a nested tree.
 
         Converts the flat {folders, documents} maps with parentId pointers
         into a pre-computed nested tree. Drops metadata the LLM doesn't
         need (timestamps, sort orders, storage paths, UI state).
         Uploaded files appear as documents with readOnly=true and fileType.
+
+        Args:
+            snapshot: Raw workspace snapshot with folders/documents maps.
+            max_depth: Maximum nesting depth (0 = unlimited). At the limit,
+                folders are collapsed to show child counts instead of contents.
+            folder_id: If set, only return the subtree rooted at this folder.
+            excluded_doc_ids: Document IDs to exclude (e.g. filtered by score).
+            valued_doc_ids: Document IDs that have valuations (for enriched
+                collapse counts showing "N documents, M valued").
         """
         folders = snapshot.get("folders", {})
         documents = snapshot.get("documents", {})
@@ -626,6 +776,8 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             nodes[fid] = node
 
         for did, ddata in documents.items():
+            if excluded_doc_ids and did in excluded_doc_ids:
+                continue
             node = {"id": did, "type": "document", "title": ddata.get("title", "Untitled")}
             if ddata.get("readOnly"):
                 node["readOnly"] = True
@@ -646,17 +798,65 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 root.append(node)
 
         # Sort children by order, then strip internal _order keys
-        def _sort_and_clean(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Apply depth truncation: at max_depth, collapse folders to counts
+        def _sort_and_clean(items: list[dict[str, Any]], current_depth: int = 1) -> list[dict[str, Any]]:
             items.sort(key=lambda x: x.get("_order", 0))
             for item in items:
                 item.pop("_order", None)
                 if "children" in item:
-                    _sort_and_clean(item["children"])
-                    if not item["children"]:
+                    if max_depth > 0 and current_depth >= max_depth:
+                        # Collapse: count children recursively instead of listing them
+                        doc_count, val_count = _count_descendants(item["children"])
                         del item["children"]
+                        if doc_count > 0:
+                            if valued_doc_ids and val_count > 0:
+                                item["collapsed"] = f"{doc_count} documents, {val_count} valued"
+                            else:
+                                item["collapsed"] = f"{doc_count} documents"
+                    else:
+                        _sort_and_clean(item["children"], current_depth + 1)
+                        if not item["children"]:
+                            del item["children"]
             return items
 
-        return _sort_and_clean(root)
+        def _count_descendants(items: list[dict[str, Any]]) -> tuple[int, int]:
+            """Count documents and valued documents in a subtree."""
+            doc_count = 0
+            val_count = 0
+            for item in items:
+                if item.get("type") == "document":
+                    doc_count += 1
+                    if valued_doc_ids and item.get("id") in valued_doc_ids:
+                        val_count += 1
+                if "children" in item:
+                    sub_docs, sub_vals = _count_descendants(item["children"])
+                    doc_count += sub_docs
+                    val_count += sub_vals
+            return doc_count, val_count
+
+        tree = _sort_and_clean(root)
+
+        # If folder_id is specified, extract just that subtree
+        if folder_id:
+            def _find_folder(items: list[dict[str, Any]], target_id: str) -> dict[str, Any] | None:
+                for item in items:
+                    if item.get("id") == target_id:
+                        return item
+                    if "children" in item:
+                        found = _find_folder(item["children"], target_id)
+                        if found:
+                            return found
+                return None
+
+            folder_node = _find_folder(tree, folder_id)
+            if folder_node and "children" in folder_node:
+                tree = folder_node["children"]
+            elif folder_node:
+                tree = [folder_node]
+            else:
+                tree = []
+
+        return tree
 
     @server.tool(
         name="get_workspace",
@@ -666,11 +866,25 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             "folders, and their titles and organization. This is the primary tool for "
             "understanding what's in a graph. Use get_user_location first if you need to know which "
             "graph the user is in.\n\n"
-            "This is always complete — prefer it over sparql_query for discovering what documents exist."
+            "**Parameters:**\n"
+            "- depth (default 2): Maximum folder nesting depth. At the limit, folders collapse to "
+            "show document counts instead of full listings. Use depth=0 for unlimited (full tree). "
+            "Organize documents into folders for cleaner workspace views at default depth.\n"
+            "- folder_id (optional): Return only the subtree under this folder. Useful for "
+            "drilling into a specific area after seeing the top-level structure.\n"
+            "- min_score (optional): Filter out documents with a document-level composite score below "
+            "this threshold. Document scores are computed from block-level valuations (avg importance, "
+            "avg valence). Only applies to documents that have been valuated; unscored documents "
+            "are always shown.\n\n"
+            "This is always complete at the requested depth — prefer it over sparql_query for "
+            "discovering what documents exist."
         ),
     )
     async def get_workspace_tool(
         graph_id: str,
+        depth: int = 2,
+        folder_id: Optional[str] = None,
+        min_score: Optional[float] = None,
         context: Context | None = None,
     ) -> str:
         """Get workspace folder structure as a nested tree."""
@@ -691,8 +905,27 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                     f"Use list_graphs to see available graphs."
                 )
 
-            tree = _build_workspace_tree(snapshot)
-            return json.dumps({"graph_id": graph_id, "tree": tree})
+            # If min_score is set, query document-level scores and build exclusion set
+            excluded_doc_ids: set[str] | None = None
+            valued_doc_ids: set[str] | None = None
+            if min_score is not None:
+                excluded_doc_ids, valued_doc_ids = await _get_excluded_docs_by_score(
+                    graph_id, min_score, auth
+                )
+
+            tree = _build_workspace_tree(
+                snapshot,
+                max_depth=depth,
+                folder_id=folder_id,
+                excluded_doc_ids=excluded_doc_ids,
+                valued_doc_ids=valued_doc_ids,
+            )
+            result: dict[str, Any] = {"graph_id": graph_id, "tree": tree}
+            if depth > 0:
+                result["depth"] = depth
+            if folder_id:
+                result["folder_id"] = folder_id
+            return json.dumps(result)
 
         except Exception as e:
             logger.error(
