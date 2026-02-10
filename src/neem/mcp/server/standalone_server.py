@@ -25,6 +25,7 @@ from neem.mcp.tools.graph_ops import register_graph_ops_tools
 from neem.mcp.tools.hocuspocus import register_hocuspocus_tools
 from neem.mcp.tools.wire_tools import register_wire_tools
 from neem.mcp.tools.geist import register_geist_tools
+from neem.mcp.tools.search import register_search_tools
 from neem.mcp.trace import trace, trace_separator
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_dev_user_id, get_internal_service_secret, validate_token_and_load
@@ -333,6 +334,10 @@ def create_standalone_mcp_server() -> FastMCP:
             "- valuate works on any block in any document, not just the queue\n"
             "- store_memory is for the agent's own working memory; append_to_document is for user-facing content\n"
             "- Wires express relationships between things; valuation expresses judgment about a single thing\n\n"
+            "**Semantic Search:**\n"
+            "- semantic_search: Find content by meaning across documents using vector embeddings\n"
+            "- reindex_graph: Re-embed all documents (admin/maintenance, auto-indexes on save)\n"
+            "- recall with query param uses hybrid search: memory queue + vector similarity merged via RRF\n\n"
             "When making function calls using tools that accept array or object parameters "
             "ensure those are structured using JSON."
         ),
@@ -374,6 +379,7 @@ def create_standalone_mcp_server() -> FastMCP:
     register_hocuspocus_tools(mcp_server)
     register_wire_tools(mcp_server)
     register_geist_tools(mcp_server)
+    register_search_tools(mcp_server)
 
     # Remove excluded tools based on MCP_EXCLUDED_TOOLS env var.
     # Comma-separated list of tool names, e.g. "export_document,upload_artifact,sparql_update"

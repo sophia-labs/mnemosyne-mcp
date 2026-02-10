@@ -12,6 +12,7 @@ is a folder structure auto-created on first use of any Geist tool.
 
 from __future__ import annotations
 
+import asyncio
 import html as html_mod
 import json
 import math
@@ -33,6 +34,7 @@ from neem.hocuspocus.converters import tiptap_xml_to_markdown
 from neem.mcp.auth import MCPAuthContext
 from neem.mcp.jobs import RealtimeJobClient
 from neem.mcp.tools.basic import await_job_completion, submit_job
+from neem.mcp.tools.wire_tools import _get_all_wires, _resolve_title_from_workspace
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import (
     get_dev_user_id,
@@ -241,12 +243,47 @@ def _compute_composite_score(
     score = (
         w["importance_weight"] * math.tanh(importance / w["importance_ref"])
         + w["valence_weight"] * math.tanh(abs(valence) / w["valence_ref"])
-        + w["temporal_weight"] * math.exp(-doc_age_days / (w["half_life_days"] * 86400))
+        + w["temporal_weight"] * math.exp(-doc_age_days / w["half_life_days"])
         + w["block_wires_weight"] * math.tanh(block_wire_count / w["block_wires_ref"])
         + w["doc_wires_weight"] * math.tanh(doc_wire_count / w["doc_wires_ref"])
-        + w["wire_freshness_weight"] * math.exp(-wire_age_days / (w["half_life_days"] * 86400))
+        + w["wire_freshness_weight"] * math.exp(-wire_age_days / w["half_life_days"])
     )
     return round(score, 4)
+
+
+def _build_wire_indexes(
+    wires: List[Dict[str, Any]],
+) -> tuple[Dict[str, int], Dict[str, int], Dict[str, str]]:
+    """Single-pass over all wires to build lookup indexes.
+
+    Returns:
+        doc_wire_counts:  {document_id: total_wire_count}
+        block_wire_counts: {block_id: total_wire_count}
+        doc_newest_wire:  {document_id: ISO timestamp of newest wire}
+    """
+    doc_wire_counts: Dict[str, int] = {}
+    block_wire_counts: Dict[str, int] = {}
+    doc_newest_wire: Dict[str, str] = {}
+
+    for wire in wires:
+        if wire["id"].endswith("-inv"):
+            continue
+
+        created = wire.get("createdAt", "")
+
+        for doc_key in ("sourceDocumentId", "targetDocumentId"):
+            doc_id = wire.get(doc_key, "")
+            if doc_id:
+                doc_wire_counts[doc_id] = doc_wire_counts.get(doc_id, 0) + 1
+                if created and (not doc_newest_wire.get(doc_id) or created > doc_newest_wire[doc_id]):
+                    doc_newest_wire[doc_id] = created
+
+        for block_key in ("sourceBlockId", "targetBlockId"):
+            block_id = wire.get(block_key, "")
+            if block_id:
+                block_wire_counts[block_id] = block_wire_counts.get(block_id, 0) + 1
+
+    return doc_wire_counts, block_wire_counts, doc_newest_wire
 
 
 # ── Scratchpad initialization ───────────────────────────────────────
@@ -494,6 +531,122 @@ def _extract_query_result(result: JsonDict) -> Any | None:
     return inline
 
 
+# ── Reciprocal Rank Fusion ──────────────────────────────────────────
+
+
+def _rrf_merge(
+    memory_results: list[dict],
+    vector_results: list[dict],
+    k: int = 60,
+) -> list[dict]:
+    """Merge two ranked lists using Reciprocal Rank Fusion.
+
+    Each item gets score = 1/(k + rank) from each list it appears in.
+    Items that appear in both lists get scores summed.
+
+    Memory results are keyed by "number" (memory queue entries).
+    Vector results are keyed by "block_id:doc_id" (graph-wide blocks).
+    Since they come from different namespaces, they never collide —
+    every item keeps its source attribution and scores simply accumulate
+    for anything that happens to appear in both.
+
+    Returns merged list sorted by RRF score descending.
+    """
+    scores: dict[str, float] = {}
+    items: dict[str, dict] = {}
+
+    # Score memory results (keyed by memory number)
+    for rank, mem in enumerate(memory_results):
+        key = f"mem:{mem.get('number', rank)}"
+        scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+        if key not in items:
+            items[key] = {**mem, "source": "memory"}
+
+    # Score vector results (keyed by block_id:doc_id)
+    for rank, hit in enumerate(vector_results):
+        key = f"vec:{hit.get('doc_id', '')}:{hit.get('block_id', '')}"
+        scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+        if key not in items:
+            items[key] = {
+                "text": hit.get("text_preview", ""),
+                "doc_id": hit.get("doc_id", ""),
+                "doc_title": hit.get("doc_title", ""),
+                "block_id": hit.get("block_id", ""),
+                "score": hit.get("score", 0.0),
+                "source": "vector",
+            }
+
+    # Sort by RRF score
+    ranked_keys = sorted(scores, key=lambda k: scores[k], reverse=True)
+    merged = []
+    for key in ranked_keys:
+        item = items[key]
+        item["rrf_score"] = round(scores[key], 6)
+        merged.append(item)
+
+    return merged
+
+
+async def _run_semantic_search(
+    backend_config: Any,
+    job_stream: Any,
+    auth: MCPAuthContext,
+    graph_id: str,
+    query: str,
+    limit: int,
+) -> list[dict]:
+    """Run semantic search via the worker pipeline. Returns hits or empty list."""
+    try:
+        if job_stream:
+            try:
+                await job_stream.ensure_ready()
+            except Exception:
+                pass
+
+        metadata = await submit_job(
+            base_url=backend_config.base_url,
+            auth=auth,
+            task_type="semantic_search",
+            payload={
+                "graph_id": graph_id,
+                "query": query,
+                "limit": limit,
+            },
+        )
+
+        ws_events, poll_payload = await await_job_completion(
+            job_stream, metadata, auth, timeout=STREAM_TIMEOUT_SECONDS,
+        )
+
+        # Extract results from WS events
+        if ws_events:
+            for event in reversed(ws_events):
+                event_type = event.get("type", "")
+                if event_type in ("job_completed", "completed", "succeeded"):
+                    payload = event.get("payload", {})
+                    if isinstance(payload, dict):
+                        detail = payload.get("detail", {})
+                        inline = detail.get("result_inline", {})
+                        if isinstance(inline, dict):
+                            return inline.get("results", [])
+
+        # Extract from poll
+        if poll_payload:
+            detail = poll_payload.get("detail", {})
+            if isinstance(detail, dict):
+                inline = detail.get("result_inline", {})
+                if isinstance(inline, dict):
+                    return inline.get("results", [])
+
+    except Exception as exc:
+        logger.warning(
+            "hybrid_recall_semantic_search_failed",
+            extra_context={"graph_id": graph_id, "error": str(exc)},
+        )
+
+    return []
+
+
 # ── Tool registration ───────────────────────────────────────────────
 
 
@@ -638,6 +791,17 @@ def register_geist_tools(server: FastMCP) -> None:
                 })
             return _render_json({"memories": [], "note": f"Memory #{number} not found"})
 
+        # When query is provided, run hybrid search: memory queue + vector search
+        # in parallel, then merge with Reciprocal Rank Fusion.
+        vector_task = None
+        if query and query.strip():
+            vector_task = asyncio.create_task(
+                _run_semantic_search(
+                    backend_config, job_stream, auth,
+                    graph_id, query.strip(), limit,
+                )
+            )
+
         # Collect all memory metadata
         memories = []
         for num_str, entry in mem_entries.items():
@@ -663,9 +827,30 @@ def register_geist_tools(server: FastMCP) -> None:
             return max(m.get("created_at", ""), m.get("last_active", ""))
 
         memories.sort(key=sort_key, reverse=True)
-        memories = memories[:limit]
 
-        return _render_json({"memories": memories, "count": len(memories)})
+        # If no query, return plain memory results (original behavior)
+        if not vector_task:
+            memories = memories[:limit]
+            return _render_json({"memories": memories, "count": len(memories)})
+
+        # Hybrid path: await vector results and merge via RRF
+        vector_hits = await vector_task
+        if not vector_hits:
+            # Vector search returned nothing — fall back to memory-only
+            memories = memories[:limit]
+            return _render_json({"memories": memories, "count": len(memories)})
+
+        merged = _rrf_merge(memories, vector_hits)
+        merged = merged[:limit]
+
+        return _render_json({
+            "results": merged,
+            "count": len(merged),
+            "sources": {
+                "memory": len([r for r in merged if r.get("source") == "memory"]),
+                "vector": len([r for r in merged if r.get("source") == "vector"]),
+            },
+        })
 
     @server.tool(
         name="bubble",
@@ -1164,12 +1349,39 @@ WHERE {{
   {filter_clause}
 }}
 ORDER BY DESC(xsd:float(?cumImp))
-LIMIT {limit}
+LIMIT {min(limit * 3, 200)}
 """
         rows = await _sparql_query(backend_config, job_stream, auth, graph_id, query)
 
+        # Load weights config
+        weights = dict(DEFAULT_WEIGHTS)
+        try:
+            await _ensure_scratchpad(hp_client, graph_id, auth)
+            await hp_client.connect_document(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
+            w_channel = hp_client.get_document_channel(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
+            if w_channel:
+                w_reader = DocumentReader(w_channel.doc)
+                w_xml = w_reader.to_xml()
+                weights = _parse_weights_text(tiptap_xml_to_markdown(w_xml))
+        except Exception:
+            logger.debug("Could not load weights config, using defaults")
+
+        # Build wire indexes (fail-safe — composite degrades gracefully without wires)
+        doc_wire_counts: Dict[str, int] = {}
+        block_wire_counts: Dict[str, int] = {}
+        doc_newest_wire: Dict[str, str] = {}
+        try:
+            await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
+            ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
+            if ws_channel:
+                all_wires = _get_all_wires(ws_channel.doc)
+                doc_wire_counts, block_wire_counts, doc_newest_wire = _build_wire_indexes(all_wires)
+        except Exception:
+            logger.debug("Could not load wire data for composite scoring")
+
+        now = datetime.now(timezone.utc)
+
         # Parse results and compute composite scores
-        # (Wire counts and temporal decay require additional context — simplified for now)
         blocks = []
         for row in rows:
             cum_imp = float(row.get("cumImp", 0))
@@ -1184,22 +1396,250 @@ LIMIT {limit}
                 if ":doc:" in pre:
                     parsed_doc_id = pre.rpartition(":doc:")[2]
 
+            # Temporal decay from last valuation
+            last_val_str = row.get("lastVal", "")
+            doc_age_days = 0.0
+            if last_val_str:
+                try:
+                    last_val_dt = datetime.fromisoformat(last_val_str.replace("Z", "+00:00"))
+                    doc_age_days = max(0.0, (now - last_val_dt).total_seconds() / 86400.0)
+                except (ValueError, TypeError):
+                    pass
+
+            # Wire counts
+            bwc = block_wire_counts.get(parsed_block_id, 0)
+            dwc = doc_wire_counts.get(parsed_doc_id, 0)
+
+            # Wire freshness
+            wire_age_days = 0.0
+            newest_wire = doc_newest_wire.get(parsed_doc_id, "")
+            if newest_wire:
+                try:
+                    wire_dt = datetime.fromisoformat(newest_wire.replace("Z", "+00:00"))
+                    wire_age_days = max(0.0, (now - wire_dt).total_seconds() / 86400.0)
+                except (ValueError, TypeError):
+                    pass
+
+            composite = _compute_composite_score(
+                importance=cum_imp,
+                valence=cum_val,
+                doc_age_days=doc_age_days,
+                block_wire_count=bwc,
+                doc_wire_count=dwc,
+                wire_age_days=wire_age_days,
+                weights=weights,
+            )
+
+            if min_score is not None and composite < min_score:
+                continue
+
             entry = {
                 "block_id": parsed_block_id,
                 "document_id": parsed_doc_id,
                 "cumulative_importance": round(cum_imp, 4),
                 "cumulative_valence": round(cum_val, 4),
+                "composite_score": composite,
                 "importance_count": int(row.get("impCount", 0)),
                 "valence_count": int(row.get("valCount", 0)),
-                "last_valuated": row.get("lastVal", ""),
+                "last_valuated": last_val_str,
+                "block_wire_count": bwc,
+                "doc_wire_count": dwc,
             }
-
-            if min_score is not None and cum_imp < min_score:
-                continue
 
             blocks.append(entry)
 
+        # Sort by composite score descending, trim to requested limit
+        blocks.sort(key=lambda b: b["composite_score"], reverse=True)
+        blocks = blocks[:limit]
+
         return _render_json({"blocks": blocks, "count": len(blocks)})
+
+    @server.tool(
+        name="get_important_blocks",
+        title="Get Important Blocks",
+        description=(
+            "Orientation tool: returns the highest-scored blocks in the graph with their "
+            "actual text content and document titles. Use at session start to understand "
+            "what matters most. Optional document_id to scope to one document."
+        ),
+    )
+    async def get_important_blocks_tool(
+        graph_id: str,
+        document_id: Optional[str] = None,
+        limit: int = 5,
+        valence: Optional[str] = None,
+        context: Context | None = None,
+    ) -> str:
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+        user_id = _resolve_user_id(auth)
+
+        graph_id = graph_id.strip()
+
+        # Build SPARQL filter
+        filters = []
+        if document_id:
+            doc_prefix = (
+                f"urn:mnemosyne:user:{user_id}:graph:{graph_id}"
+                f":valuation:{document_id.strip()}:"
+            )
+            filters.append(f'FILTER(STRSTARTS(STR(?val), "{doc_prefix}"))')
+
+        if valence == "positive":
+            filters.append("FILTER(xsd:float(?cumVal) > 0)")
+        elif valence == "negative":
+            filters.append("FILTER(xsd:float(?cumVal) < 0)")
+
+        filter_clause = "\n  ".join(filters)
+
+        query = f"""
+PREFIX doc: <http://mnemosyne.dev/doc#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+SELECT ?val ?blockRef ?cumImp ?cumVal ?lastVal
+WHERE {{
+  ?val doc:blockRef ?blockRef .
+  ?val doc:cumulativeImportance ?cumImp .
+  ?val doc:cumulativeValence ?cumVal .
+  OPTIONAL {{ ?val doc:lastValuatedAt ?lastVal }}
+  {filter_clause}
+}}
+ORDER BY DESC(xsd:float(?cumImp))
+LIMIT {min(limit * 3, 60)}
+"""
+        rows = await _sparql_query(backend_config, job_stream, auth, graph_id, query)
+
+        # Load weights
+        weights = dict(DEFAULT_WEIGHTS)
+        try:
+            await _ensure_scratchpad(hp_client, graph_id, auth)
+            await hp_client.connect_document(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
+            w_channel = hp_client.get_document_channel(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
+            if w_channel:
+                w_reader = DocumentReader(w_channel.doc)
+                weights = _parse_weights_text(tiptap_xml_to_markdown(w_reader.to_xml()))
+        except Exception:
+            pass
+
+        # Build wire indexes
+        doc_wire_counts: Dict[str, int] = {}
+        block_wire_counts: Dict[str, int] = {}
+        doc_newest_wire: Dict[str, str] = {}
+        ws_doc = None
+        try:
+            await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
+            ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
+            if ws_channel:
+                ws_doc = ws_channel.doc
+                all_wires = _get_all_wires(ws_doc)
+                doc_wire_counts, block_wire_counts, doc_newest_wire = _build_wire_indexes(all_wires)
+        except Exception:
+            pass
+
+        now = datetime.now(timezone.utc)
+
+        # Score and rank
+        scored = []
+        for row in rows:
+            cum_imp = float(row.get("cumImp", 0))
+            cum_val = float(row.get("cumVal", 0))
+
+            block_ref = row.get("blockRef", "")
+            parsed_doc_id = ""
+            parsed_block_id = ""
+            if "#block-" in block_ref:
+                pre, _, parsed_block_id = block_ref.rpartition("#block-")
+                if ":doc:" in pre:
+                    parsed_doc_id = pre.rpartition(":doc:")[2]
+
+            last_val_str = row.get("lastVal", "")
+            doc_age_days = 0.0
+            if last_val_str:
+                try:
+                    last_val_dt = datetime.fromisoformat(last_val_str.replace("Z", "+00:00"))
+                    doc_age_days = max(0.0, (now - last_val_dt).total_seconds() / 86400.0)
+                except (ValueError, TypeError):
+                    pass
+
+            bwc = block_wire_counts.get(parsed_block_id, 0)
+            dwc = doc_wire_counts.get(parsed_doc_id, 0)
+
+            wire_age_days = 0.0
+            newest_wire = doc_newest_wire.get(parsed_doc_id, "")
+            if newest_wire:
+                try:
+                    wire_dt = datetime.fromisoformat(newest_wire.replace("Z", "+00:00"))
+                    wire_age_days = max(0.0, (now - wire_dt).total_seconds() / 86400.0)
+                except (ValueError, TypeError):
+                    pass
+
+            composite = _compute_composite_score(
+                importance=cum_imp, valence=cum_val,
+                doc_age_days=doc_age_days, block_wire_count=bwc,
+                doc_wire_count=dwc, wire_age_days=wire_age_days,
+                weights=weights,
+            )
+
+            scored.append({
+                "doc_id": parsed_doc_id,
+                "block_id": parsed_block_id,
+                "composite": composite,
+                "importance": round(cum_imp, 3),
+                "valence": round(cum_val, 3),
+                "block_wires": bwc,
+                "doc_wires": dwc,
+            })
+
+        scored.sort(key=lambda b: b["composite"], reverse=True)
+        scored = scored[:limit]
+
+        # Fetch content and titles for the top blocks
+        results = []
+        # Group by doc_id to minimize connections
+        doc_groups: Dict[str, list] = {}
+        for item in scored:
+            doc_groups.setdefault(item["doc_id"], []).append(item)
+
+        for did, items in doc_groups.items():
+            title = _resolve_title_from_workspace(ws_doc, did) or did
+            try:
+                await hp_client.connect_document(graph_id, did, user_id=auth.user_id)
+                channel = hp_client.get_document_channel(graph_id, did, user_id=auth.user_id)
+                if channel is None:
+                    continue
+                reader = DocumentReader(channel.doc)
+                for item in items:
+                    block_info = reader.get_block_info(item["block_id"])
+                    content = block_info["text_content"] if block_info else "(deleted)"
+                    results.append({
+                        "content": content,
+                        "document": title,
+                        "score": item["composite"],
+                        "importance": item["importance"],
+                        "valence": item["valence"],
+                        "block_id": item["block_id"],
+                        "doc_id": item["doc_id"],
+                        "block_wires": item["block_wires"],
+                        "doc_wires": item["doc_wires"],
+                    })
+            except Exception:
+                for item in items:
+                    results.append({
+                        "content": "(unavailable)",
+                        "document": title,
+                        "score": item["composite"],
+                        "importance": item["importance"],
+                        "valence": item["valence"],
+                        "block_id": item["block_id"],
+                        "doc_id": item["doc_id"],
+                        "block_wires": item["block_wires"],
+                        "doc_wires": item["doc_wires"],
+                    })
+
+        # Re-sort since doc grouping may have scrambled order
+        results.sort(key=lambda b: b["score"], reverse=True)
+
+        return _render_json({"blocks": results, "count": len(results)})
 
     @server.tool(
         name="get_values",
