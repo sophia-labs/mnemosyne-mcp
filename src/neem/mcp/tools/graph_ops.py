@@ -251,7 +251,13 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             "Do NOT use 'urn:mnemosyne:schema:doc:' - it will match nothing.\n\n"
             "The graph_id is automatically resolved and injected as a GRAPH or WITH clause. "
             "For INSERT DATA/DELETE DATA, the graph is wrapped automatically. "
-            "For DELETE/INSERT WHERE patterns, a WITH clause is prepended."
+            "For DELETE/INSERT WHERE patterns, a WITH clause is prepended.\n\n"
+            "WARNING: This is an advanced debug tool for power users. Raw SPARQL updates bypass "
+            "CRDT synchronization and can modify or corrupt data managed by the Y.js document layer "
+            "(titles, content, folder structure, etc.). Changes made here will NOT sync to the "
+            "real-time editor and may be overwritten by the next materialization cycle. "
+            "Prefer document and workspace tools for normal operations. Use this only for "
+            "manual RDF cleanup, orphan removal, or debugging materialization issues."
         ),
     )
     async def sparql_update_tool(
@@ -303,6 +309,20 @@ def register_graph_ops_tools(server: FastMCP) -> None:
                 import re
                 sparql = re.sub(
                     r"(DELETE\s+DATA\s*)\{",
+                    rf"\1{{ GRAPH <{graph_uri}> {{",
+                    sparql,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                sparql = sparql.rstrip()
+                if sparql.endswith("}"):
+                    sparql = sparql[:-1] + "} }"
+            elif "DELETE WHERE" in sparql_upper:
+                # DELETE WHERE { ... } → DELETE WHERE { GRAPH <uri> { ... } }
+                # WITH clause does NOT work with DELETE WHERE shorthand
+                import re
+                sparql = re.sub(
+                    r"(DELETE\s+WHERE\s*)\{",
                     rf"\1{{ GRAPH <{graph_uri}> {{",
                     sparql,
                     count=1,
