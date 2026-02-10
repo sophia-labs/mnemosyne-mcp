@@ -414,6 +414,17 @@ class WorkspaceReader:
         self._documents: pycrdt.Map = doc.get("documents", type=pycrdt.Map)
         self._folders: pycrdt.Map = doc.get("folders", type=pycrdt.Map)
 
+    def folder_exists(self, folder_id: str) -> bool:
+        """Check if a folder exists in workspace navigation.
+
+        Args:
+            folder_id: The folder ID
+
+        Returns:
+            True if folder exists in workspace.
+        """
+        return folder_id in self._folders
+
     def get_folder(self, folder_id: str) -> dict[str, Any] | None:
         """Get a folder entry from workspace navigation.
 

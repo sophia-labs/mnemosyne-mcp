@@ -2,7 +2,7 @@
 MCP tools for Project Geist — Sophia's persistent memory, valuation, and self-narrative.
 
 Provides 10 tools organized in three groups:
-- Memory Queue: store_memory, recall, care
+- Memory Queue: remember, recall, care
 - Valuation: valuate, batch_valuate, get_block_values, get_values, revaluate
 - Song: music, sing
 
@@ -681,8 +681,8 @@ def register_geist_tools(server: FastMCP) -> None:
     # ================================================================
 
     @server.tool(
-        name="store_memory",
-        title="Store Memory",
+        name="remember",
+        title="Remember",
         description=(
             "Append a numbered memory to the agent's memory queue. Returns the assigned number. "
             "The memory queue is a FIFO working-memory buffer — use it for rapid capture of "

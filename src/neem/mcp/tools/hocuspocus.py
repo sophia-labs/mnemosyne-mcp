@@ -368,6 +368,7 @@ GROUP BY ?docId
 Formats (set via 'format' parameter):
 - default (None): TipTap XML with full formatting and data-block-id attributes on every block. Use this when you need block IDs for surgical editing (edit_block_text, update_block, insert_block, delete_block) or block-level wire connections.
 - 'markdown': Clean Markdown. Use this when you just need to read/understand a document's content without editing it. Much more compact than XML.
+- 'ids_only': Returns just the ordered list of block IDs and count, no content. Use this when you already know the content but need block IDs for wiring or editing.
 
 XML block types: paragraph, heading (level="1-3"), bulletList, orderedList, blockquote, codeBlock (language="..."), taskList (taskItem checked="true"), horizontalRule, image (src="...", alt="...")
 XML marks (nestable): strong, em, strike, code, mark (highlight), a (href="..."), footnote (data-footnote-content="..."), commentMark (data-comment-id="...")
@@ -392,8 +393,8 @@ Works for all documents including uploaded files (which are documents with readO
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
-        if format and format not in ("xml", "markdown"):
-            raise ValueError("format must be 'xml' or 'markdown'")
+        if format and format not in ("xml", "markdown", "ids_only"):
+            raise ValueError("format must be 'xml', 'markdown', or 'ids_only'")
 
         try:
             # Validate document exists in workspace before connecting
@@ -421,6 +422,23 @@ Works for all documents including uploaded files (which are documents with readO
             reader = DocumentReader(channel.doc)
             xml_content = reader.to_xml()
             comments = reader.get_all_comments()
+
+            # ids_only: return just the ordered list of block IDs, no content
+            if format == "ids_only":
+                fragment = reader.get_content_fragment()
+                block_ids = []
+                for child in fragment.children:
+                    if hasattr(child, "attributes"):
+                        bid = child.attributes.get("data-block-id")
+                        if bid:
+                            block_ids.append(bid)
+                return {
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "format": "ids_only",
+                    "block_ids": block_ids,
+                    "block_count": len(block_ids),
+                }
 
             # Convert to requested format
             if format == "markdown":
@@ -582,6 +600,8 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}
 
 Markdown is also accepted and auto-converted to TipTap XML.
 
+Returns block_ids: an ordered list of all block IDs in the written document, enabling immediate block-level wiring without a separate read call.
+
 NOT for: editing existing documents (use edit_block_text, update_block, or insert_block instead). Only use write_document for brand-new documents or when the user explicitly asks for a full rewrite.""",
     )
     async def write_document_tool(
@@ -623,6 +643,18 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 user_id=auth.user_id,
             )
 
+            # Collect block IDs from the written document
+            channel = hp_client.get_document_channel(graph_id, document_id, user_id=auth.user_id)
+            block_ids = []
+            if channel:
+                reader = DocumentReader(channel.doc)
+                fragment = reader.get_content_fragment()
+                for child in fragment.children:
+                    if hasattr(child, "attributes"):
+                        bid = child.attributes.get("data-block-id")
+                        if bid:
+                            block_ids.append(bid)
+
             # 2. Update workspace navigation so document appears in file tree
             # Extract title from first heading, fallback to document_id
             title = extract_title_from_xml(xml_content) or document_id
@@ -638,6 +670,7 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 "graph_id": graph_id,
                 "document_id": document_id,
                 "title": title,
+                "block_ids": block_ids,
             }
 
         except Exception as e:

@@ -458,7 +458,7 @@ async def _wait_for_job_result(
             if event_type in ("failed", "error"):
                 error = event.get("error", "Job failed")
                 return {"status": "failed", "error": error}
-        return {"status": "unknown", "event_count": len(ws_events)}
+        # No terminal event in WS — fall through to poll result
 
     # Try poll result
     if context:

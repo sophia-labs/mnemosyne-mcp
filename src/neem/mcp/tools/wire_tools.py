@@ -357,13 +357,16 @@ def register_wire_tools(server: FastMCP) -> None:
                 "category": info["category"],
             })
 
-        # Scan workspace wires for any custom predicates
+        # Scan workspace wires for any custom predicates not already in built-ins.
+        # Dedup by short name to prevent the same predicate appearing twice
+        # (e.g. a custom URI whose short name matches a built-in).
         try:
             await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
             channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
             if channel and channel.doc:
                 all_wires = _get_all_wires(channel.doc)
                 builtin_uris = set(BUILTIN_PREDICATES.keys())
+                seen_names = {p["name"] for p in predicates}
                 custom_uris: set[str] = set()
 
                 for wire in all_wires:
@@ -372,11 +375,14 @@ def register_wire_tools(server: FastMCP) -> None:
                         custom_uris.add(pred)
 
                 for uri in sorted(custom_uris):
-                    predicates.append({
-                        "name": _get_predicate_short_name(uri),
-                        "label": _get_predicate_label(uri),
-                        "category": "Custom",
-                    })
+                    short_name = _get_predicate_short_name(uri)
+                    if short_name not in seen_names:
+                        seen_names.add(short_name)
+                        predicates.append({
+                            "name": short_name,
+                            "label": _get_predicate_label(uri),
+                            "category": "Custom",
+                        })
         except Exception as e:
             logger.warning(
                 "Failed to scan custom predicates",
