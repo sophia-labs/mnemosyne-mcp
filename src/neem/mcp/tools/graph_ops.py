@@ -360,7 +360,71 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             return _render_json({"success": True})
         return _render_json({"success": False, "error": result.get("error", "Update failed")})
 
-    logger.info("Registered graph operations tools (create, delete, query, update)")
+    @server.tool(
+        name="duplicate_graph",
+        title="Duplicate Knowledge Graph",
+        description=(
+            "Duplicates an entire graph including all documents, folders, wires, and artifacts. "
+            "Creates a new graph with a new ID containing copies of all content from the source graph. "
+            "Document IDs are preserved (they don't collide because S3 paths are scoped by graph_id), "
+            "so all internal wires work without remapping."
+        ),
+    )
+    async def duplicate_graph_tool(
+        source_graph_id: str,
+        new_graph_id: str,
+        new_title: Optional[str] = None,
+        context: Context | None = None,
+    ) -> str:
+        """Duplicate an entire knowledge graph."""
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        if not source_graph_id or not source_graph_id.strip():
+            raise ValueError("source_graph_id is required and cannot be empty")
+        if not new_graph_id or not new_graph_id.strip():
+            raise ValueError("new_graph_id is required and cannot be empty")
+
+        payload = {
+            "source_graph_id": source_graph_id.strip(),
+            "new_graph_id": new_graph_id.strip(),
+        }
+        if new_title:
+            payload["new_title"] = new_title.strip()
+
+        if job_stream:
+            try:
+                await job_stream.ensure_ready()
+            except Exception:
+                pass
+
+        metadata = await submit_job(
+            base_url=backend_config.base_url,
+            auth=auth,
+            task_type="duplicate_graph",
+            payload=payload,
+        )
+
+        if context:
+            await context.report_progress(10, 100)
+
+        result = await _wait_for_job_result(
+            job_stream, metadata, context, auth
+        )
+
+        # Extract inline result if available
+        detail = result.get("detail", {})
+        inline = detail.get("result_inline") if isinstance(detail, dict) else None
+        if inline:
+            return _render_json({"success": True, **inline})
+
+        return _render_json({
+            "success": True,
+            "source_graph_id": source_graph_id.strip(),
+            "new_graph_id": new_graph_id.strip(),
+        })
+
+    logger.info("Registered graph operations tools (create, delete, duplicate, query, update)")
 
 
 async def _wait_for_job_result(
