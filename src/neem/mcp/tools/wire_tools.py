@@ -336,7 +336,8 @@ def register_wire_tools(server: FastMCP) -> None:
             "Categories: Quantity (partOf, contains, exemplifies), Quality (supports, contradicts, qualifies), "
             "Relation (causeOf, consequenceOf, relatedTo), Modality (requires, enables, precedes), "
             "Synthesis (flowsInto, produces, divergesFrom, branchesTo, consumesWith, intensifiesWith). "
-            "Also includes any custom predicates found in the graph's wires."
+            "Also includes any custom predicates found in the graph's wires. "
+            "The returned short names can be passed directly to create_wire's predicate parameter."
         ),
     )
     async def list_wire_predicates_tool(
@@ -395,7 +396,8 @@ def register_wire_tools(server: FastMCP) -> None:
             "Create a semantic wire (connection) between two documents or blocks. "
             "The wire is written directly to the workspace Y.Doc via CRDT, so it "
             "syncs in real-time to the browser and materializes to RDF automatically. "
-            "Use list_wire_predicates to see available predicate URIs. "
+            "Use list_wire_predicates to see available predicates. "
+            "Accepts short predicate names (e.g. 'supports', 'intensifiesWith') — no need for full URIs. "
             "Title/snippet previews are not populated at creation time — use the "
             "UI's refresh action or the backend API to fill them in later.\n\n"
             "Supports four connection modes: document-to-document (default), document-to-block, "
@@ -695,3 +697,116 @@ def register_wire_tools(server: FastMCP) -> None:
 
         except Exception as e:
             raise RuntimeError(f"Failed to traverse wires: {e}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # batch_create_wires
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @server.tool(
+        name="batch_create_wires",
+        title="Batch Create Wires",
+        description=(
+            "Create multiple semantic wires in a single call. More efficient than "
+            "repeated create_wire calls when wiring a cluster of documents. "
+            "Each wire spec requires source_document_id and target_document_id; "
+            "predicate (short name like 'supports'), source_block_id, target_block_id, "
+            "and bidirectional are optional. Returns results for each wire."
+        ),
+    )
+    async def batch_create_wires_tool(
+        graph_id: str,
+        wires: List[Dict[str, Any]],
+        context: Context | None = None,
+    ) -> str:
+        """Create multiple wires in batch."""
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required")
+        if not wires:
+            raise ValueError("wires list is required and must not be empty")
+
+        graph_id = graph_id.strip()
+
+        try:
+            await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
+            channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
+            if channel is None:
+                raise RuntimeError(f"Workspace not connected: {graph_id}")
+
+            created: List[Dict[str, Any]] = []
+            errors: List[Dict[str, Any]] = []
+
+            for i, spec in enumerate(wires):
+                try:
+                    src_doc = spec.get("source_document_id", "").strip()
+                    tgt_doc = spec.get("target_document_id", "").strip()
+                    if not src_doc or not tgt_doc:
+                        errors.append({"index": i, "error": "source_document_id and target_document_id are required"})
+                        continue
+
+                    pred_input = spec.get("predicate")
+                    effective_predicate = _resolve_predicate(pred_input) if pred_input else f"{MNEMO_NS}isWiredTo"
+                    effective_target_graph = spec.get("target_graph_id", graph_id).strip()
+                    bidirectional = bool(spec.get("bidirectional", False))
+                    src_block = spec.get("source_block_id", "").strip() or None
+                    tgt_block = spec.get("target_block_id", "").strip() or None
+
+                    # Validate documents exist
+                    _validate_document_in_ws(channel.doc, graph_id, src_doc)
+                    if effective_target_graph == graph_id:
+                        _validate_document_in_ws(channel.doc, graph_id, tgt_doc)
+
+                    wire_id = f"w-{uuid4().hex[:12]}"
+                    inverse_wire_id = f"{wire_id}-inv" if bidirectional else None
+
+                    # Capture for closure
+                    _src_doc, _tgt_doc = src_doc, tgt_doc
+                    _eff_pred, _eff_tgt_graph = effective_predicate, effective_target_graph
+                    _src_block, _tgt_block = src_block, tgt_block
+                    _bidir, _inv_id, _wid = bidirectional, inverse_wire_id, wire_id
+
+                    def _do_create(doc: pycrdt.Doc, *, wid=_wid, sd=_src_doc, td=_tgt_doc,
+                                   tg=_eff_tgt_graph, pred=_eff_pred, sb=_src_block,
+                                   tb=_tgt_block, bi=_bidir, inv=_inv_id) -> None:
+                        _create_wire_in_doc(
+                            doc, wire_id=wid, source_document_id=sd,
+                            target_graph_id=tg, target_document_id=td,
+                            predicate=pred, source_block_id=sb,
+                            target_block_id=tb, bidirectional=bi, inverse_of=inv,
+                        )
+                        if bi and inv:
+                            _create_wire_in_doc(
+                                doc, wire_id=inv, source_document_id=td,
+                                target_graph_id=graph_id, target_document_id=sd,
+                                predicate=pred, source_block_id=tb,
+                                target_block_id=sb, bidirectional=True, inverse_of=wid,
+                            )
+
+                    await hp_client.transact_workspace(graph_id, _do_create, user_id=auth.user_id)
+
+                    result: Dict[str, Any] = {
+                        "wire_id": wire_id,
+                        "predicate": _get_predicate_short_name(effective_predicate),
+                    }
+                    if bidirectional:
+                        result["bidirectional"] = True
+                    created.append(result)
+
+                    # Best-effort snippet refresh
+                    await _refresh_wire_snapshot(
+                        backend_config.base_url, auth, graph_id, wire_id
+                    )
+
+                except Exception as e:
+                    errors.append({"index": i, "error": str(e)})
+
+            output: Dict[str, Any] = {"created": created, "created_count": len(created)}
+            if errors:
+                output["errors"] = errors
+                output["error_count"] = len(errors)
+            return json.dumps(output)
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to batch create wires: {e}")
