@@ -242,9 +242,15 @@ def _extract_graphs_from_events(events: list[JsonDict]) -> Optional[list]:
     """Extract graph list from WebSocket job events."""
     for event in reversed(events):  # Check most recent events first
         event_type = event.get("type", "")
-        if event_type in ("job_completed", "completed", "succeeded"):
+        payload = event.get("payload", {})
+        payload_status = payload.get("status", "") if isinstance(payload, dict) else ""
+
+        is_success = (
+            event_type in ("job_completed", "completed", "succeeded")
+            or (event_type == "job_update" and payload_status == "succeeded")
+        )
+        if is_success:
             # Result might be in payload.detail.result_inline or directly in payload
-            payload = event.get("payload", {})
             if isinstance(payload, dict):
                 detail = payload.get("detail", {})
                 if isinstance(detail, dict):
