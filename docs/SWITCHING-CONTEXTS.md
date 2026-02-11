@@ -17,3 +17,9 @@ Then restart Claude Code (`/exit` and reopen).
 - If you've made code changes to the MCP server, reinstall with `uv tool install -e . --force` before restarting Claude Code.
 - `~/.claude.json` takes precedence over `~/.claude/settings.json` for `mcpServers`. Keep the config in one file only.
 - The saved OAuth token at `~/.mnemosyne/config.json` is only used when `MNEMOSYNE_DEV_TOKEN` is not set.
+
+quick copy paste for eschaton for when she wants to do it manually:
+        "MNEMOSYNE_FASTAPI_URL": "https://api.garden.sophia-labs.com",
+        "MNEMOSYNE_FASTAPI_URL": "http://127.0.0.1:8080",
+        "MNEMOSYNE_DEV_USER_ID": "dev-user-001",
+        "MNEMOSYNE_DEV_TOKEN": "dev-user-001",
