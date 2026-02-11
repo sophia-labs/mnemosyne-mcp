@@ -12,6 +12,7 @@ import json
 import math
 import mimetypes
 import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -126,7 +127,7 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
         - valued_doc_ids: all docs that have any valuations (for enriched collapse counts)
 
         Documents with no valuations are NOT excluded (unscored docs always pass).
-        Documents in the Agent Scratchpad are never excluded (infrastructure protection).
+        Documents in _sophia are never excluded (infrastructure protection).
 
         Document score uses bicameral approach: avg importance + avg valence are
         normalized for doc size, but max importance ensures a single extraordinary
@@ -703,12 +704,18 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
         text: str,
         context: Context | None = None,
     ) -> dict:
-        """Append a block to a document.
+        """Append one or more blocks to a document.
+
+        Accepts markdown or TipTap XML with multiple blocks and automatically
+        breaks them into individual append operations within a single transaction.
 
         Args:
             graph_id: The graph containing the document
             document_id: The document to append to
-            text: TipTap XML content. If it doesn't start with '<', it's wrapped in <paragraph>.
+            text: Content to append. Can be:
+                - Plain text (wrapped in <paragraph>)
+                - Markdown (converted to TipTap XML)
+                - TipTap XML (single or multiple blocks)
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
@@ -727,24 +734,41 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             # Connect to the document channel with user context
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
-            # Auto-wrap plain text in a paragraph element
-            content = _ensure_xml(text)
+            # Convert to XML, handling multiple blocks
+            content = _ensure_xml_multiblock(text)
 
-            new_block_id: str = ""
+            # Parse to extract individual block elements
+            # Wrap in a root element to handle multiple top-level blocks
+            blocks_xml: list[str] = []
+            try:
+                wrapped = f"<root>{content}</root>"
+                root = ET.fromstring(wrapped)
+                blocks = list(root)  # Extract all child elements
+            except ET.ParseError:
+                # If parsing fails, treat as single block (fallback to old behavior)
+                blocks_xml = [content]
+            else:
+                # Convert each element back to XML string
+                blocks_xml = [ET.tostring(block, encoding='unicode') for block in blocks]
+
+            new_block_ids: list[str] = []
 
             def perform_append(doc: Any) -> None:
-                nonlocal new_block_id
+                nonlocal new_block_ids
                 writer = DocumentWriter(doc)
-                writer.append_block(content)
-                # Get the last block's ID
                 reader = DocumentReader(doc)
-                count = reader.get_block_count()
-                if count > 0:
-                    block = reader.get_block_at(count - 1)
-                    if block and hasattr(block, "attributes"):
-                        # pycrdt XmlAttributesView.get() doesn't support default arg
-                        attrs = block.attributes
-                        new_block_id = attrs.get("data-block-id") if "data-block-id" in attrs else ""
+
+                for block_xml in blocks_xml:
+                    writer.append_block(block_xml)
+                    # Get the last block's ID after each append
+                    count = reader.get_block_count()
+                    if count > 0:
+                        block = reader.get_block_at(count - 1)
+                        if block and hasattr(block, "attributes"):
+                            attrs = block.attributes
+                            block_id = attrs.get("data-block-id") if "data-block-id" in attrs else ""
+                            if block_id:
+                                new_block_ids.append(block_id)
 
             await hp_client.transact_document(
                 graph_id.strip(),
@@ -757,7 +781,9 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 "success": True,
                 "graph_id": graph_id.strip(),
                 "document_id": document_id.strip(),
-                "new_block_id": new_block_id,
+                "new_block_id": new_block_ids[-1] if new_block_ids else "",
+                "block_ids": new_block_ids,  # Return all appended block IDs
+                "blocks_appended": len(new_block_ids),
             }
             return result
 
