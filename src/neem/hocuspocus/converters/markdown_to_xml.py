@@ -22,7 +22,7 @@ import mistune
 # Singleton parser with plugins enabled
 _md_parser = mistune.create_markdown(
     renderer="ast",
-    plugins=["strikethrough", "task_lists", "footnotes"],
+    plugins=["strikethrough", "task_lists", "footnotes", "table"],
 )
 
 
@@ -111,6 +111,9 @@ def _convert_block(node: dict, footnotes: dict[str, str]) -> str:
     if ntype == "thematic_break":
         return "<horizontalRule/>"
 
+    if ntype == "table":
+        return _convert_table(node, footnotes)
+
     if ntype in ("blank_line", "footnotes"):
         return ""
 
@@ -156,6 +159,51 @@ def _convert_blockquote(node: dict, footnotes: dict[str, str]) -> str:
         if xml:
             parts.append(xml)
     return f'<blockquote>{"".join(parts)}</blockquote>'
+
+
+def _convert_table(node: dict, footnotes: dict[str, str]) -> str:
+    """Convert a table AST node to TipTap table XML.
+
+    Mistune table structure:
+    - table_head: contains table_cell directly (no table_row wrapper)
+    - table_body: contains table_row, which contains table_cell
+    """
+    rows: list[str] = []
+
+    for section in node.get("children", []):
+        section_type = section.get("type", "")
+
+        if section_type == "table_head":
+            # Header row: table_head contains table_cell directly
+            cells: list[str] = []
+            for cell_node in section.get("children", []):
+                if cell_node.get("type") != "table_cell":
+                    continue
+                content = _convert_inline_children(cell_node.get("children", []), footnotes)
+                cells.append(f"<tableHeader><paragraph>{content}</paragraph></tableHeader>")
+
+            if cells:
+                rows.append(f'<tableRow>{"".join(cells)}</tableRow>')
+
+        elif section_type == "table_body":
+            # Body rows: table_body > table_row > table_cell
+            for row_node in section.get("children", []):
+                if row_node.get("type") != "table_row":
+                    continue
+
+                cells: list[str] = []
+                for cell_node in row_node.get("children", []):
+                    if cell_node.get("type") != "table_cell":
+                        continue
+                    content = _convert_inline_children(cell_node.get("children", []), footnotes)
+                    cells.append(f"<tableCell><paragraph>{content}</paragraph></tableCell>")
+
+                if cells:
+                    rows.append(f'<tableRow>{"".join(cells)}</tableRow>')
+
+    if rows:
+        return f'<table>{"".join(rows)}</table>'
+    return ""
 
 
 # ---------------------------------------------------------------------------

@@ -150,6 +150,10 @@ BLOCK_TYPES = frozenset({
     "blockquote",
     "codeBlock",
     "horizontalRule",
+    "table",
+    "tableRow",
+    "tableHeader",
+    "tableCell",
 })
 
 # List container elements that should be flattened to listItem blocks
