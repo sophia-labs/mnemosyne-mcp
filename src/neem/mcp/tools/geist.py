@@ -6,8 +6,8 @@ Provides 10 tools organized in three groups:
 - Valuation: valuate, batch_valuate, get_block_values, get_values, revaluate
 - Song: music, sing
 
-All state lives in the graph as standard Sophia documents. The "agent scratchpad"
-is a folder structure auto-created on first use of any Geist tool.
+All state lives in the graph as standard Sophia documents. The "_sophia" folder
+is auto-created on first use of any Geist tool.
 """
 
 from __future__ import annotations
@@ -318,7 +318,7 @@ async def _ensure_scratchpad(
     def create_workspace_structure(doc: pycrdt.Doc) -> None:
         ws = WorkspaceWriter(doc)
         # Root scratchpad folder
-        ws.upsert_folder(SCRATCHPAD_FOLDER_ID, "Agent Scratchpad")
+        ws.upsert_folder(SCRATCHPAD_FOLDER_ID, "_sophia")
         # Memory queue at scratchpad root
         ws.upsert_document(MEMORY_QUEUE_DOC_ID, "Memory Queue", parent_id=SCRATCHPAD_FOLDER_ID)
         # present/ folder
