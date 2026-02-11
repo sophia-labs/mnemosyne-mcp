@@ -154,8 +154,6 @@ def register_basic_tools(server: FastMCP) -> None:
         trace("FAIL: Could not extract graphs from any source")
         return _render_json({
             "error": "Failed to extract graph list from job result",
-            "job_id": metadata.job_id,
-            "status": poll_payload.get("status") if poll_payload else None,
         })
 
 
@@ -430,4 +428,4 @@ async def _request_json(
 
 
 def _render_json(payload: JsonDict) -> str:
-    return json.dumps(payload, indent=2, sort_keys=True)
+    return json.dumps(payload, sort_keys=True)

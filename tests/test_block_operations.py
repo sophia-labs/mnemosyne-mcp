@@ -115,6 +115,26 @@ class TestDocumentReader:
         assert info["context"]["prev_block_id"] is not None
         assert info["context"]["next_block_id"] is not None
 
+    def test_query_blocks_includes_neighbors(self, populated_doc):
+        """Test that query_blocks results include prev/next block IDs."""
+        reader = DocumentReader(populated_doc)
+
+        all_blocks = reader.query_blocks()
+        assert len(all_blocks) >= 3
+
+        # First block should have no prev, but has next
+        assert all_blocks[0]["prev_block_id"] is None
+        assert all_blocks[0]["next_block_id"] is not None
+
+        # Last block should have prev, but no next
+        assert all_blocks[-1]["prev_block_id"] is not None
+        assert all_blocks[-1]["next_block_id"] is None
+
+        # Middle block should have both
+        mid = all_blocks[1]
+        assert mid["prev_block_id"] is not None
+        assert mid["next_block_id"] is not None
+
     def test_query_blocks_by_type(self, populated_doc):
         """Test querying blocks by type."""
         reader = DocumentReader(populated_doc)

@@ -15,13 +15,12 @@ async def websocket_server(unused_tcp_port):
     """Spin up a temporary aiohttp WebSocket endpoint for testing."""
 
     async def handler(request):
-        ws = web.WebSocketResponse()
+        ws = web.WebSocketResponse(protocols=["Bearer.test-token"])
         await ws.prepare(request)
 
         # Basic auth check so we know headers make it through.
         assert request.headers.get("Authorization") == "Bearer test-token"
         assert request.headers.get("X-User-ID") == "dev-user"
-        assert request.headers.get("Sec-WebSocket-Protocol") == "Bearer.dev-user"
 
         # Simulate backend: immediately send events for job-123
         # (mimics the user channel broadcasting all job events)

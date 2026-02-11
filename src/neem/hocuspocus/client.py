@@ -194,6 +194,17 @@ class HocuspocusClient:
                 user_id=user_id,
             )
 
+    async def refresh_session(self, user_id: str) -> None:
+        """Close and reconnect the session channel to get fresh state.
+
+        The session WebSocket doesn't receive incremental Y.js updates
+        after initial sync, so we reconnect to get the latest state.
+        """
+        if self._session_channel is not None:
+            await self._close_channel(self._session_channel)
+            self._session_channel = None
+        await self.ensure_session_connected(user_id)
+
     async def _connect_channel(
         self,
         channel: ChannelState,
@@ -854,41 +865,53 @@ class HocuspocusClient:
             },
         )
 
-        # Only send if there are actual changes and connection is alive
-        if incremental_update and channel.ws and not channel.ws.closed:
-            encoded_message = encode_sync_update(incremental_update)
-            logger.info(
-                "transact_document: sending encoded sync_update",
-                extra_context={
-                    "graph_id": graph_id,
-                    "doc_id": doc_id,
-                    "raw_update_size": len(incremental_update),
-                    "encoded_message_size": len(encoded_message),
-                    "encoded_hex_preview": encoded_message[:50].hex(),
-                    "ws_closed": channel.ws.closed,
-                },
+        # Only send if there are actual changes
+        if not incremental_update:
+            logger.debug(
+                "transact_document: no changes detected (empty diff)",
+                extra_context={"graph_id": graph_id, "doc_id": doc_id},
             )
-            await channel.ws.send_bytes(encoded_message)
-            logger.info(
-                "transact_document: SENT to server",
+            return
+
+        # Connection must be alive to persist changes
+        if not channel.ws or channel.ws.closed:
+            logger.error(
+                "transact_document: WebSocket closed, cannot persist changes",
                 extra_context={
                     "graph_id": graph_id,
                     "doc_id": doc_id,
                     "update_size": len(incremental_update),
-                },
-            )
-        else:
-            logger.warning(
-                "transact_document: NOT sending update",
-                extra_context={
-                    "graph_id": graph_id,
-                    "doc_id": doc_id,
-                    "has_update": bool(incremental_update),
-                    "update_size": len(incremental_update) if incremental_update else 0,
                     "has_ws": channel.ws is not None,
                     "ws_closed": channel.ws.closed if channel.ws else True,
                 },
             )
+            raise RuntimeError(
+                f"Cannot persist document changes: WebSocket connection to "
+                f"'{doc_id}' is closed. The local document was modified but "
+                f"the update was NOT sent to the server. Reconnect and retry."
+            )
+
+        encoded_message = encode_sync_update(incremental_update)
+        logger.info(
+            "transact_document: sending encoded sync_update",
+            extra_context={
+                "graph_id": graph_id,
+                "doc_id": doc_id,
+                "raw_update_size": len(incremental_update),
+                "encoded_message_size": len(encoded_message),
+                "encoded_hex_preview": encoded_message[:50].hex(),
+                "ws_closed": channel.ws.closed,
+            },
+        )
+        await channel.ws.send_bytes(encoded_message)
+        logger.info(
+            "transact_document: SENT to server",
+            extra_context={
+                "graph_id": graph_id,
+                "doc_id": doc_id,
+                "update_size": len(incremental_update),
+            },
+        )
 
     # -------------------------------------------------------------------------
     # Cleanup

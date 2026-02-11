@@ -88,9 +88,6 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             "success": True,
             "graph_id": graph_id.strip(),
             "title": title.strip(),
-            "description": description.strip() if description else None,
-            "job_id": metadata.job_id,
-            **result,
         })
 
     @server.tool(
@@ -142,10 +139,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         return _render_json({
             "success": True,
             "graph_id": graph_id.strip(),
-            "deleted": True,
             "hard_delete": hard,
-            "job_id": metadata.job_id,
-            **result,
         })
 
     @server.tool(
@@ -240,17 +234,9 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         # Extract query results from job output
         query_result = _extract_query_result(result)
         if query_result is not None:
-            return _render_json({
-                "success": True,
-                "results": query_result,
-                "job_id": metadata.job_id,
-            })
+            return _render_json({"results": query_result})
 
-        return _render_json({
-            "success": True,
-            "job_id": metadata.job_id,
-            **result,
-        })
+        return _render_json({"success": True, **result})
 
     @server.tool(
         name="sparql_update",
@@ -265,7 +251,13 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             "Do NOT use 'urn:mnemosyne:schema:doc:' - it will match nothing.\n\n"
             "The graph_id is automatically resolved and injected as a GRAPH or WITH clause. "
             "For INSERT DATA/DELETE DATA, the graph is wrapped automatically. "
-            "For DELETE/INSERT WHERE patterns, a WITH clause is prepended."
+            "For DELETE/INSERT WHERE patterns, a WITH clause is prepended.\n\n"
+            "WARNING: This is an advanced debug tool for power users. Raw SPARQL updates bypass "
+            "CRDT synchronization and can modify or corrupt data managed by the Y.js document layer "
+            "(titles, content, folder structure, etc.). Changes made here will NOT sync to the "
+            "real-time editor and may be overwritten by the next materialization cycle. "
+            "Prefer document and workspace tools for normal operations. Use this only for "
+            "manual RDF cleanup, orphan removal, or debugging materialization issues."
         ),
     )
     async def sparql_update_tool(
@@ -325,6 +317,20 @@ def register_graph_ops_tools(server: FastMCP) -> None:
                 sparql = sparql.rstrip()
                 if sparql.endswith("}"):
                     sparql = sparql[:-1] + "} }"
+            elif "DELETE WHERE" in sparql_upper:
+                # DELETE WHERE { ... } → DELETE WHERE { GRAPH <uri> { ... } }
+                # WITH clause does NOT work with DELETE WHERE shorthand
+                import re
+                sparql = re.sub(
+                    r"(DELETE\s+WHERE\s*)\{",
+                    rf"\1{{ GRAPH <{graph_uri}> {{",
+                    sparql,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                sparql = sparql.rstrip()
+                if sparql.endswith("}"):
+                    sparql = sparql[:-1] + "} }"
             else:
                 # For other updates (INSERT/DELETE WHERE), prepend WITH clause
                 sparql = f"WITH <{graph_uri}>\n{sparql}"
@@ -350,13 +356,75 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         )
 
         job_succeeded = result.get("status") != "failed"
+        if job_succeeded:
+            return _render_json({"success": True})
+        return _render_json({"success": False, "error": result.get("error", "Update failed")})
+
+    @server.tool(
+        name="duplicate_graph",
+        title="Duplicate Knowledge Graph",
+        description=(
+            "Duplicates an entire graph including all documents, folders, wires, and artifacts. "
+            "Creates a new graph with a new ID containing copies of all content from the source graph. "
+            "Document IDs are preserved (they don't collide because S3 paths are scoped by graph_id), "
+            "so all internal wires work without remapping."
+        ),
+    )
+    async def duplicate_graph_tool(
+        source_graph_id: str,
+        new_graph_id: str,
+        new_title: Optional[str] = None,
+        context: Context | None = None,
+    ) -> str:
+        """Duplicate an entire knowledge graph."""
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        if not source_graph_id or not source_graph_id.strip():
+            raise ValueError("source_graph_id is required and cannot be empty")
+        if not new_graph_id or not new_graph_id.strip():
+            raise ValueError("new_graph_id is required and cannot be empty")
+
+        payload = {
+            "source_graph_id": source_graph_id.strip(),
+            "new_graph_id": new_graph_id.strip(),
+        }
+        if new_title:
+            payload["new_title"] = new_title.strip()
+
+        if job_stream:
+            try:
+                await job_stream.ensure_ready()
+            except Exception:
+                pass
+
+        metadata = await submit_job(
+            base_url=backend_config.base_url,
+            auth=auth,
+            task_type="duplicate_graph",
+            payload=payload,
+        )
+
+        if context:
+            await context.report_progress(10, 100)
+
+        result = await _wait_for_job_result(
+            job_stream, metadata, context, auth
+        )
+
+        # Extract inline result if available
+        detail = result.get("detail", {})
+        inline = detail.get("result_inline") if isinstance(detail, dict) else None
+        if inline:
+            return _render_json({"success": True, **inline})
+
         return _render_json({
-            "success": job_succeeded,
-            "job_id": metadata.job_id,
-            **result,
+            "success": True,
+            "source_graph_id": source_graph_id.strip(),
+            "new_graph_id": new_graph_id.strip(),
         })
 
-    logger.info("Registered graph operations tools (create, delete, query, update)")
+    logger.info("Registered graph operations tools (create, delete, duplicate, query, update)")
 
 
 async def _wait_for_job_result(
@@ -390,7 +458,7 @@ async def _wait_for_job_result(
             if event_type in ("failed", "error"):
                 error = event.get("error", "Job failed")
                 return {"status": "failed", "error": error}
-        return {"status": "unknown", "event_count": len(ws_events)}
+        # No terminal event in WS — fall through to poll result
 
     # Try poll result
     if context:
@@ -433,4 +501,4 @@ def _extract_query_result(result: JsonDict) -> Optional[Any]:
 
 
 def _render_json(payload: JsonDict) -> str:
-    return json.dumps(payload, indent=2, sort_keys=True, default=str)
+    return json.dumps(payload, sort_keys=True, default=str)
