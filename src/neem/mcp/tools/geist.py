@@ -338,7 +338,10 @@ async def _ensure_scratchpad(
         graph_id, create_workspace_structure, user_id=auth.user_id
     )
 
-    # 2. Write seed content to each document
+    # 2. Write seed content to each document — but NEVER overwrite existing content.
+    # This is the critical safety net: even if the workspace guard check above
+    # fails spuriously (race condition, Redis eviction, CRDT sync issue), we
+    # must not destroy existing memories, songs, or valuations.
     seed_docs = {
         MEMORY_QUEUE_DOC_ID: SEED_MEMORY_QUEUE,
         SONG_DOC_ID: SEED_SONG,
@@ -349,6 +352,22 @@ async def _ensure_scratchpad(
 
     for doc_id, content in seed_docs.items():
         await hp_client.connect_document(graph_id, doc_id, user_id=auth.user_id)
+
+        # Check if document already has content before writing seed
+        doc_channel = hp_client.get_document_channel(graph_id, doc_id, user_id=auth.user_id)
+        if doc_channel is not None:
+            try:
+                content_frag = doc_channel.doc.get("content", type=pycrdt.XmlFragment)
+                existing_text = str(content_frag).strip()
+                if existing_text:
+                    logger.info(
+                        "Skipping seed — document already has content",
+                        extra_context={"doc_id": doc_id, "content_length": len(existing_text)},
+                    )
+                    continue
+            except Exception:
+                pass  # If we can't read content, proceed with seeding
+
         await hp_client.transact_document(
             graph_id,
             doc_id,

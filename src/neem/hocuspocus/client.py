@@ -101,6 +101,12 @@ class HocuspocusClient:
         self._workspace_channels: Dict[str, ChannelState] = {}  # graph_id -> state
         self._document_channels: Dict[str, ChannelState] = {}  # graph_id:doc_id -> state
 
+        # Per-key connection locks to prevent concurrent channel creation races.
+        # Without these, parallel callers can overwrite each other's ChannelState,
+        # causing one caller to read from an unsynced channel.
+        self._workspace_connect_locks: Dict[str, asyncio.Lock] = {}
+        self._document_connect_locks: Dict[str, asyncio.Lock] = {}
+
         # Shutdown flag
         self._closed = False
 
@@ -584,21 +590,37 @@ class HocuspocusClient:
         """
         effective_user_id = user_id or self._dev_user_id
         channel_key = f"{effective_user_id}:{graph_id}"
+
+        # Fast path: already connected and synced (no lock needed)
         if channel_key in self._workspace_channels:
             channel = self._workspace_channels[channel_key]
             if channel.ws and not channel.ws.closed and channel.synced.is_set():
-                return  # Already connected and synced
+                return
 
-        channel = ChannelState()
-        self._workspace_channels[channel_key] = channel
+        # Slow path: acquire per-key lock to prevent concurrent channel creation.
+        # Without this, parallel callers (e.g. orientation batch: music + recall +
+        # get_important_blocks) can overwrite each other's ChannelState, causing
+        # one caller to read from an unsynced empty channel.
+        if channel_key not in self._workspace_connect_locks:
+            self._workspace_connect_locks[channel_key] = asyncio.Lock()
 
-        async with channel.lock:
-            await self._connect_channel(
-                channel,
-                f"/hocuspocus/workspace/{effective_user_id}/{graph_id}",
-                f"workspace:{graph_id}",
-                user_id=user_id,
-            )
+        async with self._workspace_connect_locks[channel_key]:
+            # Re-check under lock (another caller may have connected while we waited)
+            if channel_key in self._workspace_channels:
+                channel = self._workspace_channels[channel_key]
+                if channel.ws and not channel.ws.closed and channel.synced.is_set():
+                    return
+
+            channel = ChannelState()
+            self._workspace_channels[channel_key] = channel
+
+            async with channel.lock:
+                await self._connect_channel(
+                    channel,
+                    f"/hocuspocus/workspace/{effective_user_id}/{graph_id}",
+                    f"workspace:{graph_id}",
+                    user_id=user_id,
+                )
 
     def get_workspace_channel(
         self, graph_id: str, user_id: Optional[str] = None
@@ -708,21 +730,33 @@ class HocuspocusClient:
         effective_user_id = user_id or self._dev_user_id
         key = f"{effective_user_id}:{graph_id}:{doc_id}"
 
+        # Fast path: already connected and synced
         if key in self._document_channels:
             channel = self._document_channels[key]
             if channel.ws and not channel.ws.closed and channel.synced.is_set():
-                return  # Already connected and synced
+                return
 
-        channel = ChannelState()
-        self._document_channels[key] = channel
+        # Slow path: acquire per-key lock to prevent concurrent channel creation
+        if key not in self._document_connect_locks:
+            self._document_connect_locks[key] = asyncio.Lock()
 
-        async with channel.lock:
-            await self._connect_channel(
-                channel,
-                f"/hocuspocus/docs/{graph_id}/{doc_id}",
-                f"doc:{graph_id}:{doc_id}",
-                user_id=user_id,
-            )
+        async with self._document_connect_locks[key]:
+            # Re-check under lock
+            if key in self._document_channels:
+                channel = self._document_channels[key]
+                if channel.ws and not channel.ws.closed and channel.synced.is_set():
+                    return
+
+            channel = ChannelState()
+            self._document_channels[key] = channel
+
+            async with channel.lock:
+                await self._connect_channel(
+                    channel,
+                    f"/hocuspocus/docs/{graph_id}/{doc_id}",
+                    f"doc:{graph_id}:{doc_id}",
+                    user_id=user_id,
+                )
 
     def get_document_channel(
         self, graph_id: str, doc_id: str, user_id: Optional[str] = None
