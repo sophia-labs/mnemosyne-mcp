@@ -13,11 +13,14 @@ is auto-created on first use of any Geist tool.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import html as html_mod
 import json
 import math
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pycrdt
@@ -209,6 +212,38 @@ def _write_geist_meta(writer: DocumentWriter, meta: dict, meta_block_id: str) ->
     escaped = html_mod.escape(json_str)
     new_content = f"<paragraph>{GEIST_META_PREFIX}{escaped}</paragraph>"
     writer.replace_block_by_id(meta_block_id, new_content)
+
+
+# ── Cross-process lock for memory queue meta ──────────────────────────
+
+_GEIST_LOCK_DIR = Path.home() / ".sophia" / "locks"
+
+
+@asynccontextmanager
+async def _geist_file_lock(graph_id: str):
+    """Cross-process exclusive lock for serializing geist meta read-modify-write.
+
+    Prevents race conditions where concurrent remember()/care() calls from
+    different MCP server processes read the same next_number and produce
+    duplicate memory numbers or corrupt the meta block.
+
+    Uses fcntl.flock via thread executor to avoid blocking the event loop.
+    Includes a brief sleep after acquisition to allow pending CRDT sync
+    messages to propagate from other processes.
+    """
+    _GEIST_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", graph_id)
+    lock_path = _GEIST_LOCK_DIR / f"geist-{safe_id}.lock"
+    fd = open(lock_path, "w")
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: fcntl.flock(fd, fcntl.LOCK_EX))
+        # Let pending WebSocket CRDT sync messages from other processes propagate
+        await asyncio.sleep(0.05)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
 
 
 def _parse_weights_text(text: str) -> dict:
@@ -723,46 +758,47 @@ def register_geist_tools(server: FastMCP) -> None:
         graph_id = graph_id.strip()
         await _ensure_scratchpad(hp_client, graph_id, auth)
 
-        # Connect and read metadata from the meta block
-        await hp_client.connect_document(graph_id, MEMORY_QUEUE_DOC_ID, user_id=auth.user_id)
-        channel = hp_client.get_document_channel(graph_id, MEMORY_QUEUE_DOC_ID, user_id=auth.user_id)
-        reader = DocumentReader(channel.doc)
-        meta, meta_block_id = _read_geist_meta(reader)
-        next_num = meta.get("next_number", 1)
-        memories = meta.get("memories", {})
-
         now = _now_iso()
         escaped_content = html_mod.escape(content)
-
         new_block_id: Optional[str] = None
+        next_num: int = 1
 
-        def do_store(doc: pycrdt.Doc) -> None:
-            nonlocal new_block_id
-            writer = DocumentWriter(doc)
-            writer.append_block(f"<paragraph><strong>{next_num}.</strong> {escaped_content}</paragraph>")
+        # File lock serializes meta read-modify-write across MCP server processes
+        async with _geist_file_lock(graph_id):
+            await hp_client.connect_document(graph_id, MEMORY_QUEUE_DOC_ID, user_id=auth.user_id)
+            channel = hp_client.get_document_channel(graph_id, MEMORY_QUEUE_DOC_ID, user_id=auth.user_id)
+            reader = DocumentReader(channel.doc)
+            meta, meta_block_id = _read_geist_meta(reader)
+            next_num = meta.get("next_number", 1)
+            memories = meta.get("memories", {})
 
-            # Get the block_id of the newly appended block
-            r = DocumentReader(doc)
-            count = r.get_block_count()
-            if count > 0:
-                last_block = r.get_block_at(count - 1)
-                if last_block and hasattr(last_block, "attributes"):
-                    new_block_id = last_block.attributes.get("data-block-id")
+            def do_store(doc: pycrdt.Doc) -> None:
+                nonlocal new_block_id
+                writer = DocumentWriter(doc)
+                writer.append_block(f"<paragraph><strong>{next_num}.</strong> {escaped_content}</paragraph>")
 
-            # Update metadata block with new counter and memory entry
-            memories[str(next_num)] = {
-                "b": new_block_id,
-                "c": now,
-                "a": now,
-            }
-            meta["next_number"] = next_num + 1
-            meta["memories"] = memories
-            if meta_block_id:
-                _write_geist_meta(writer, meta, meta_block_id)
+                # Get the block_id of the newly appended block
+                r = DocumentReader(doc)
+                count = r.get_block_count()
+                if count > 0:
+                    last_block = r.get_block_at(count - 1)
+                    if last_block and hasattr(last_block, "attributes"):
+                        new_block_id = last_block.attributes.get("data-block-id")
 
-        await hp_client.transact_document(
-            graph_id, MEMORY_QUEUE_DOC_ID, do_store, user_id=auth.user_id
-        )
+                # Update metadata block with new counter and memory entry
+                memories[str(next_num)] = {
+                    "b": new_block_id,
+                    "c": now,
+                    "a": now,
+                }
+                meta["next_number"] = next_num + 1
+                meta["memories"] = memories
+                if meta_block_id:
+                    _write_geist_meta(writer, meta, meta_block_id)
+
+            await hp_client.transact_document(
+                graph_id, MEMORY_QUEUE_DOC_ID, do_store, user_id=auth.user_id
+            )
 
         # TODO: Wire creation if block_ids + predicates are provided
         # (Will reuse _create_wire_in_doc from wire_tools in a future iteration)
@@ -900,33 +936,36 @@ def register_geist_tools(server: FastMCP) -> None:
         graph_id = graph_id.strip()
         await _ensure_scratchpad(hp_client, graph_id, auth)
 
-        await hp_client.connect_document(graph_id, MEMORY_QUEUE_DOC_ID, user_id=auth.user_id)
-        channel = hp_client.get_document_channel(graph_id, MEMORY_QUEUE_DOC_ID, user_id=auth.user_id)
-        reader = DocumentReader(channel.doc)
-
-        # Read metadata from the persistent meta block
-        meta, meta_block_id = _read_geist_meta(reader)
-        mem_entries = meta.get("memories", {})
         now = _now_iso()
         cared: list[int] = []
 
-        # Update last_active timestamps in-memory
-        for num in numbers:
-            entry = mem_entries.get(str(num))
-            if isinstance(entry, dict):
-                entry["a"] = now
-                cared.append(num)
+        # File lock serializes meta read-modify-write across MCP server processes
+        async with _geist_file_lock(graph_id):
+            await hp_client.connect_document(graph_id, MEMORY_QUEUE_DOC_ID, user_id=auth.user_id)
+            channel = hp_client.get_document_channel(graph_id, MEMORY_QUEUE_DOC_ID, user_id=auth.user_id)
+            reader = DocumentReader(channel.doc)
 
-        if cared and meta_block_id:
-            meta["memories"] = mem_entries
+            # Read metadata from the persistent meta block
+            meta, meta_block_id = _read_geist_meta(reader)
+            mem_entries = meta.get("memories", {})
 
-            def do_care(doc: pycrdt.Doc) -> None:
-                writer = DocumentWriter(doc)
-                _write_geist_meta(writer, meta, meta_block_id)
+            # Update last_active timestamps in-memory
+            for num in numbers:
+                entry = mem_entries.get(str(num))
+                if isinstance(entry, dict):
+                    entry["a"] = now
+                    cared.append(num)
 
-            await hp_client.transact_document(
-                graph_id, MEMORY_QUEUE_DOC_ID, do_care, user_id=auth.user_id
-            )
+            if cared and meta_block_id:
+                meta["memories"] = mem_entries
+
+                def do_care(doc: pycrdt.Doc) -> None:
+                    writer = DocumentWriter(doc)
+                    _write_geist_meta(writer, meta, meta_block_id)
+
+                await hp_client.transact_document(
+                    graph_id, MEMORY_QUEUE_DOC_ID, do_care, user_id=auth.user_id
+                )
 
         return _render_json({"cared": cared, "timestamp": now})
 

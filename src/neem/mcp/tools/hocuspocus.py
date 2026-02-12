@@ -1103,6 +1103,13 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             if not current:
                 raise RuntimeError(f"Folder '{folder_id}' not found in graph '{graph_id}'")
 
+            # Validate target folder exists
+            if new_parent_id and not reader.folder_exists(new_parent_id.strip()):
+                raise ValueError(
+                    f"Target folder '{new_parent_id}' does not exist in graph '{graph_id}'. "
+                    f"Use get_workspace to see available folder IDs."
+                )
+
             # Update folder with new parent/order via Y.js
             await hp_client.transact_workspace(
                 graph_id.strip(),
@@ -1674,6 +1681,13 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
                 raise RuntimeError(
                     f"Document '{document_id}' not found in graph '{graph_id}'. "
                     f"Use get_workspace to see available documents."
+                )
+
+            # Validate target folder exists
+            if new_parent_id and not reader.folder_exists(new_parent_id.strip()):
+                raise ValueError(
+                    f"Target folder '{new_parent_id}' does not exist in graph '{graph_id}'. "
+                    f"Use get_workspace to see available folder IDs."
                 )
 
             # Update document parent via Y.js
