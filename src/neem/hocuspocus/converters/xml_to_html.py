@@ -41,6 +41,10 @@ HORIZONTAL_RULE_TAG = "horizontalRule"
 BULLET_LIST_TAG = "bulletList"
 ORDERED_LIST_TAG = "orderedList"
 TASK_LIST_TAG = "taskList"
+TABLE_TAG = "table"
+TABLE_ROW_TAG = "tableRow"
+TABLE_HEADER_TAG = "tableHeader"
+TABLE_CELL_TAG = "tableCell"
 
 FOOTNOTE_TAG = "footnote"
 WIKILINK_TAG = "wikilink"
@@ -223,6 +227,36 @@ sup.fn-ref a {
   font-weight: 500;
 }
 sup.fn-ref a:hover { text-decoration: underline; }
+
+/* Tables */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.5rem 0;
+  font-size: 0.95em;
+}
+thead {
+  border-bottom: 2px solid var(--border);
+}
+th {
+  font-weight: 600;
+  text-align: left;
+  padding: 0.75rem;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+}
+td {
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+}
+tr:hover {
+  background: var(--fern-light);
+}
+
+@media print {
+  table { page-break-inside: avoid; }
+  tr { page-break-inside: avoid; }
+}
 """
 
 # Minimal CSS for unthemed export
@@ -399,6 +433,26 @@ def _convert_block(
         chk = " checked" if checked else ""
         content = _list_item_inline(elem, footnotes)
         return f'<li{bid}><input type="checkbox" disabled{chk} /> {content}</li>'
+
+    if tag == TABLE_TAG:
+        rows = "\n".join(
+            _convert_block(child, footnotes, include_ids) for child in elem
+        )
+        return f"<table{bid}>\n{rows}\n</table>"
+
+    if tag == TABLE_ROW_TAG:
+        cells = "\n".join(
+            _convert_block(child, footnotes, include_ids) for child in elem
+        )
+        return f"<tr{bid}>\n{cells}\n</tr>"
+
+    if tag == TABLE_HEADER_TAG:
+        content = _inline_content(elem, footnotes)
+        return f"<th{bid}>{content}</th>"
+
+    if tag == TABLE_CELL_TAG:
+        content = _inline_content(elem, footnotes)
+        return f"<td{bid}>{content}</td>"
 
     # Unknown — try inline content
     content = _inline_content(elem, footnotes)
