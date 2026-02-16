@@ -718,7 +718,8 @@ class HocuspocusClient:
     # -------------------------------------------------------------------------
 
     async def connect_document(
-        self, graph_id: str, doc_id: str, user_id: Optional[str] = None
+        self, graph_id: str, doc_id: str, user_id: Optional[str] = None,
+        force_fresh: bool = False,
     ) -> None:
         """Connect to a document channel.
 
@@ -726,9 +727,18 @@ class HocuspocusClient:
             graph_id: The graph ID
             doc_id: The document ID
             user_id: The user ID for auth (uses _dev_user_id if not provided)
+            force_fresh: If True, disconnect any existing channel first to
+                guarantee a fresh sync from the server.  Use this for read
+                operations where stale cached state would return wrong data.
         """
         effective_user_id = user_id or self._dev_user_id
         key = f"{effective_user_id}:{graph_id}:{doc_id}"
+
+        # Force-fresh: tear down cached channel so we get a new sync_step2
+        if force_fresh and key in self._document_channels:
+            old_channel = self._document_channels.pop(key, None)
+            if old_channel:
+                await self._close_channel(old_channel)
 
         # Fast path: already connected and synced
         if key in self._document_channels:

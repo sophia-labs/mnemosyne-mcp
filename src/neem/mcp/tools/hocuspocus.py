@@ -402,8 +402,10 @@ Works for all documents including uploaded files (which are documents with readO
             await _validate_document_in_workspace(graph_id, document_id, auth.user_id)
 
             # Connect to the document channel with user context
+            # force_fresh=True ensures we get a new sync from the server,
+            # preventing stale reads when another agent has written to this doc.
             try:
-                await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
+                await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id, force_fresh=True)
             except TimeoutError:
                 logger.warning(
                     "read_document initial sync timed out, retrying once",
@@ -553,7 +555,7 @@ Works for all documents including uploaded files (which are documents with readO
             await _validate_document_in_workspace(graph_id, document_id, auth.user_id)
 
             try:
-                await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
+                await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id, force_fresh=True)
             except TimeoutError:
                 await hp_client.disconnect_document(graph_id, document_id, user_id=auth.user_id)
                 await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
@@ -715,7 +717,7 @@ Works for all documents including uploaded files (which are documents with readO
 
             # 2. Connect document and extract size + headings
             try:
-                await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
+                await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id, force_fresh=True)
             except TimeoutError:
                 await hp_client.disconnect_document(graph_id, document_id, user_id=auth.user_id)
                 await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
@@ -948,8 +950,8 @@ LIMIT {top_valued}
             # Validate document exists in workspace before connecting
             await _validate_document_in_workspace(graph_id, document_id, auth.user_id)
 
-            # Connect to the document channel
-            await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
+            # Connect to the document channel (force_fresh for read consistency)
+            await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id, force_fresh=True)
 
             channel = hp_client.get_document_channel(graph_id, document_id, user_id=auth.user_id)
             if channel is None:
@@ -1851,7 +1853,7 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
 
             # Read the document content (artifact_id IS the document_id)
             try:
-                await hp_client.connect_document(graph_id.strip(), artifact_id.strip(), user_id=auth.user_id)
+                await hp_client.connect_document(graph_id.strip(), artifact_id.strip(), user_id=auth.user_id, force_fresh=True)
                 doc_channel = hp_client.get_document_channel(graph_id.strip(), artifact_id.strip(), user_id=auth.user_id)
                 if doc_channel is not None:
                     doc_reader = DocumentReader(doc_channel.doc)
@@ -2241,7 +2243,7 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             # Validate document exists in workspace
             await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id)
 
-            await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
+            await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id, force_fresh=True)
 
             channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
             if channel is None:
@@ -2324,7 +2326,7 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             # Validate document exists in workspace
             await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id)
 
-            await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
+            await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id, force_fresh=True)
 
             channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
             if channel is None:
