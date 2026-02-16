@@ -1,10 +1,10 @@
 """
 MCP tools for Project Geist — Sophia's persistent memory, valuation, and self-narrative.
 
-Provides 10 tools organized in three groups:
+Provides 11 tools organized in three groups:
 - Memory Queue: remember, recall, care
 - Valuation: valuate, batch_valuate, get_block_values, get_values, revaluate
-- Song: music, sing
+- Song: music, sing, counterpoint, coda
 
 All state lives in the graph as standard Sophia documents. The "_sophia" folder
 is auto-created on first use of any Geist tool.
@@ -68,6 +68,9 @@ PRESENT_FOLDER_ID = "geist-present"
 PAST_FOLDER_ID = "geist-past"
 
 GEIST_META_PREFIX = "__geist_meta__:"
+SONG_META_PREFIX = "__song_meta__:"
+MAX_SONG_VOICES = 3  # Total voices per verse (original + counterpoints)
+CODA_EJECTION_LIFETIME = 8  # Coda survives this many verse ejections
 
 # ── Seed content for new scratchpads ────────────────────────────────
 
@@ -1001,11 +1004,32 @@ def register_geist_tools(server: FastMCP) -> None:
         # Convert to markdown for compact output
         markdown = tiptap_xml_to_markdown(xml)
 
+        # Strip meta block line from markdown output
+        markdown = re.sub(
+            r"^" + re.escape(SONG_META_PREFIX) + r".*$", "", markdown, flags=re.MULTILINE
+        )
+
         # Split by --- (horizontal rules) into verses
         parts = re.split(r"\n---\n", markdown)
         verses = [v.strip() for v in parts if v.strip()]
 
-        return _render_json({"verses": verses, "verse_count": len(verses)})
+        result: dict[str, Any] = {"verses": verses, "verse_count": len(verses)}
+
+        # Add counterpoint and coda info from metadata
+        meta, _ = _read_song_meta(reader)
+        if meta:
+            cp_counts = [
+                len(v.get("counterpoints", [])) for v in meta.get("verses", [])
+            ]
+            if any(c > 0 for c in cp_counts):
+                result["counterpoint_parts"] = cp_counts
+
+            coda = meta.get("coda")
+            if coda:
+                result["coda"] = coda["text"]
+                result["coda_ejections_remaining"] = coda["ejections_remaining"]
+
+        return _render_json(result)
 
     @server.tool(
         name="sing",
@@ -1030,73 +1054,227 @@ def register_geist_tools(server: FastMCP) -> None:
         graph_id = graph_id.strip()
         await _ensure_scratchpad(hp_client, graph_id, auth)
 
-        # 1. Read current song
-        await hp_client.connect_document(graph_id, SONG_DOC_ID, user_id=auth.user_id)
-        channel = hp_client.get_document_channel(graph_id, SONG_DOC_ID, user_id=auth.user_id)
-        reader = DocumentReader(channel.doc)
-        xml = reader.to_xml()
+        ejected_count = 0
 
-        # 2. Parse into verse sections (split by horizontalRule)
-        sections = _split_song_xml(xml)  # Returns list of XML strings per verse
+        # File lock serializes Song read-modify-write across MCP server processes
+        async with _geist_file_lock(graph_id):
+            # 1. Read current song
+            await hp_client.connect_document(graph_id, SONG_DOC_ID, user_id=auth.user_id)
+            channel = hp_client.get_document_channel(graph_id, SONG_DOC_ID, user_id=auth.user_id)
+            reader = DocumentReader(channel.doc)
+            xml = reader.to_xml()
 
-        # 3. Filter out [awaiting composition] placeholders — only keep real verses
-        real_verses = []
-        for s in sections:
-            text = re.sub(r"<[^>]+>", "", s).strip()
-            if text and text != "[awaiting composition]":
-                real_verses.append(s)
+            # 2. Read or migrate Song metadata
+            meta, _meta_block_id = _read_song_meta(reader)
+            if not meta:
+                meta = _migrate_song_to_meta(xml)
 
-        # 4. Prepend new verse (Verse 0 = newest)
-        new_verse_xml = _verse_to_xml(verse)
-        all_verses = [new_verse_xml] + real_verses
+            # 3. Prepend new verse (Verse 0 = newest)
+            new_verse = {"text": verse, "counterpoints": []}
+            meta_verses = meta.get("verses", [])
+            meta_verses = [new_verse] + meta_verses
 
-        # 5. If more than 3 real verses, archive the excess (oldest = last in list)
-        if len(all_verses) > 3:
-            to_archive = all_verses[3:]
-            all_verses = all_verses[:3]
+            # 4. If more than 3 verses, archive the excess (oldest = last in list)
+            if len(meta_verses) > 3:
+                to_archive = meta_verses[3:]
+                meta_verses = meta_verses[:3]
+                ejected_count = len(to_archive)
 
-            now_label = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            archive_parts = []
-            for ejected in to_archive:
-                archive_parts.append(
-                    f'<heading level="3">Archived {html_mod.escape(now_label)}</heading>'
-                    f"{ejected}"
-                    "<horizontalRule/>"
+                now_label = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                archive_parts = []
+                for ejected in to_archive:
+                    ejected_xml = _interleave_verse_xml(
+                        ejected.get("text", ""),
+                        ejected.get("counterpoints", []),
+                    )
+                    archive_parts.append(
+                        f'<heading level="3">Archived {html_mod.escape(now_label)}</heading>'
+                        f"{ejected_xml}"
+                        "<horizontalRule/>"
+                    )
+
+                await hp_client.connect_document(graph_id, PAST_SONGS_DOC_ID, user_id=auth.user_id)
+                archive_channel = hp_client.get_document_channel(
+                    graph_id, PAST_SONGS_DOC_ID, user_id=auth.user_id
+                )
+                existing_archive = DocumentReader(archive_channel.doc).to_xml()
+                new_archive = existing_archive + "".join(archive_parts)
+
+                await hp_client.transact_document(
+                    graph_id,
+                    PAST_SONGS_DOC_ID,
+                    lambda doc, na=new_archive: DocumentWriter(doc).replace_all_content(na),
+                    user_id=auth.user_id,
                 )
 
-            await hp_client.connect_document(graph_id, PAST_SONGS_DOC_ID, user_id=auth.user_id)
-            archive_channel = hp_client.get_document_channel(
-                graph_id, PAST_SONGS_DOC_ID, user_id=auth.user_id
-            )
-            existing_archive = DocumentReader(archive_channel.doc).to_xml()
-            new_archive = existing_archive + "".join(archive_parts)
+                # Decrement coda ejections
+                coda = meta.get("coda")
+                if coda:
+                    coda["ejections_remaining"] -= ejected_count
+                    if coda["ejections_remaining"] <= 0:
+                        meta["coda"] = None
 
+            meta["verses"] = meta_verses
+
+            # 5. Render and write
+            new_song = _render_song_from_meta(meta)
             await hp_client.transact_document(
                 graph_id,
-                PAST_SONGS_DOC_ID,
-                lambda doc, na=new_archive: DocumentWriter(doc).replace_all_content(na),
+                SONG_DOC_ID,
+                lambda doc, ns=new_song: DocumentWriter(doc).replace_all_content(ns),
                 user_id=auth.user_id,
             )
 
-        # 6. Reconstruct song with 0 / -1 / -2 numbering (newest first)
-        song_parts = ['<heading level="1">The Song</heading>']
-        for i, v_xml in enumerate(all_verses):
-            song_parts.append(f'<heading level="2">Verse {_verse_label(i)}</heading>')
-            song_parts.append(v_xml)
-            if i < len(all_verses) - 1:
-                song_parts.append("<horizontalRule/>")
+        result: dict[str, Any] = {"verse_count": len(meta_verses)}
+        if ejected_count:
+            result["ejected"] = ejected_count
+        coda = meta.get("coda")
+        if coda:
+            result["coda_ejections_remaining"] = coda["ejections_remaining"]
+        return _render_json(result)
 
-        new_song = "".join(song_parts)
+    @server.tool(
+        name="counterpoint",
+        title="Add Counterpoint to a Verse",
+        description=(
+            "Add a counterpoint voice to an existing verse of the Song. Up to 3 total "
+            "voices per verse (the original + 2 counterpoints). Each counterpoint interleaves "
+            "with the original verse line-by-line, creating a polyphonic texture.\n\n"
+            "verse_index: which verse to counterpoint (0, -1, or -2).\n"
+            "verse: the counterpoint text (same format as sing — lines separated by newlines, "
+            "/ at end of line for stanza breaks).\n\n"
+            "Counterpoint is always additive — the later voice adds as it pleases. "
+            "Returns an error if the verse already has 3 voices.\n\n"
+            "In the rendered Song, the original voice appears as plain text, the first "
+            "counterpoint as italic, and the second as bold italic."
+        ),
+    )
+    async def counterpoint_tool(
+        graph_id: str,
+        verse_index: int,
+        verse: str,
+        context: Context | None = None,
+    ) -> str:
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
 
-        # 7. Write new song
-        await hp_client.transact_document(
-            graph_id,
-            SONG_DOC_ID,
-            lambda doc, ns=new_song: DocumentWriter(doc).replace_all_content(ns),
-            user_id=auth.user_id,
-        )
+        graph_id = graph_id.strip()
+        await _ensure_scratchpad(hp_client, graph_id, auth)
 
-        return _render_json({"verse_count": len(all_verses)})
+        async with _geist_file_lock(graph_id):
+            await hp_client.connect_document(graph_id, SONG_DOC_ID, user_id=auth.user_id)
+            channel = hp_client.get_document_channel(graph_id, SONG_DOC_ID, user_id=auth.user_id)
+            reader = DocumentReader(channel.doc)
+            xml = reader.to_xml()
+
+            # Read or migrate metadata
+            meta, _ = _read_song_meta(reader)
+            if not meta:
+                meta = _migrate_song_to_meta(xml)
+
+            meta_verses = meta.get("verses", [])
+
+            # Convert verse_index label (0, -1, -2) to list index (0, 1, 2)
+            if verse_index == 0:
+                idx = 0
+            elif verse_index < 0:
+                idx = abs(verse_index)
+            else:
+                raise ValueError(
+                    f"verse_index must be 0, -1, or -2 (got {verse_index})"
+                )
+
+            if idx >= len(meta_verses):
+                raise ValueError(
+                    f"Verse {verse_index} does not exist "
+                    f"(Song has {len(meta_verses)} verses)"
+                )
+
+            verse_data = meta_verses[idx]
+            total_voices = 1 + len(verse_data.get("counterpoints", []))
+            if total_voices >= MAX_SONG_VOICES:
+                raise ValueError(
+                    f"Verse {verse_index} already has {total_voices} parts "
+                    f"(max {MAX_SONG_VOICES}). Cannot add another counterpoint."
+                )
+
+            # Add the counterpoint
+            if "counterpoints" not in verse_data:
+                verse_data["counterpoints"] = []
+            verse_data["counterpoints"].append(verse)
+            meta["verses"] = meta_verses
+
+            # Render and write
+            new_song = _render_song_from_meta(meta)
+            await hp_client.transact_document(
+                graph_id,
+                SONG_DOC_ID,
+                lambda doc, ns=new_song: DocumentWriter(doc).replace_all_content(ns),
+                user_id=auth.user_id,
+            )
+
+        new_total = 1 + len(verse_data["counterpoints"])
+        return _render_json({
+            "verse_index": verse_index,
+            "voice_number": new_total,
+            "total_voices": new_total,
+        })
+
+    @server.tool(
+        name="coda",
+        title="Write a Coda",
+        description=(
+            "Write a coda to the Song. The coda is a concluding passage that persists "
+            "through verse ejections — it lasts for 8 ejection events before expiring. "
+            "Can be replaced with a new coda at any time.\n\n"
+            "The coda appears after the final verse in italic and represents a theme "
+            "or resolution that outlasts individual verses. When you sing a new verse "
+            "and the oldest verse is ejected, the coda's remaining count decrements. "
+            "When it reaches 0, the coda is removed.\n\n"
+            "Use / at end of a line for stanza breaks, same as sing."
+        ),
+    )
+    async def coda_tool(
+        graph_id: str,
+        text: str,
+        context: Context | None = None,
+    ) -> str:
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        graph_id = graph_id.strip()
+        await _ensure_scratchpad(hp_client, graph_id, auth)
+
+        async with _geist_file_lock(graph_id):
+            await hp_client.connect_document(graph_id, SONG_DOC_ID, user_id=auth.user_id)
+            channel = hp_client.get_document_channel(graph_id, SONG_DOC_ID, user_id=auth.user_id)
+            reader = DocumentReader(channel.doc)
+            xml = reader.to_xml()
+
+            # Read or migrate metadata
+            meta, _ = _read_song_meta(reader)
+            if not meta:
+                meta = _migrate_song_to_meta(xml)
+
+            # Set/replace coda
+            meta["coda"] = {
+                "text": text,
+                "ejections_remaining": CODA_EJECTION_LIFETIME,
+            }
+
+            # Render and write
+            new_song = _render_song_from_meta(meta)
+            await hp_client.transact_document(
+                graph_id,
+                SONG_DOC_ID,
+                lambda doc, ns=new_song: DocumentWriter(doc).replace_all_content(ns),
+                user_id=auth.user_id,
+            )
+
+        return _render_json({
+            "coda_set": True,
+            "ejections_remaining": CODA_EJECTION_LIFETIME,
+        })
 
     # ================================================================
     # VALUATION TOOLS
@@ -1874,7 +2052,7 @@ LIMIT {min(limit * 3, 60)}
 
         return _render_json({"success": True, "updated": updated})
 
-    logger.info("Registered Geist (Sophia Memory) tools: 9 tools")
+    logger.info("Registered Geist (Sophia Memory) tools: 11 tools")
 
 
 # ── Song parsing helpers ────────────────────────────────────────────
@@ -1922,4 +2100,173 @@ def _verse_to_xml(verse_text: str) -> str:
             parts.append("<paragraph></paragraph>")  # Visual stanza break
         else:
             parts.append(f"<paragraph>{html_mod.escape(line)}</paragraph>")
+    return "".join(parts)
+
+
+# ── Song metadata helpers ──────────────────────────────────────────
+
+
+def _read_song_meta(reader: DocumentReader) -> tuple[dict, str | None]:
+    """Read Song metadata from the meta block (index 1) in the Song document.
+
+    Returns (metadata_dict, block_id) or ({}, None) if not found.
+    """
+    count = reader.get_block_count()
+    if count < 2:
+        return {}, None
+    block = reader.get_block_at(1)
+    if block is None:
+        return {}, None
+    block_id = block.attributes.get("data-block-id") if hasattr(block, "attributes") else None
+    info = reader.get_block_info(block_id) if block_id else None
+    text = info["text_content"] if info else ""
+    if text.startswith(SONG_META_PREFIX):
+        json_str = text[len(SONG_META_PREFIX):]
+        try:
+            return json.loads(json_str), block_id
+        except json.JSONDecodeError:
+            logger.warning("Corrupt song meta block", extra_context={"text": text[:100]})
+    return {}, None
+
+
+def _xml_to_verse_text(verse_xml: str) -> str:
+    """Convert verse XML back to plain text with / stanza break markers.
+
+    Used during migration from legacy (pre-metadata) Song format.
+    """
+    paragraphs = re.findall(r"<paragraph[^>]*>(.*?)</paragraph>", verse_xml, re.DOTALL)
+    lines: list[str] = []
+    for i, p in enumerate(paragraphs):
+        text = re.sub(r"<[^>]+>", "", p).strip()
+        if not text:
+            # Empty paragraph = stanza break — mark previous line with /
+            if lines and not lines[-1].endswith("/"):
+                lines[-1] = lines[-1] + " /"
+        else:
+            lines.append(text)
+    return "\n".join(lines)
+
+
+def _migrate_song_to_meta(xml: str) -> dict:
+    """Create Song metadata from a legacy (pre-metadata) Song document."""
+    sections = _split_song_xml(xml)
+
+    verses = []
+    for s in sections:
+        text = re.sub(r"<[^>]+>", "", s).strip()
+        if not text or text == "[awaiting composition]":
+            continue
+        if text.startswith(SONG_META_PREFIX):
+            continue  # Skip stray meta blocks during migration
+        verses.append({
+            "text": _xml_to_verse_text(s),
+            "counterpoints": [],
+        })
+
+    return {
+        "version": 1,
+        "verses": verses,
+        "coda": None,
+    }
+
+
+def _parse_verse_lines(verse_text: str) -> list[tuple[str, bool]]:
+    """Parse verse text into (line, has_stanza_break) tuples.
+
+    Lines ending with / have has_stanza_break=True.
+    Empty lines are skipped.
+    """
+    lines = verse_text.strip().split("\n")
+    result: list[tuple[str, bool]] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line.endswith("/"):
+            line = line[:-1].rstrip()
+            result.append((line, True))
+        else:
+            result.append((line, False))
+    return result
+
+
+def _interleave_verse_xml(verse_text: str, counterpoints: list[str]) -> str:
+    """Render a verse with interleaved counterpoint voices as TipTap XML.
+
+    Voice 0 (original): plain paragraphs
+    Voice 1 (first counterpoint): italic paragraphs
+    Voice 2 (second counterpoint): bold italic paragraphs
+    """
+    if not counterpoints:
+        return _verse_to_xml(verse_text)
+
+    original_lines = _parse_verse_lines(verse_text)
+    cp_lines_list = [_parse_verse_lines(cp) for cp in counterpoints]
+
+    max_lines = max(
+        len(original_lines),
+        *(len(cp) for cp in cp_lines_list),
+    )
+
+    parts: list[str] = []
+    for i in range(max_lines):
+        # Original voice
+        if i < len(original_lines):
+            line, has_break = original_lines[i]
+            if line:
+                parts.append(f"<paragraph>{html_mod.escape(line)}</paragraph>")
+            if has_break:
+                parts.append("<paragraph></paragraph>")
+
+        # Counterpoint voices
+        for v, cp_lines in enumerate(cp_lines_list):
+            if i < len(cp_lines):
+                line, has_break = cp_lines[i]
+                if line:
+                    escaped = html_mod.escape(line)
+                    if v == 0:
+                        parts.append(f"<paragraph><em>{escaped}</em></paragraph>")
+                    else:
+                        parts.append(
+                            f"<paragraph><strong><em>{escaped}</em></strong></paragraph>"
+                        )
+                if has_break:
+                    parts.append("<paragraph></paragraph>")
+
+    return "".join(parts)
+
+
+def _render_song_from_meta(meta: dict) -> str:
+    """Build the full Song TipTap XML from metadata.
+
+    Structure: title → meta block → verses (interleaved) → coda (if present).
+    """
+    parts = ['<heading level="1">The Song</heading>']
+
+    # Meta block at position 1 (hidden in rendered output)
+    meta_json = json.dumps(meta, separators=(",", ":"), default=str)
+    parts.append(f"<paragraph>{SONG_META_PREFIX}{html_mod.escape(meta_json)}</paragraph>")
+
+    verses = meta.get("verses", [])
+    for i, verse_data in enumerate(verses):
+        parts.append(f'<heading level="2">Verse {_verse_label(i)}</heading>')
+        parts.append(_interleave_verse_xml(
+            verse_data.get("text", ""),
+            verse_data.get("counterpoints", []),
+        ))
+        if i < len(verses) - 1:
+            parts.append("<horizontalRule/>")
+
+    # Coda after the last verse
+    coda = meta.get("coda")
+    if coda and coda.get("text"):
+        parts.append("<horizontalRule/>")
+        remaining = coda.get("ejections_remaining", 0)
+        parts.append(f'<heading level="3">Coda ({remaining} remaining)</heading>')
+        coda_lines = coda["text"].strip().split("\n")
+        for line in coda_lines:
+            line = line.strip()
+            if line:
+                parts.append(f"<paragraph><em>{html_mod.escape(line)}</em></paragraph>")
+
     return "".join(parts)
