@@ -7,6 +7,7 @@ for real-time state synchronization of sessions, workspaces, and documents.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import urljoin, urlparse
@@ -36,6 +37,7 @@ class ChannelState:
     doc: pycrdt.Doc = field(default_factory=pycrdt.Doc)
     ws: Optional[aiohttp.ClientWebSocketResponse] = None
     synced: asyncio.Event = field(default_factory=asyncio.Event)
+    synced_at: float = 0.0  # monotonic timestamp of last successful sync
     receiver_task: Optional[asyncio.Task] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -266,6 +268,7 @@ class HocuspocusClient:
             # Wait for sync to complete (server sends sync_step2)
             try:
                 await asyncio.wait_for(channel.synced.wait(), timeout=10.0)
+                channel.synced_at = time.monotonic()
                 logger.info(
                     "Hocuspocus channel synced",
                     extra_context={"channel": channel_name},
@@ -720,6 +723,7 @@ class HocuspocusClient:
     async def connect_document(
         self, graph_id: str, doc_id: str, user_id: Optional[str] = None,
         force_fresh: bool = False,
+        max_age: Optional[float] = None,
     ) -> None:
         """Connect to a document channel.
 
@@ -727,15 +731,28 @@ class HocuspocusClient:
             graph_id: The graph ID
             doc_id: The document ID
             user_id: The user ID for auth (uses _dev_user_id if not provided)
-            force_fresh: If True, disconnect any existing channel first to
-                guarantee a fresh sync from the server.  Use this for read
-                operations where stale cached state would return wrong data.
+            force_fresh: If True, always disconnect and reconnect.
+            max_age: Max seconds since last sync before reconnecting.
+                If set, a cached channel older than this is torn down and
+                reconnected.  Preferred over force_fresh for read tools —
+                it preserves the fast path for rapid sequential reads of
+                the same document while still catching multi-agent staleness.
         """
         effective_user_id = user_id or self._dev_user_id
         key = f"{effective_user_id}:{graph_id}:{doc_id}"
 
-        # Force-fresh: tear down cached channel so we get a new sync_step2
+        # Decide whether to tear down the cached channel
+        need_teardown = False
         if force_fresh and key in self._document_channels:
+            need_teardown = True
+        elif max_age is not None and key in self._document_channels:
+            channel = self._document_channels[key]
+            if channel.synced_at > 0:
+                age = time.monotonic() - channel.synced_at
+                if age > max_age:
+                    need_teardown = True
+
+        if need_teardown:
             old_channel = self._document_channels.pop(key, None)
             if old_channel:
                 await self._close_channel(old_channel)
@@ -751,7 +768,7 @@ class HocuspocusClient:
             self._document_connect_locks[key] = asyncio.Lock()
 
         async with self._document_connect_locks[key]:
-            # Re-check under lock
+            # Re-check under lock (another coroutine may have connected while we waited)
             if key in self._document_channels:
                 channel = self._document_channels[key]
                 if channel.ws and not channel.ws.closed and channel.synced.is_set():
@@ -760,13 +777,18 @@ class HocuspocusClient:
             channel = ChannelState()
             self._document_channels[key] = channel
 
-            async with channel.lock:
-                await self._connect_channel(
-                    channel,
-                    f"/hocuspocus/docs/{graph_id}/{doc_id}",
-                    f"doc:{graph_id}:{doc_id}",
-                    user_id=user_id,
-                )
+            try:
+                async with channel.lock:
+                    await self._connect_channel(
+                        channel,
+                        f"/hocuspocus/docs/{graph_id}/{doc_id}",
+                        f"doc:{graph_id}:{doc_id}",
+                        user_id=user_id,
+                    )
+            except Exception:
+                # Clean up the broken entry so future calls don't see a zombie
+                self._document_channels.pop(key, None)
+                raise
 
     def get_document_channel(
         self, graph_id: str, doc_id: str, user_id: Optional[str] = None
