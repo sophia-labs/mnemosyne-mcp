@@ -410,7 +410,9 @@ XML marks (nestable): strong, em, strike, code, mark (highlight), a (href="...")
 
 Also returns wire counts: document-level (outgoing, incoming, total) and block-level (which blocks have wires attached). Use get_wires for full wire details.
 
-Works for all documents including uploaded files (which are documents with readOnly=true).""",
+Works for all documents including uploaded files (which are documents with readOnly=true).
+
+Always returns fresh content — automatically reconnects if the cached channel is older than 2 seconds, and retries once on sync timeout. Safe for multi-agent use where another agent may have written to this document.""",
     )
     async def read_document_tool(
         graph_id: str,
@@ -540,7 +542,9 @@ Works for all documents including uploaded files (which are documents with readO
             "- 'text': Plain text only (most compact)\n"
             "- 'xml': Full TipTap XML with attributes and block IDs\n\n"
             "Returns: blocks list, total_blocks count, has_more flag, and "
-            "next_offset for easy pagination."
+            "next_offset for easy pagination.\n\n"
+            "Always returns fresh content — automatically reconnects if cached state "
+            "is older than 2 seconds, and retries once on sync timeout."
         ),
     )
     async def read_blocks_tool(
@@ -670,7 +674,9 @@ Works for all documents including uploaded files (which are documents with readO
             "- **valuation_summary**: top valued blocks with scores and excerpts\n\n"
             "Use this to decide whether a full read_document is needed. Much cheaper "
             "than reading the full document when you only need to understand what it "
-            "contains and how it connects."
+            "contains and how it connects.\n\n"
+            "Always returns fresh content — automatically reconnects if cached state "
+            "is older than 2 seconds, and retries once on sync timeout."
         ),
     )
     async def document_digest_tool(
@@ -1022,7 +1028,9 @@ Markdown is also accepted and auto-converted to TipTap XML.
 
 Returns block_ids: an ordered list of all block IDs in the written document, enabling immediate block-level wiring without a separate read call.
 
-NOT for: editing existing documents (use edit_block_text, update_block, or insert_block instead). Only use write_document for brand-new documents or when the user explicitly asks for a full rewrite.""",
+NOT for: editing existing documents (use edit_block_text, update_block, or insert_block instead). Only use write_document for brand-new documents or when the user explicitly asks for a full rewrite.
+
+Write tools use a persistent cached channel (no automatic reconnect like read tools). In multi-agent environments, always call read_document first to get current content before writing — this ensures your channel has the latest state from the server. CRDT merge prevents data corruption, but writing without reading first may silently overwrite another agent's recent changes.""",
     )
     async def write_document_tool(
         graph_id: str,
@@ -1114,7 +1122,9 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             "provide full XML like <heading level=\"2\">Title</heading> or <listItem listType=\"bullet\">...</listItem>. "
             "Plain text without XML tags is auto-wrapped in a <paragraph>. "
             "Only accepts a single top-level XML block element per call. To append multiple blocks, make multiple calls. "
-            "Markdown is also accepted and auto-converted."
+            "Markdown is also accepted and auto-converted.\n\n"
+            "For appending to documents written by other agents, call read_document first to sync "
+            "the channel — otherwise the append may conflict with content you haven't seen yet."
         ),
     )
     async def append_to_document_tool(
@@ -2227,7 +2237,9 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             "Use when you need raw markup or precise formatting details.\n"
             "- 'markdown': Compact markdown rendering of the block. Recommended for agent workflows "
             "that just need to read content.\n"
-            "- 'text': Plain text only. Most compact — use when you only need the text, not structure."
+            "- 'text': Plain text only. Most compact — use when you only need the text, not structure.\n\n"
+            "Always returns fresh content — automatically reconnects if cached state "
+            "is older than 2 seconds, and retries once on sync timeout."
         ),
     )
     async def get_block_tool(
@@ -2308,7 +2320,9 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
         description=(
             "Search for blocks matching specific criteria. Filter by block type, indent level, "
             "list type, checked state, or text content. Returns a list of matching block summaries. "
-            "Use this to find blocks without reading the entire document."
+            "Use this to find blocks without reading the entire document.\n\n"
+            "Always returns fresh content — automatically reconnects if cached state "
+            "is older than 2 seconds, and retries once on sync timeout."
         ),
     )
     async def query_blocks_tool(
@@ -2376,7 +2390,9 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             "without changing content, or replace the entire block content. "
             "This is the most surgical edit - only modifies what you specify. "
             "Plain text in xml_content is auto-wrapped in a <paragraph>. "
-            "Markdown is also accepted and auto-converted."
+            "Markdown is also accepted and auto-converted.\n\n"
+            "Always read the document or block first (read_document or get_block) before updating — "
+            "write tools use a cached channel and need a preceding read to sync latest state from the server."
         ),
     )
     async def update_block_tool(
@@ -2455,10 +2471,14 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             "CRDT-native operations that merge cleanly with concurrent browser edits. "
             "Unlike update_block (which replaces entire content), this enables true "
             "collaborative editing without data loss.\n\n"
-            "Workflow: 1) Call get_block to read current text and length, "
+            "Workflow: 1) Call get_block to read current text and length (this also syncs "
+            "the channel to latest server state), "
             "2) Determine offset(s) for edits, "
             "3) Call edit_block_text with operations, "
             "4) Response includes updated text for verification.\n\n"
+            "IMPORTANT: Always call get_block immediately before editing — the read syncs "
+            "fresh state from the server, and the write reuses that channel. Skipping the "
+            "read risks operating on stale offsets.\n\n"
             "Each operation has: type ('insert' or 'delete'), offset (0-indexed char position), "
             "text (for insert), length (for delete), attrs (optional formatting like {\"bold\": {}}), "
             "inherit_format (default true - inherit formatting from preceding character).\n\n"
@@ -2541,7 +2561,9 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             "to specify where to insert. Returns the new block's generated ID. "
             "For appending to the end, use append_to_document instead. "
             "Plain text in xml_content is auto-wrapped in a <paragraph>. "
-            "Markdown is also accepted and auto-converted."
+            "Markdown is also accepted and auto-converted.\n\n"
+            "Always read the document first (read_document or get_block) before inserting — "
+            "write tools use a cached channel and need a preceding read to sync latest state from the server."
         ),
     )
     async def insert_block_tool(
@@ -2624,7 +2646,9 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
         title="Delete Block",
         description=(
             "Delete a block by its ID. Use cascade=true to also delete all subsequent blocks "
-            "with higher indent (indent-based children). Returns the list of deleted block IDs."
+            "with higher indent (indent-based children). Returns the list of deleted block IDs.\n\n"
+            "Always read the document first (read_document) before deleting — "
+            "write tools use a cached channel and need a preceding read to sync latest state from the server."
         ),
     )
     async def delete_block_tool(
@@ -2702,7 +2726,9 @@ NOT for: editing existing documents (use edit_block_text, update_block, or inser
             "Update multiple blocks in a single transaction. More efficient than "
             "individual update_block calls. Each update object should have a block_id (required), "
             "and optionally attributes (object) and/or xml_content (string), matching the "
-            "parameters of update_block. Returns results for each update."
+            "parameters of update_block. Returns results for each update.\n\n"
+            "Always read the document first (read_document) before batch updating — "
+            "write tools use a cached channel and need a preceding read to sync latest state from the server."
         ),
     )
     async def batch_update_blocks_tool(
