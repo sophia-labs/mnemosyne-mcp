@@ -11,6 +11,7 @@ before wiring in fresh tools.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass
 from typing import Optional
@@ -382,6 +383,17 @@ def create_standalone_mcp_server() -> FastMCP:
     register_wire_tools(mcp_server)
     register_geist_tools(mcp_server)
     register_search_tools(mcp_server)
+
+    # LOCAL STOPGAP: throttle on every tool call to reduce backend pressure
+    # when multiple Sophia instances hit the cluster simultaneously.
+    _original_call_tool = mcp_server.call_tool
+
+    async def _throttled_call_tool(*args, **kwargs):
+        await asyncio.sleep(0.5)
+        return await _original_call_tool(*args, **kwargs)
+
+    mcp_server.call_tool = _throttled_call_tool  # type: ignore[method-assign]
+    logger.info("Tool throttle enabled: 0.5s sleep before every tool call")
 
     # Remove excluded tools based on MCP_EXCLUDED_TOOLS env var.
     # Comma-separated list of tool names, e.g. "export_document,upload_artifact,sparql_update"

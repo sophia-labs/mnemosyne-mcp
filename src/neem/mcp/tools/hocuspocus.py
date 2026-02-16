@@ -26,7 +26,7 @@ from neem.hocuspocus.document import extract_title_from_xml
 from neem.mcp.auth import MCPAuthContext
 from neem.mcp.jobs import RealtimeJobClient
 from neem.mcp.tools.basic import await_job_completion, submit_job
-from neem.mcp.tools.wire_tools import _get_wires_for_document
+from neem.mcp.tools.wire_tools import _get_wires_for_document, _get_predicate_short_name
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_dev_user_id, get_internal_service_secret, get_user_id_from_token, validate_token_and_load
 
@@ -502,6 +502,412 @@ Works for all documents including uploaded files (which are documents with readO
                 },
             )
             raise RuntimeError(f"Failed to read document: {e}")
+
+    @server.tool(
+        name="read_blocks",
+        title="Read Blocks (Paginated)",
+        description=(
+            "Read a document's blocks sequentially with pagination. Returns blocks as "
+            "a list with their content, type, block ID, and index. Use offset and limit "
+            "to paginate through large documents.\n\n"
+            "Pair with document_digest to understand document size before reading. "
+            "For example: digest tells you a book has 500 blocks, then read_blocks "
+            "with offset=0, limit=50 reads the first 50 blocks.\n\n"
+            "Output format is controlled by the format parameter:\n"
+            "- 'markdown' (default): Clean markdown rendering of each block\n"
+            "- 'text': Plain text only (most compact)\n"
+            "- 'xml': Full TipTap XML with attributes and block IDs\n\n"
+            "Returns: blocks list, total_blocks count, has_more flag, and "
+            "next_offset for easy pagination."
+        ),
+    )
+    async def read_blocks_tool(
+        graph_id: str,
+        document_id: str,
+        offset: int = 0,
+        limit: int = 50,
+        format: Optional[str] = None,
+        context: Context | None = None,
+    ) -> dict:
+        """Read blocks sequentially from a document with pagination.
+
+        Args:
+            graph_id: The graph containing the document
+            document_id: The document to read
+            offset: Block index to start from (0-based, default 0)
+            limit: Maximum number of blocks to return (default 50, max 200)
+            format: Output format - 'markdown' (default), 'text', or 'xml'
+        """
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        if limit > 200:
+            limit = 200
+        if offset < 0:
+            offset = 0
+        fmt = format or "markdown"
+        if fmt not in ("markdown", "text", "xml"):
+            raise ValueError("format must be 'markdown', 'text', or 'xml'")
+
+        try:
+            await _validate_document_in_workspace(graph_id, document_id, auth.user_id)
+
+            try:
+                await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
+            except TimeoutError:
+                await hp_client.disconnect_document(graph_id, document_id, user_id=auth.user_id)
+                await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
+
+            channel = hp_client.get_document_channel(graph_id, document_id, user_id=auth.user_id)
+            if channel is None:
+                raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
+
+            reader = DocumentReader(channel.doc)
+            fragment = reader.get_content_fragment()
+            all_children = list(fragment.children)
+            total_blocks = len(all_children)
+
+            # Slice to requested range
+            end = min(offset + limit, total_blocks)
+            slice_children = all_children[offset:end]
+
+            blocks = []
+            for i, child in enumerate(slice_children):
+                idx = offset + i
+                if not hasattr(child, "attributes"):
+                    continue
+
+                attrs = dict(child.attributes)
+                block_id = attrs.get("data-block-id", "")
+                tag = child.tag if hasattr(child, "tag") else "unknown"
+
+                # Get content in requested format
+                xml_str = reader._serialize_element(child)
+
+                if fmt == "xml":
+                    content = xml_str
+                elif fmt == "text":
+                    plain = re.sub(r"<[^>]+>", "", xml_str)
+                    content = plain.strip()
+                else:  # markdown
+                    content = tiptap_xml_to_markdown(xml_str).strip()
+
+                block_entry: Dict[str, Any] = {
+                    "index": idx,
+                    "block_id": block_id,
+                    "type": tag,
+                    "content": content,
+                }
+
+                # Include heading level for headings
+                if tag == "heading":
+                    level = attrs.get("level", 1)
+                    if isinstance(level, float):
+                        level = int(level)
+                    block_entry["level"] = level
+
+                blocks.append(block_entry)
+
+            has_more = end < total_blocks
+            result: Dict[str, Any] = {
+                "graph_id": graph_id,
+                "document_id": document_id,
+                "blocks": blocks,
+                "total_blocks": total_blocks,
+                "offset": offset,
+                "limit": limit,
+                "returned": len(blocks),
+                "has_more": has_more,
+            }
+            if has_more:
+                result["next_offset"] = end
+
+            return result
+
+        except Exception as e:
+            logger.error(
+                "Failed to read blocks",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "offset": offset,
+                    "limit": limit,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to read blocks: {e}")
+
+    @server.tool(
+        name="document_digest",
+        title="Document Digest",
+        description=(
+            "Returns a compact summary of a document for orientation and triage, "
+            "without fetching full content. Includes:\n\n"
+            "- **metadata**: title, folder path, readOnly status\n"
+            "- **size**: block count, character count, word count\n"
+            "- **freshness**: created_at timestamp\n"
+            "- **headings**: section headings extracted from document structure\n"
+            "- **wire_summary**: incoming/outgoing counts, predicate distribution, "
+            "top connected documents\n"
+            "- **valuation_summary**: top valued blocks with scores and excerpts\n\n"
+            "Use this to decide whether a full read_document is needed. Much cheaper "
+            "than reading the full document when you only need to understand what it "
+            "contains and how it connects."
+        ),
+    )
+    async def document_digest_tool(
+        graph_id: str,
+        document_id: str,
+        top_valued: int = 3,
+        context: Context | None = None,
+    ) -> dict:
+        """Return a compact digest of a document.
+
+        Args:
+            graph_id: The graph containing the document
+            document_id: The document to digest
+            top_valued: Number of top-valued blocks to include (default 3)
+        """
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        try:
+            # 1. Connect workspace and get document metadata
+            await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
+            ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
+            if not ws_channel or not ws_channel.doc:
+                raise RuntimeError(f"Could not connect to workspace for graph '{graph_id}'")
+
+            ws_reader = WorkspaceReader(ws_channel.doc)
+            doc_meta = ws_reader.get_document(document_id)
+            if doc_meta is None:
+                raise RuntimeError(
+                    f"Document '{document_id}' not found in graph '{graph_id}'. "
+                    f"Use get_workspace to see available documents."
+                )
+
+            # Resolve folder path
+            folder_path = None
+            parent_id = doc_meta.get("parentId")
+            if parent_id:
+                path_parts = []
+                current = parent_id
+                seen = set()
+                while current and current not in seen:
+                    seen.add(current)
+                    folder = ws_reader.get_folder(current)
+                    if folder:
+                        path_parts.append(folder.get("label", current))
+                        current = folder.get("parentId")
+                    else:
+                        break
+                path_parts.reverse()
+                folder_path = "/".join(path_parts)
+
+            metadata = {
+                "title": doc_meta.get("title", document_id),
+                "document_id": document_id,
+                "folder_path": folder_path,
+                "readOnly": doc_meta.get("readOnly", False),
+            }
+            if doc_meta.get("fileType"):
+                metadata["fileType"] = doc_meta["fileType"]
+
+            # 2. Connect document and extract size + headings
+            try:
+                await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
+            except TimeoutError:
+                await hp_client.disconnect_document(graph_id, document_id, user_id=auth.user_id)
+                await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
+
+            channel = hp_client.get_document_channel(graph_id, document_id, user_id=auth.user_id)
+            if not channel:
+                raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
+
+            reader = DocumentReader(channel.doc)
+            fragment = reader.get_content_fragment()
+
+            block_count = 0
+            char_count = 0
+            word_count = 0
+            headings = []
+
+            def _count_text(elem: Any) -> str:
+                """Recursively extract plain text from a Y.js element."""
+                import pycrdt
+                if isinstance(elem, pycrdt.XmlText):
+                    return str(elem)
+                elif isinstance(elem, pycrdt.XmlElement):
+                    parts = []
+                    for child in elem.children:
+                        parts.append(_count_text(child))
+                    return "".join(parts)
+                return ""
+
+            import pycrdt
+            for child in fragment.children:
+                if isinstance(child, pycrdt.XmlElement):
+                    block_count += 1
+                    text = _count_text(child)
+                    char_count += len(text)
+                    word_count += len(text.split()) if text.strip() else 0
+
+                    # Extract headings
+                    tag = child.tag
+                    if tag == "heading":
+                        attrs = dict(child.attributes)
+                        level = attrs.get("level", 1)
+                        if isinstance(level, float):
+                            level = int(level)
+                        headings.append({
+                            "level": level,
+                            "text": text.strip()[:120],
+                        })
+
+            size = {
+                "block_count": block_count,
+                "char_count": char_count,
+                "word_count": word_count,
+            }
+
+            # 3. Wire summary from workspace
+            wire_summary = None
+            try:
+                outgoing = _get_wires_for_document(ws_channel.doc, document_id, "outgoing")
+                incoming = _get_wires_for_document(ws_channel.doc, document_id, "incoming")
+                total = len(outgoing) + len(incoming)
+                if total > 0:
+                    # Predicate distribution
+                    pred_counts: Dict[str, int] = {}
+                    for w in outgoing + incoming:
+                        pred = _get_predicate_short_name(w.get("predicate", "unknown"))
+                        pred_counts[pred] = pred_counts.get(pred, 0) + 1
+
+                    # Top connected docs (by wire count)
+                    neighbor_counts: Dict[str, int] = {}
+                    neighbor_titles: Dict[str, str] = {}
+                    for w in outgoing:
+                        tid = w.get("targetDocumentId", "")
+                        neighbor_counts[tid] = neighbor_counts.get(tid, 0) + 1
+                        if w.get("targetTitle"):
+                            neighbor_titles[tid] = w["targetTitle"]
+                    for w in incoming:
+                        sid = w.get("sourceDocumentId", "")
+                        neighbor_counts[sid] = neighbor_counts.get(sid, 0) + 1
+                        if w.get("sourceTitle"):
+                            neighbor_titles[sid] = w["sourceTitle"]
+
+                    # Top 5 neighbors by wire count
+                    top_neighbors = sorted(
+                        neighbor_counts.items(), key=lambda x: x[1], reverse=True
+                    )[:5]
+                    top_connected = []
+                    for nid, count in top_neighbors:
+                        title = neighbor_titles.get(nid)
+                        if not title:
+                            ndoc = ws_reader.get_document(nid)
+                            title = ndoc.get("title", nid) if ndoc else nid
+                        top_connected.append({"id": nid, "title": title, "wires": count})
+
+                    wire_summary = {
+                        "outgoing": len(outgoing),
+                        "incoming": len(incoming),
+                        "total": total,
+                        "predicates": pred_counts,
+                        "top_connected": top_connected,
+                    }
+            except Exception as e:
+                logger.debug(
+                    "Failed to fetch wire summary for digest (non-fatal)",
+                    extra_context={"document_id": document_id, "error": str(e)},
+                )
+
+            # 4. Valuation summary (top valued blocks via SPARQL)
+            valuation_summary = None
+            if top_valued > 0:
+                try:
+                    user_id = auth.user_id or get_dev_user_id() or get_user_id_from_token(auth.token)
+                    doc_prefix = (
+                        f"urn:mnemosyne:user:{user_id}:graph:{graph_id}"
+                        f":valuation:{document_id}:"
+                    )
+                    query = f"""
+PREFIX doc: <http://mnemosyne.dev/doc#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+SELECT ?val ?blockRef ?cumImp ?cumVal
+WHERE {{
+  ?val doc:blockRef ?blockRef .
+  ?val doc:cumulativeImportance ?cumImp .
+  ?val doc:cumulativeValence ?cumVal .
+  FILTER(STRSTARTS(STR(?val), "{doc_prefix}"))
+}}
+ORDER BY DESC(xsd:float(?cumImp))
+LIMIT {top_valued}
+"""
+                    from neem.mcp.tools.geist import _sparql_query as _geist_sparql_query
+                    rows = await _geist_sparql_query(backend_config, job_stream, auth, graph_id, query)
+
+                    if rows:
+                        valued_blocks = []
+                        for row in rows:
+                            block_ref = row.get("blockRef", "")
+                            block_id = block_ref.split("#block-")[-1] if "#block-" in block_ref else ""
+                            importance = float(row.get("cumImp", 0))
+                            valence_val = float(row.get("cumVal", 0))
+
+                            # Get block text excerpt
+                            excerpt = ""
+                            if block_id:
+                                try:
+                                    for child in fragment.children:
+                                        if isinstance(child, pycrdt.XmlElement):
+                                            bid = dict(child.attributes).get("data-block-id")
+                                            if bid == block_id:
+                                                excerpt = _count_text(child).strip()[:150]
+                                                break
+                                except Exception:
+                                    pass
+
+                            valued_blocks.append({
+                                "block_id": block_id,
+                                "importance": round(importance, 2),
+                                "valence": round(valence_val, 2),
+                                "excerpt": excerpt,
+                            })
+                        valuation_summary = valued_blocks
+                except Exception as e:
+                    logger.debug(
+                        "Failed to fetch valuations for digest (non-fatal)",
+                        extra_context={"document_id": document_id, "error": str(e)},
+                    )
+
+            # 5. Build result
+            result: Dict[str, Any] = {
+                "metadata": metadata,
+                "size": size,
+            }
+            if doc_meta.get("createdAt"):
+                result["freshness"] = {"created_at": doc_meta["createdAt"]}
+            if headings:
+                result["headings"] = headings
+            if wire_summary:
+                result["wire_summary"] = wire_summary
+            if valuation_summary:
+                result["valuation_summary"] = valuation_summary
+
+            return result
+
+        except Exception as e:
+            logger.error(
+                "Failed to create document digest",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to create document digest: {e}")
 
     @server.tool(
         name="export_document",
