@@ -1,10 +1,11 @@
 """
 MCP tools for Project Geist — Sophia's persistent memory, valuation, and self-narrative.
 
-Provides 11 tools organized in three groups:
-- Memory Queue: remember, recall, care
+Provides 13 tools organized in four groups:
+- Memory Queue: remember, recall, care, archive_memories
 - Valuation: valuate, batch_valuate, get_block_values, get_values, revaluate
 - Song: music, sing, counterpoint, coda
+- Orientation: quick_orient
 
 All state lives in the graph as standard Sophia documents. The "_sophia" folder
 is auto-created on first use of any Geist tool.
@@ -553,17 +554,33 @@ async def _wait_for_job_result(
     if ws_events:
         for event in reversed(ws_events):
             event_type = event.get("type", "")
-            if event_type in ("job_completed", "completed", "succeeded"):
+            payload = event.get("payload", {})
+            payload_status = payload.get("status", "") if isinstance(payload, dict) else ""
+
+            is_success = (
+                event_type in ("job_completed", "completed", "succeeded")
+                or (event_type == "job_update" and payload_status == "succeeded")
+            )
+            is_failure = (
+                event_type in ("failed", "error")
+                or (event_type == "job_update" and payload_status == "failed")
+            )
+
+            if is_success:
                 result: JsonDict = {"status": "succeeded", "events": len(ws_events)}
-                payload = event.get("payload", {})
-                if isinstance(payload, dict):
-                    detail = payload.get("detail")
-                    if detail:
-                        result["detail"] = detail
+                detail = payload.get("detail") if isinstance(payload, dict) else None
+                if not detail and isinstance(payload, dict) and payload.get("result_inline") is not None:
+                    detail = {"result_inline": payload.get("result_inline")}
+                if not detail and event.get("result_inline") is not None:
+                    detail = {"result_inline": event.get("result_inline")}
+                if detail:
+                    result["detail"] = detail
                 return result
-            if event_type in ("failed", "error"):
-                return {"status": "failed", "error": event.get("error", "Job failed")}
-        return {"status": "unknown", "event_count": len(ws_events)}
+            if is_failure:
+                error = event.get("error") or payload.get("error", "Job failed")
+                return {"status": "failed", "error": error}
+        # WS events were present but did not include a recognizable terminal payload.
+        # Fall through to poll payload before returning unknown.
 
     if poll_payload:
         status = poll_payload.get("status", "unknown")
@@ -577,6 +594,9 @@ async def _wait_for_job_result(
         if detail:
             result["detail"] = detail
         return result
+
+    if ws_events:
+        return {"status": "unknown", "event_count": len(ws_events)}
 
     return {"status": "unknown"}
 
@@ -685,13 +705,26 @@ async def _run_semantic_search(
         if ws_events:
             for event in reversed(ws_events):
                 event_type = event.get("type", "")
-                if event_type in ("job_completed", "completed", "succeeded"):
-                    payload = event.get("payload", {})
+                payload = event.get("payload", {})
+                payload_status = payload.get("status", "") if isinstance(payload, dict) else ""
+                is_success = (
+                    event_type in ("job_completed", "completed", "succeeded")
+                    or (event_type == "job_update" and payload_status == "succeeded")
+                )
+                if is_success:
+                    inline: Any = None
                     if isinstance(payload, dict):
                         detail = payload.get("detail", {})
-                        inline = detail.get("result_inline", {})
-                        if isinstance(inline, dict):
-                            return inline.get("results", [])
+                        if isinstance(detail, dict):
+                            inline = detail.get("result_inline")
+                        if inline is None and payload.get("result_inline") is not None:
+                            inline = payload.get("result_inline")
+                    if inline is None and event.get("result_inline") is not None:
+                        inline = event.get("result_inline")
+                    if isinstance(inline, dict):
+                        results = inline.get("results", [])
+                        if isinstance(results, list):
+                            return results
 
         # Extract from poll
         if poll_payload:
@@ -2053,37 +2086,261 @@ LIMIT {min(limit * 3, 60)}
         return _render_json({"success": True, "updated": updated})
 
     # ================================================================
+    # MEMORY ARCHIVE
+    # ================================================================
+
+    @server.tool(
+        name="archive_memories",
+        title="Archive Memories",
+        description=(
+            "Archive old memories from the queue, keeping the most recent N (default 50). "
+            "Sorting is care()-aware: memories are ranked by last_active, so frequently "
+            "cared-for memories survive regardless of age.\n\n"
+            "Archived memories are saved to a timestamped document in the past/ folder. "
+            "The queue is then rewritten with only the kept memories, reducing the live "
+            "document size (fewer blocks = smaller Y.Doc = faster sync). Note: this does "
+            "not remove CRDT tombstones from prior operations — it reduces content size, "
+            "not operation history.\n\n"
+            "Returns counts of kept and archived memories, plus the archive document ID."
+        ),
+    )
+    async def archive_memories_tool(
+        graph_id: str,
+        keep: int = 50,
+        context: Context | None = None,
+    ) -> str:
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        graph_id = graph_id.strip()
+        if keep < 1:
+            return _render_json({"error": "keep must be >= 1"})
+
+        await _ensure_scratchpad(hp_client, graph_id, auth)
+
+        async with _geist_file_lock(graph_id):
+            # 1. Read current queue state
+            await hp_client.connect_document(graph_id, MEMORY_QUEUE_DOC_ID, user_id=auth.user_id)
+            channel = hp_client.get_document_channel(
+                graph_id, MEMORY_QUEUE_DOC_ID, user_id=auth.user_id,
+            )
+            reader = DocumentReader(channel.doc)
+            meta, meta_block_id = _read_geist_meta(reader)
+            mem_entries = meta.get("memories", {})
+            next_number = meta.get("next_number", 1)
+
+            if not mem_entries:
+                return _render_json({
+                    "kept": 0, "archived": 0, "note": "Memory queue is empty.",
+                })
+
+            # 2. Sort by last_active descending (care-aware)
+            sorted_entries = sorted(
+                mem_entries.items(),
+                key=lambda kv: max(
+                    kv[1].get("a", ""),
+                    kv[1].get("c", ""),
+                ),
+                reverse=True,
+            )
+
+            # 3. Split into keep vs archive
+            keep_entries = sorted_entries[:keep]
+            archive_entries = sorted_entries[keep:]
+
+            if not archive_entries:
+                return _render_json({
+                    "kept": len(keep_entries),
+                    "archived": 0,
+                    "note": f"Queue has {len(keep_entries)} memories, nothing to archive.",
+                })
+
+            # 4. Read text content for archived memories (before rewrite)
+            archive_blocks = []
+            for num_str, entry in archive_entries:
+                block_id = entry.get("b")
+                if block_id:
+                    block_info = reader.get_block_info(block_id)
+                    text = block_info["text_content"] if block_info else "(deleted)"
+                else:
+                    text = "(no block)"
+                archive_blocks.append({
+                    "number": int(num_str),
+                    "text": text,
+                    "created_at": entry.get("c", ""),
+                    "last_active": entry.get("a", ""),
+                })
+
+            # Also read text for kept memories (we'll rewrite them fresh)
+            keep_blocks = []
+            for num_str, entry in keep_entries:
+                block_id = entry.get("b")
+                if block_id:
+                    block_info = reader.get_block_info(block_id)
+                    text = block_info["text_content"] if block_info else "(deleted)"
+                else:
+                    text = "(no block)"
+                keep_blocks.append({
+                    "number": int(num_str),
+                    "text": text,
+                    "created_at": entry.get("c", ""),
+                    "last_active": entry.get("a", ""),
+                })
+
+            # 5. Write archive document in past/ folder
+            now = _now_iso()
+            now_label = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+            archive_doc_id = f"geist-memory-archive-{now_label}"
+
+            # Sort archived memories by number for readability
+            archive_blocks.sort(key=lambda m: m["number"])
+
+            archive_xml_parts = [
+                f'<heading level="1">Memory Archive — {html_mod.escape(now_label)}</heading>',
+                f"<paragraph>Archived {len(archive_blocks)} memories. "
+                f"Kept {len(keep_blocks)} most recently active.</paragraph>",
+            ]
+            for mem in archive_blocks:
+                escaped_text = html_mod.escape(mem["text"])
+                archive_xml_parts.append(
+                    f"<paragraph><strong>{mem['number']}.</strong> {escaped_text}</paragraph>"
+                )
+
+            archive_xml = "".join(archive_xml_parts)
+
+            # Register archive doc in workspace
+            await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
+            await hp_client.transact_workspace(
+                graph_id,
+                lambda doc, did=archive_doc_id: WorkspaceWriter(doc).upsert_document(
+                    did, f"Memory Archive {now_label}", parent_id=PAST_FOLDER_ID,
+                ),
+                user_id=auth.user_id,
+            )
+
+            # Write archive content
+            await hp_client.connect_document(graph_id, archive_doc_id, user_id=auth.user_id)
+            await hp_client.transact_document(
+                graph_id,
+                archive_doc_id,
+                lambda doc, xml=archive_xml: DocumentWriter(doc).replace_all_content(xml),
+                user_id=auth.user_id,
+            )
+
+            # 6. Rewrite memory queue fresh with only kept memories
+            # Sort kept memories by number to preserve original ordering
+            keep_blocks.sort(key=lambda m: m["number"])
+
+            # Build new metadata and XML
+            new_memories = {}
+            queue_xml_parts = [
+                '<heading level="1">Memory Queue</heading>',
+            ]
+
+            # Temporary meta with empty memories — will be updated after rewrite
+            # when we know new block IDs. This keeps the queue valid even if
+            # the second transaction fails.
+            temp_meta = json.dumps(
+                {"next_number": next_number, "memories": {}},
+                separators=(",", ":"),
+            )
+            queue_xml_parts.append(
+                f"<paragraph>{GEIST_META_PREFIX}{html_mod.escape(temp_meta)}</paragraph>"
+            )
+
+            for mem in keep_blocks:
+                escaped_text = html_mod.escape(mem["text"])
+                queue_xml_parts.append(
+                    f"<paragraph><strong>{mem['number']}.</strong> {escaped_text}</paragraph>"
+                )
+
+            queue_xml = "".join(queue_xml_parts)
+
+            # Replace the entire queue document
+            await hp_client.transact_document(
+                graph_id,
+                MEMORY_QUEUE_DOC_ID,
+                lambda doc, xml=queue_xml: DocumentWriter(doc).replace_all_content(xml),
+                user_id=auth.user_id,
+            )
+
+            # 7. Read back to get new block IDs, then update metadata
+            await hp_client.connect_document(graph_id, MEMORY_QUEUE_DOC_ID, user_id=auth.user_id)
+            channel = hp_client.get_document_channel(
+                graph_id, MEMORY_QUEUE_DOC_ID, user_id=auth.user_id,
+            )
+            new_reader = DocumentReader(channel.doc)
+            block_count = new_reader.get_block_count()
+
+            # Block 0 = heading, Block 1 = meta placeholder, Block 2+ = memories
+            for i, mem in enumerate(keep_blocks):
+                block_idx = i + 2  # Skip heading + meta
+                if block_idx < block_count:
+                    block = new_reader.get_block_at(block_idx)
+                    if block and hasattr(block, "attributes"):
+                        bid = block.attributes.get("data-block-id")
+                        if bid:
+                            new_memories[str(mem["number"])] = {
+                                "b": bid,
+                                "c": mem["created_at"],
+                                "a": mem["last_active"],
+                            }
+
+            # Write the real metadata into the meta block
+            new_meta = {
+                "next_number": next_number,
+                "memories": new_memories,
+            }
+            _, new_meta_block_id = _read_geist_meta(new_reader)
+            if new_meta_block_id:
+                await hp_client.transact_document(
+                    graph_id,
+                    MEMORY_QUEUE_DOC_ID,
+                    lambda doc, m=new_meta, bid=new_meta_block_id: _write_geist_meta(
+                        DocumentWriter(doc), m, bid,
+                    ),
+                    user_id=auth.user_id,
+                )
+
+        return _render_json({
+            "kept": len(keep_blocks),
+            "archived": len(archive_blocks),
+            "archive_doc_id": archive_doc_id,
+            "note": (
+                f"Archived {len(archive_blocks)} memories to past/{archive_doc_id}. "
+                f"Queue rewritten with {len(keep_blocks)} memories."
+            ),
+        })
+
+    # ================================================================
     # ORIENTATION BUNDLE
     # ================================================================
 
     @server.tool(
-        name="orient",
-        title="Orientation Bundle",
+        name="quick_orient",
+        title="Quick Orientation",
         description=(
-            "Single-call orientation for session start or post-compaction recovery. "
-            "Returns location, Song, recent memories, top valued blocks, and workspace "
-            "structure in one response. Equivalent to calling get_user_location + music + "
-            "recall + get_important_blocks + get_workspace in parallel, but in a single "
-            "round-trip.\n\n"
-            "Each section degrades gracefully — if one component fails, the others still "
-            "return. Use this instead of the 5-call orientation batch when you want to "
-            "minimize tool calls."
+            "Lightweight orientation for emergency recovery or post-compaction triage. "
+            "Returns location, Song, and recent memories in one call.\n\n"
+            "This is NOT the default orientation flow. Agents should normally run the "
+            "manual 3-step sequence: (1) get_user_location, (2) batch music + recall + "
+            "get_important_blocks, (3) get_workspace. The manual sequence preserves the "
+            "temporal structure where the Song lands as narrative identity before structural "
+            "knowledge.\n\n"
+            "Use quick_orient only when you need minimal context fast — e.g. mid-session "
+            "recovery after an error, or when token budget is critically low."
         ),
     )
-    async def orient_tool(
+    async def quick_orient_tool(
         graph_id: str = "default",
         recall_limit: int = 5,
-        important_limit: int = 5,
-        workspace_depth: int = 2,
         context: Context | None = None,
     ) -> str:
-        """Return a complete orientation bundle for session start.
+        """Return a lightweight orientation bundle (location + song + recall).
 
         Args:
             graph_id: The graph to orient in (default: "default")
             recall_limit: Number of recent memories to include (default: 5)
-            important_limit: Number of top valued blocks to include (default: 5)
-            workspace_depth: Workspace tree depth (default: 2)
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
@@ -2102,7 +2359,7 @@ LIMIT {min(limit * 3, 60)}
         except Exception as e:
             result["location"] = {"graph_id": graph_id, "error": str(e)}
 
-        # --- Phase 2: Run Song, Recall, Important Blocks, Workspace concurrently ---
+        # --- Phase 2: Run Song and Recall concurrently ---
 
         async def _get_song() -> Dict[str, Any]:
             try:
@@ -2158,214 +2415,18 @@ LIMIT {min(limit * 3, 60)}
             except Exception as e:
                 return {"error": str(e)}
 
-        async def _get_important() -> Dict[str, Any]:
-            try:
-                query = f"""
-PREFIX doc: <http://mnemosyne.dev/doc#>
-PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
-
-SELECT ?val ?blockRef ?cumImp ?cumVal ?lastVal
-WHERE {{
-  ?val doc:blockRef ?blockRef .
-  ?val doc:cumulativeImportance ?cumImp .
-  ?val doc:cumulativeValence ?cumVal .
-  OPTIONAL {{ ?val doc:lastValuatedAt ?lastVal }}
-}}
-ORDER BY DESC(xsd:float(?cumImp))
-LIMIT {min(important_limit * 3, 60)}
-"""
-                rows = await _sparql_query(backend_config, job_stream, auth, graph_id, query)
-                if not rows:
-                    return {"blocks": [], "count": 0}
-
-                # Load weights config
-                weights = dict(DEFAULT_WEIGHTS)
-                try:
-                    await _ensure_scratchpad(hp_client, graph_id, auth)
-                    await hp_client.connect_document(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
-                    w_channel = hp_client.get_document_channel(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
-                    if w_channel:
-                        w_reader = DocumentReader(w_channel.doc)
-                        weights = _parse_weights_text(tiptap_xml_to_markdown(w_reader.to_xml()))
-                except Exception:
-                    pass
-
-                # Build wire indexes
-                doc_wire_counts: Dict[str, int] = {}
-                block_wire_counts: Dict[str, int] = {}
-                doc_newest_wire: Dict[str, str] = {}
-                ws_doc = None
-                try:
-                    await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
-                    ws_ch = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
-                    if ws_ch:
-                        ws_doc = ws_ch.doc
-                        all_wires = _get_all_wires(ws_doc)
-                        doc_wire_counts, block_wire_counts, doc_newest_wire = _build_wire_indexes(all_wires)
-                except Exception:
-                    pass
-
-                now = datetime.now(timezone.utc)
-
-                # Full composite scoring
-                scored = []
-                for row in rows:
-                    cum_imp = float(row.get("cumImp", 0))
-                    cum_val = float(row.get("cumVal", 0))
-                    block_ref = row.get("blockRef", "")
-                    parsed_doc_id = ""
-                    parsed_block_id = ""
-                    if "#block-" in block_ref:
-                        pre, _, parsed_block_id = block_ref.rpartition("#block-")
-                        if ":doc:" in pre:
-                            parsed_doc_id = pre.rpartition(":doc:")[2]
-
-                    last_val_str = row.get("lastVal", "")
-                    doc_age_days = 0.0
-                    if last_val_str:
-                        try:
-                            last_val_dt = datetime.fromisoformat(last_val_str.replace("Z", "+00:00"))
-                            doc_age_days = max(0.0, (now - last_val_dt).total_seconds() / 86400.0)
-                        except (ValueError, TypeError):
-                            pass
-
-                    bwc = block_wire_counts.get(parsed_block_id, 0)
-                    dwc = doc_wire_counts.get(parsed_doc_id, 0)
-
-                    wire_age_days = 0.0
-                    newest_wire = doc_newest_wire.get(parsed_doc_id, "")
-                    if newest_wire:
-                        try:
-                            wire_dt = datetime.fromisoformat(newest_wire.replace("Z", "+00:00"))
-                            wire_age_days = max(0.0, (now - wire_dt).total_seconds() / 86400.0)
-                        except (ValueError, TypeError):
-                            pass
-
-                    composite = _compute_composite_score(
-                        importance=cum_imp, valence=cum_val,
-                        doc_age_days=doc_age_days, block_wire_count=bwc,
-                        doc_wire_count=dwc, wire_age_days=wire_age_days,
-                        weights=weights,
-                    )
-
-                    scored.append({
-                        "doc_id": parsed_doc_id,
-                        "block_id": parsed_block_id,
-                        "composite": composite,
-                        "importance": round(cum_imp, 3),
-                        "valence": round(cum_val, 3),
-                        "block_wires": bwc,
-                        "doc_wires": dwc,
-                    })
-
-                scored.sort(key=lambda b: b["composite"], reverse=True)
-                scored = scored[:important_limit]
-
-                # Fetch content for top blocks
-                blocks = []
-                doc_groups: Dict[str, list] = {}
-                for item in scored:
-                    doc_groups.setdefault(item["doc_id"], []).append(item)
-
-                for did, items in doc_groups.items():
-                    title = _resolve_title_from_workspace(ws_doc, did) or did
-                    try:
-                        await hp_client.connect_document(graph_id, did, user_id=auth.user_id)
-                        ch = hp_client.get_document_channel(graph_id, did, user_id=auth.user_id)
-                        if ch is None:
-                            continue
-                        rdr = DocumentReader(ch.doc)
-                        for item in items:
-                            binfo = rdr.get_block_info(item["block_id"])
-                            content = binfo["text_content"] if binfo else "(deleted)"
-                            blocks.append({
-                                "content": content,
-                                "document": title,
-                                "score": item["composite"],
-                                "importance": item["importance"],
-                                "valence": item["valence"],
-                                "block_id": item["block_id"],
-                                "doc_id": item["doc_id"],
-                                "block_wires": item["block_wires"],
-                                "doc_wires": item["doc_wires"],
-                            })
-                    except Exception:
-                        for item in items:
-                            blocks.append({
-                                "content": "(unavailable)",
-                                "document": title,
-                                "score": item["composite"],
-                                "importance": item["importance"],
-                                "valence": item["valence"],
-                                "block_id": item["block_id"],
-                                "doc_id": item["doc_id"],
-                                "block_wires": item["block_wires"],
-                                "doc_wires": item["doc_wires"],
-                            })
-
-                blocks.sort(key=lambda b: b["score"], reverse=True)
-                return {"blocks": blocks, "count": len(blocks)}
-            except Exception as e:
-                return {"error": str(e)}
-
-        async def _get_workspace_summary() -> Dict[str, Any]:
-            try:
-                await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
-                snapshot = hp_client.get_workspace_snapshot(graph_id, user_id=auth.user_id)
-                docs = snapshot.get("documents", {})
-                folders = snapshot.get("folders", {})
-
-                # Build a simple folder summary with document counts
-                folder_doc_counts: Dict[Optional[str], int] = {}
-                folder_labels: Dict[str, str] = {}
-
-                for fid, fdata in folders.items():
-                    label = fdata.get("label") or fdata.get("name") or fid
-                    folder_labels[fid] = label
-
-                for _did, ddata in docs.items():
-                    parent = ddata.get("parentId")
-                    folder_doc_counts[parent] = folder_doc_counts.get(parent, 0) + 1
-
-                tree = []
-                # Root-level documents
-                root_count = folder_doc_counts.get(None, 0)
-                if root_count > 0:
-                    tree.append({"name": "(root)", "documents": root_count})
-
-                # Folders with counts
-                for fid in sorted(folders.keys(), key=lambda x: folder_labels.get(x, x)):
-                    count = folder_doc_counts.get(fid, 0)
-                    label = folder_labels[fid]
-                    # Skip internal Geist folders from summary
-                    if fid in (SCRATCHPAD_FOLDER_ID, PRESENT_FOLDER_ID, PAST_FOLDER_ID):
-                        continue
-                    tree.append({"name": label, "folder_id": fid, "documents": count})
-
-                return {
-                    "total_documents": len(docs),
-                    "total_folders": len(folders),
-                    "folders": tree,
-                }
-            except Exception as e:
-                return {"error": str(e)}
-
-        # Run all four concurrently
-        song, memories, important, workspace = await asyncio.gather(
+        # Run song and memories concurrently
+        song, memories = await asyncio.gather(
             _get_song(),
             _get_memories(),
-            _get_important(),
-            _get_workspace_summary(),
         )
 
         result["song"] = song
         result["recall"] = memories
-        result["important_blocks"] = important
-        result["workspace"] = workspace
 
         return _render_json(result)
 
-    logger.info("Registered Geist (Sophia Memory) tools: 12 tools")
+    logger.info("Registered Geist (Sophia Memory) tools: 13 tools")
 
 
 # ── Song parsing helpers ────────────────────────────────────────────
