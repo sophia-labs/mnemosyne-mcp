@@ -1279,6 +1279,7 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
         folder_id: str | None = None,
         excluded_doc_ids: set[str] | None = None,
         valued_doc_ids: set[str] | None = None,
+        folders_only: bool = False,
     ) -> list[dict[str, Any]]:
         """Transform flat workspace snapshot into a nested tree.
 
@@ -1295,6 +1296,8 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             excluded_doc_ids: Document IDs to exclude (e.g. filtered by score).
             valued_doc_ids: Document IDs that have valuations (for enriched
                 collapse counts showing "N documents, M valued").
+            folders_only: If True, return only the folder hierarchy with
+                document counts per folder. No individual documents listed.
         """
         folders = snapshot.get("folders", {})
         documents = snapshot.get("documents", {})
@@ -1309,18 +1312,19 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             node["children"] = []
             nodes[fid] = node
 
-        for did, ddata in documents.items():
-            if excluded_doc_ids and did in excluded_doc_ids:
-                continue
-            node = {"id": did, "type": "document", "title": ddata.get("title", "Untitled")}
-            if ddata.get("readOnly"):
-                node["readOnly"] = True
-            sf_file_type = ddata.get("sf_fileType")
-            if sf_file_type:
-                node["fileType"] = sf_file_type
-            node["_parent"] = ddata.get("parentId")
-            node["_order"] = ddata.get("order", 0)
-            nodes[did] = node
+        if not folders_only:
+            for did, ddata in documents.items():
+                if excluded_doc_ids and did in excluded_doc_ids:
+                    continue
+                node = {"id": did, "type": "document", "title": ddata.get("title", "Untitled")}
+                if ddata.get("readOnly"):
+                    node["readOnly"] = True
+                sf_file_type = ddata.get("sf_fileType")
+                if sf_file_type:
+                    node["fileType"] = sf_file_type
+                node["_parent"] = ddata.get("parentId")
+                node["_order"] = ddata.get("order", 0)
+                nodes[did] = node
 
         # Build tree by inserting children into parent folders
         root: list[dict[str, Any]] = []
@@ -1330,6 +1334,26 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
                 nodes[parent_id]["children"].append(node)
             else:
                 root.append(node)
+
+        # In folders_only mode, annotate each folder with document counts
+        # from the raw snapshot (documents weren't added as tree nodes).
+        if folders_only:
+            # Count direct documents per folder, and unfiled (root-level) docs
+            docs_per_folder: dict[str | None, int] = {}
+            for did, ddata in documents.items():
+                pid = ddata.get("parentId")
+                docs_per_folder[pid] = docs_per_folder.get(pid, 0) + 1
+
+            def _annotate_doc_counts(items: list[dict[str, Any]]) -> None:
+                for item in items:
+                    fid = item.get("id")
+                    direct = docs_per_folder.get(fid, 0)
+                    if direct > 0:
+                        item["documents"] = direct
+                    if "children" in item:
+                        _annotate_doc_counts(item["children"])
+
+            _annotate_doc_counts(root)
 
         # Sort children by order, then strip internal _order keys
         # Apply depth truncation: at max_depth, collapse folders to counts
@@ -1409,7 +1433,10 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             "- min_score (optional): Filter out documents with a document-level composite score below "
             "this threshold. Document scores are computed from block-level valuations (avg importance, "
             "avg valence). Only applies to documents that have been valuated; unscored documents "
-            "are always shown.\n\n"
+            "are always shown.\n"
+            "- folders_only (default false): Return only the folder hierarchy with document counts "
+            "per folder. No individual documents listed. Useful for understanding graph organization "
+            "without the full document list.\n\n"
             "This is always complete at the requested depth — prefer it over sparql_query for "
             "discovering what documents exist."
         ),
@@ -1419,6 +1446,7 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
         depth: int = 2,
         folder_id: Optional[str] = None,
         min_score: Optional[float] = None,
+        folders_only: bool = False,
         context: Context | None = None,
     ) -> str:
         """Get workspace folder structure as a nested tree."""
@@ -1453,12 +1481,22 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
                 folder_id=folder_id,
                 excluded_doc_ids=excluded_doc_ids,
                 valued_doc_ids=valued_doc_ids,
+                folders_only=folders_only,
             )
             result: dict[str, Any] = {"graph_id": graph_id, "tree": tree}
             if depth > 0:
                 result["depth"] = depth
             if folder_id:
                 result["folder_id"] = folder_id
+            if folders_only:
+                result["folders_only"] = True
+                # Count unfiled (root-level) documents
+                unfiled = sum(
+                    1 for d in snapshot.get("documents", {}).values()
+                    if not d.get("parentId")
+                )
+                if unfiled > 0:
+                    result["unfiled_documents"] = unfiled
             return json.dumps(result)
 
         except Exception as e:
