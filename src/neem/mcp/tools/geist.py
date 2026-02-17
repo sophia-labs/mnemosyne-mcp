@@ -1443,7 +1443,11 @@ INSERT DATA {{
         valuations: List[Dict[str, Any]],
         context: Context | None = None,
     ) -> str:
-        """Valuate multiple blocks in batch."""
+        """Valuate multiple blocks in batch.
+
+        Uses 3 SPARQL round-trips total (1 read + 1 delete + 1 insert)
+        regardless of batch size, instead of 3 per block.
+        """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
         user_id = _resolve_user_id(auth)
@@ -1452,108 +1456,163 @@ INSERT DATA {{
             raise ValueError("valuations list is required and must not be empty")
 
         graph_id = graph_id.strip()
-        results: List[Dict[str, Any]] = []
         errors: List[Dict[str, Any]] = []
 
+        # 1. Validate all entries and build URI maps
+        valid_entries: List[Dict[str, Any]] = []
         for i, entry in enumerate(valuations):
-            try:
-                doc_id = entry.get("document_id", "").strip()
-                blk_id = entry.get("block_id", "").strip()
-                imp = entry.get("importance")
-                val = entry.get("valence")
+            doc_id = str(entry.get("document_id", "")).strip()
+            blk_id = str(entry.get("block_id", "")).strip()
+            imp = entry.get("importance")
+            val = entry.get("valence")
 
-                if not doc_id or not blk_id:
-                    errors.append({"index": i, "error": "document_id and block_id are required"})
-                    continue
-                if imp is None and val is None:
-                    errors.append({"index": i, "error": "At least one of importance or valence required"})
-                    continue
-                if imp is not None and not (0 <= imp <= 5):
-                    errors.append({"index": i, "error": "importance must be between 0 and 5"})
-                    continue
-                if val is not None and not (-5 <= val <= 5):
-                    errors.append({"index": i, "error": "valence must be between -5 and +5"})
-                    continue
+            if not doc_id or not blk_id:
+                errors.append({"index": i, "error": "document_id and block_id are required"})
+                continue
+            if imp is None and val is None:
+                errors.append({"index": i, "error": "At least one of importance or valence required"})
+                continue
+            if imp is not None and not (0 <= imp <= 5):
+                errors.append({"index": i, "error": "importance must be between 0 and 5"})
+                continue
+            if val is not None and not (-5 <= val <= 5):
+                errors.append({"index": i, "error": "valence must be between -5 and +5"})
+                continue
 
-                val_uri = (
-                    f"urn:mnemosyne:user:{user_id}:graph:{graph_id}"
-                    f":valuation:{doc_id}:{blk_id}"
-                )
-                block_uri = (
-                    f"urn:mnemosyne:user:{user_id}:graph:{graph_id}"
-                    f":doc:{doc_id}#block-{blk_id}"
-                )
+            val_uri = (
+                f"urn:mnemosyne:user:{user_id}:graph:{graph_id}"
+                f":valuation:{doc_id}:{blk_id}"
+            )
+            block_uri = (
+                f"urn:mnemosyne:user:{user_id}:graph:{graph_id}"
+                f":doc:{doc_id}#block-{blk_id}"
+            )
+            valid_entries.append({
+                "index": i,
+                "doc_id": doc_id,
+                "blk_id": blk_id,
+                "imp": imp,
+                "val": val,
+                "val_uri": val_uri,
+                "block_uri": block_uri,
+            })
 
-                # Read current values
-                query = f"""
+        if not valid_entries:
+            output: Dict[str, Any] = {"results": [], "updated_count": 0}
+            if errors:
+                output["errors"] = errors
+                output["error_count"] = len(errors)
+            return _render_json(output)
+
+        # 2. Single SPARQL SELECT to read all current valuations
+        values_clause = " ".join(f"(<{e['val_uri']}>)" for e in valid_entries)
+        read_query = f"""
 PREFIX doc: <http://mnemosyne.dev/doc#>
-SELECT ?rawImp ?impCount ?rawVal ?valCount
+SELECT ?valUri ?rawImp ?impCount ?rawVal ?valCount
 WHERE {{
-  OPTIONAL {{ <{val_uri}> doc:rawImportanceSum ?rawImp }}
-  OPTIONAL {{ <{val_uri}> doc:importanceCount ?impCount }}
-  OPTIONAL {{ <{val_uri}> doc:rawValenceSum ?rawVal }}
-  OPTIONAL {{ <{val_uri}> doc:valenceCount ?valCount }}
+  VALUES (?valUri) {{ {values_clause} }}
+  OPTIONAL {{ ?valUri doc:rawImportanceSum ?rawImp }}
+  OPTIONAL {{ ?valUri doc:importanceCount ?impCount }}
+  OPTIONAL {{ ?valUri doc:rawValenceSum ?rawVal }}
+  OPTIONAL {{ ?valUri doc:valenceCount ?valCount }}
 }}
 """
-                rows = await _sparql_query(backend_config, job_stream, auth, graph_id, query)
-                current = rows[0] if rows else {}
+        rows = await _sparql_query(backend_config, job_stream, auth, graph_id, read_query)
 
-                old_raw_imp = float(current.get("rawImp", 0))
-                old_imp_count = int(current.get("impCount", 0))
-                old_raw_val = float(current.get("rawVal", 0))
-                old_val_count = int(current.get("valCount", 0))
+        # Index current values by valuation URI
+        current_by_uri: Dict[str, Dict[str, str]] = {}
+        for row in rows:
+            uri = row.get("valUri", "")
+            if uri:
+                current_by_uri[uri] = row
 
-                new_raw_imp = old_raw_imp + (imp if imp is not None else 0)
-                new_imp_count = old_imp_count + (1 if imp is not None else 0)
-                new_raw_val = old_raw_val + (val if val is not None else 0)
-                new_val_count = old_val_count + (1 if val is not None else 0)
+        # 3. Compute new values for each entry
+        now = _now_iso()
+        results: List[Dict[str, Any]] = []
+        computed: List[Dict[str, Any]] = []
 
-                new_cum_imp = math.log2(1 + new_raw_imp) if new_raw_imp > 0 else 0.0
-                if new_raw_val != 0:
-                    sign = 1 if new_raw_val >= 0 else -1
-                    new_cum_val = sign * math.log2(1 + abs(new_raw_val))
-                else:
-                    new_cum_val = 0.0
+        for entry in valid_entries:
+            current = current_by_uri.get(entry["val_uri"], {})
+            old_raw_imp = float(current.get("rawImp", 0))
+            old_imp_count = int(current.get("impCount", 0))
+            old_raw_val = float(current.get("rawVal", 0))
+            old_val_count = int(current.get("valCount", 0))
 
-                now = _now_iso()
+            imp = entry["imp"]
+            val = entry["val"]
 
-                delete_sparql = f"""
+            new_raw_imp = old_raw_imp + (imp if imp is not None else 0)
+            new_imp_count = old_imp_count + (1 if imp is not None else 0)
+            new_raw_val = old_raw_val + (val if val is not None else 0)
+            new_val_count = old_val_count + (1 if val is not None else 0)
+
+            new_cum_imp = math.log2(1 + new_raw_imp) if new_raw_imp > 0 else 0.0
+            if new_raw_val != 0:
+                sign = 1 if new_raw_val >= 0 else -1
+                new_cum_val = sign * math.log2(1 + abs(new_raw_val))
+            else:
+                new_cum_val = 0.0
+
+            computed.append({
+                **entry,
+                "new_raw_imp": new_raw_imp,
+                "new_imp_count": new_imp_count,
+                "new_cum_imp": round(new_cum_imp, 4),
+                "new_raw_val": new_raw_val,
+                "new_val_count": new_val_count,
+                "new_cum_val": round(new_cum_val, 4),
+                "now": now,
+            })
+
+        # 4. Single SPARQL DELETE for all valuation URIs
+        # Uses DELETE { } WHERE { } form (not DELETE WHERE shorthand) so the
+        # _sparql_update helper injects a WITH <graph> clause correctly.
+        delete_values = " ".join(f"(<{c['val_uri']}>)" for c in computed)
+        delete_sparql = f"""
 PREFIX doc: <http://mnemosyne.dev/doc#>
-DELETE WHERE {{ <{val_uri}> ?p ?o }}
+DELETE {{ ?v ?p ?o }}
+WHERE {{
+  VALUES (?v) {{ {delete_values} }}
+  ?v ?p ?o .
+}}
 """
-                await _sparql_update(backend_config, job_stream, auth, graph_id, delete_sparql)
+        await _sparql_update(backend_config, job_stream, auth, graph_id, delete_sparql)
 
-                insert_sparql = f"""
+        # 5. Single SPARQL INSERT for all new triples
+        insert_triples = []
+        for c in computed:
+            insert_triples.append(f"""  <{c['val_uri']}> doc:blockRef <{c['block_uri']}> .
+  <{c['val_uri']}> doc:rawImportanceSum "{c['new_raw_imp']}"^^xsd:float .
+  <{c['val_uri']}> doc:importanceCount "{c['new_imp_count']}"^^xsd:integer .
+  <{c['val_uri']}> doc:cumulativeImportance "{c['new_cum_imp']}"^^xsd:float .
+  <{c['val_uri']}> doc:rawValenceSum "{c['new_raw_val']}"^^xsd:float .
+  <{c['val_uri']}> doc:valenceCount "{c['new_val_count']}"^^xsd:integer .
+  <{c['val_uri']}> doc:cumulativeValence "{c['new_cum_val']}"^^xsd:float .
+  <{c['val_uri']}> doc:lastValuatedAt "{c['now']}"^^xsd:dateTime .""")
+
+        insert_sparql = f"""
 PREFIX doc: <http://mnemosyne.dev/doc#>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 INSERT DATA {{
-  <{val_uri}> doc:blockRef <{block_uri}> .
-  <{val_uri}> doc:rawImportanceSum "{new_raw_imp}"^^xsd:float .
-  <{val_uri}> doc:importanceCount "{new_imp_count}"^^xsd:integer .
-  <{val_uri}> doc:cumulativeImportance "{round(new_cum_imp, 4)}"^^xsd:float .
-  <{val_uri}> doc:rawValenceSum "{new_raw_val}"^^xsd:float .
-  <{val_uri}> doc:valenceCount "{new_val_count}"^^xsd:integer .
-  <{val_uri}> doc:cumulativeValence "{round(new_cum_val, 4)}"^^xsd:float .
-  <{val_uri}> doc:lastValuatedAt "{now}"^^xsd:dateTime .
+{chr(10).join(insert_triples)}
 }}
 """
-                success = await _sparql_update(backend_config, job_stream, auth, graph_id, insert_sparql)
+        success = await _sparql_update(backend_config, job_stream, auth, graph_id, insert_sparql)
 
-                if not success:
-                    errors.append({"index": i, "error": "SPARQL update failed"})
-                    continue
-
+        if not success:
+            # INSERT failed — report all as errors
+            for c in computed:
+                errors.append({"index": c["index"], "error": "Batch SPARQL INSERT failed"})
+        else:
+            for c in computed:
                 results.append({
-                    "block_id": blk_id,
-                    "document_id": doc_id,
-                    "cumulative_importance": round(new_cum_imp, 4),
-                    "cumulative_valence": round(new_cum_val, 4),
+                    "block_id": c["blk_id"],
+                    "document_id": c["doc_id"],
+                    "cumulative_importance": c["new_cum_imp"],
+                    "cumulative_valence": c["new_cum_val"],
                 })
 
-            except Exception as e:
-                errors.append({"index": i, "error": str(e)})
-
-        output: Dict[str, Any] = {"results": results, "updated_count": len(results)}
+        output = {"results": results, "updated_count": len(results)}
         if errors:
             output["errors"] = errors
             output["error_count"] = len(errors)
