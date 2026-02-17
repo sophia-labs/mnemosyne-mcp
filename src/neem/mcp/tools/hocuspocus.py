@@ -178,18 +178,37 @@ GROUP BY ?docId
             raw = None
             if ws_events:
                 for event in reversed(ws_events):
-                    if event.get("type") in ("job_completed", "completed", "succeeded"):
-                        payload = event.get("payload", {})
-                        if isinstance(payload, dict):
-                            detail = payload.get("detail")
-                            if isinstance(detail, dict):
-                                inline = detail.get("result_inline")
-                                if isinstance(inline, dict) and "raw" in inline:
-                                    raw = inline["raw"]
-                                elif inline is not None:
-                                    raw = inline
-                        break
-            elif poll_payload:
+                    event_type = event.get("type", "")
+                    payload = event.get("payload", {})
+                    payload_status = payload.get("status", "") if isinstance(payload, dict) else ""
+                    is_success = (
+                        event_type in ("job_completed", "completed", "succeeded")
+                        or (event_type == "job_update" and payload_status == "succeeded")
+                    )
+                    if not is_success:
+                        continue
+                    if isinstance(payload, dict):
+                        detail = payload.get("detail")
+                        if isinstance(detail, dict):
+                            inline = detail.get("result_inline")
+                            if isinstance(inline, dict) and "raw" in inline:
+                                raw = inline["raw"]
+                            elif inline is not None:
+                                raw = inline
+                        if raw is None and payload.get("result_inline") is not None:
+                            inline = payload.get("result_inline")
+                            if isinstance(inline, dict) and "raw" in inline:
+                                raw = inline["raw"]
+                            else:
+                                raw = inline
+                    if raw is None and event.get("result_inline") is not None:
+                        inline = event.get("result_inline")
+                        if isinstance(inline, dict) and "raw" in inline:
+                            raw = inline["raw"]
+                        else:
+                            raw = inline
+                    break
+            if raw is None and poll_payload:
                 detail = poll_payload.get("detail")
                 if isinstance(detail, dict):
                     inline = detail.get("result_inline")
@@ -272,7 +291,11 @@ GROUP BY ?docId
                 title = doc_info.get("title", doc_id) if isinstance(doc_info, dict) else doc_id
                 available.append(f"  - {title} ({doc_id})")
 
-        msg = f"Document '{document_id}' not found in graph '{graph_id}'."
+        msg = (
+            f"Document '{document_id}' not found in graph '{graph_id}'. "
+            f"It may have been deleted — if so, use a different document ID "
+            f"(deleted document IDs are tombstoned and cannot be reused)."
+        )
         if available:
             shown = available[:15]
             msg += "\n\nAvailable documents:\n" + "\n".join(shown)
@@ -1083,7 +1106,30 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
                         if bid:
                             block_ids.append(bid)
 
-            # 2. Update workspace navigation so document appears in file tree
+            # 2. Verify content persisted (detect tombstoned document IDs)
+            # Read back through a fresh channel to confirm the write landed.
+            expected_count = len(block_ids)
+            if expected_count > 0:
+                await _connect_for_read(graph_id, document_id, auth.user_id)
+                verify_channel = hp_client.get_document_channel(
+                    graph_id, document_id, user_id=auth.user_id,
+                )
+                actual_count = 0
+                if verify_channel:
+                    verify_reader = DocumentReader(verify_channel.doc)
+                    verify_frag = verify_reader.get_content_fragment()
+                    actual_count = len([
+                        c for c in verify_frag.children
+                        if hasattr(c, "attributes") and c.attributes.get("data-block-id")
+                    ])
+                if actual_count < expected_count:
+                    raise RuntimeError(
+                        f"Write to '{document_id}' failed: wrote {expected_count} blocks "
+                        f"but only {actual_count} persisted. This document ID may be "
+                        f"tombstoned from a previous deletion — try a different document ID."
+                    )
+
+            # 3. Update workspace navigation so document appears in file tree
             # Extract title from first heading, fallback to document_id
             title = extract_title_from_xml(xml_content) or document_id
             await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
