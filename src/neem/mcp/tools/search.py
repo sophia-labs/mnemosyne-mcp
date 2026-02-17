@@ -75,22 +75,6 @@ def _escape_sparql_string(s: str) -> str:
     )
 
 
-def _parse_block_uri(uri: str) -> tuple[str | None, str | None]:
-    """Extract (doc_id, block_id) from RDF block URI.
-
-    URI pattern: urn:mnemosyne:user:{uid}:graph:{gid}:doc:{doc_id}#block-{block_id}
-    """
-    if "#block-" in uri:
-        doc_part, block_id = uri.rsplit("#block-", 1)
-        doc_id = doc_part.rsplit(":", 1)[-1] if ":" in doc_part else None
-        return doc_id, block_id
-    # Fragment block (e.g., #frag) — skip these
-    if "#" in uri:
-        doc_part = uri.split("#")[0]
-        doc_id = doc_part.rsplit(":", 1)[-1] if ":" in doc_part else None
-        return doc_id, None
-    return None, None
-
 
 def _extract_inline_result(result: JsonDict) -> Any:
     """Extract result_inline from a job result dict."""
@@ -356,10 +340,10 @@ def register_search_tools(server: FastMCP) -> None:
             for r in raw_results:
                 out.append({
                     "block_id": r.get("block_id", ""),
-                    "document_id": r.get("document_id", ""),
-                    "document_title": r.get("document_title", ""),
-                    "text": r.get("text", ""),
-                    "similarity_score": r.get("similarity_score"),
+                    "document_id": r.get("doc_id", ""),
+                    "document_title": r.get("doc_title", ""),
+                    "text": r.get("text_preview", ""),
+                    "similarity_score": r.get("score"),
                 })
             return out
 
@@ -377,7 +361,12 @@ def register_search_tools(server: FastMCP) -> None:
         doc_titles: dict[str, str],
         use_regex: bool = False,
     ) -> list[dict]:
-        """Run lexical content search via SPARQL job queue."""
+        """Run lexical content search via SPARQL job queue.
+
+        Content lives on TextNode entities (doc:content triples) nested
+        inside addressable blocks (doc:nodeId). The query joins through
+        the block tree to return block IDs usable for wiring and merge.
+        """
         user_id = auth.user_id or (get_user_id_from_token(auth.token) if auth.token else None)
         if not user_id:
             logger.warning("lexical_search_no_user_id")
@@ -385,26 +374,31 @@ def register_search_tools(server: FastMCP) -> None:
 
         graph_uri = f"urn:mnemosyne:user:{user_id}:graph:{graph_id}"
 
-        # Build SPARQL FILTER
+        # Build SPARQL FILTER on text content
         if use_regex:
             escaped = _escape_sparql_string(query)
-            filter_clause = f'FILTER(REGEX(?content, "{escaped}", "i"))'
+            filter_clause = f'FILTER(REGEX(?text, "{escaped}", "i"))'
         else:
             escaped = _escape_sparql_string(query.lower())
-            filter_clause = f'FILTER(CONTAINS(LCASE(?content), "{escaped}"))'
+            filter_clause = f'FILTER(CONTAINS(LCASE(?text), "{escaped}"))'
 
-        # Optional doc filter
+        # Optional doc filter — scope to a single document's blocks
         doc_filter_clause = ""
         if doc_filter:
-            doc_uri_prefix = f"{graph_uri}:doc:{doc_filter}#"
-            doc_filter_clause = f'\n    FILTER(STRSTARTS(STR(?blockUri), "{doc_uri_prefix}"))'
+            safe_doc_filter = _escape_sparql_string(doc_filter)
+            doc_uri_prefix = f"{graph_uri}:doc:{safe_doc_filter}#"
+            doc_filter_clause = f'\n    FILTER(STRSTARTS(STR(?block), "{doc_uri_prefix}"))'
 
+        # Join TextNodes → parent block (via doc:childNode+) to get
+        # the addressable block ID (doc:nodeId) alongside content.
         sparql = (
             'PREFIX doc: <http://mnemosyne.dev/doc#>\n'
-            'SELECT ?blockUri ?content\n'
+            'SELECT ?block ?blockId ?text\n'
             f'FROM <{graph_uri}>\n'
             'WHERE {\n'
-            '    ?blockUri doc:content ?content .\n'
+            '    ?block doc:nodeId ?blockId .\n'
+            '    ?block doc:childNode+ ?textNode .\n'
+            '    ?textNode doc:content ?text .\n'
             f'    {filter_clause}{doc_filter_clause}\n'
             '}\n'
             f'LIMIT {limit}'
@@ -438,15 +432,26 @@ def register_search_tools(server: FastMCP) -> None:
         elif isinstance(inline, list):
             bindings = inline
 
+        def _binding_val(binding: dict, var: str) -> str:
+            v = binding.get(var)
+            if isinstance(v, dict):
+                return v.get("value", "")
+            return str(v) if v else ""
+
         out = []
         for binding in bindings:
-            block_uri = ""
-            content = ""
-            if isinstance(binding, dict):
-                block_uri = binding.get("blockUri", {}).get("value", "") if isinstance(binding.get("blockUri"), dict) else str(binding.get("blockUri", ""))
-                content = binding.get("content", {}).get("value", "") if isinstance(binding.get("content"), dict) else str(binding.get("content", ""))
+            if not isinstance(binding, dict):
+                continue
+            block_uri = _binding_val(binding, "block")
+            block_id = _binding_val(binding, "blockId")
+            text = _binding_val(binding, "text")
 
-            doc_id, block_id = _parse_block_uri(block_uri)
+            # Extract doc_id from block URI: ...doc:{doc_id}#node-N
+            doc_id = None
+            if "#" in block_uri:
+                doc_part = block_uri.split("#")[0]
+                doc_id = doc_part.rsplit(":", 1)[-1] if ":" in doc_part else None
+
             if not doc_id or not block_id:
                 continue
 
@@ -454,7 +459,7 @@ def register_search_tools(server: FastMCP) -> None:
                 "block_id": block_id,
                 "document_id": doc_id,
                 "document_title": doc_titles.get(doc_id, ""),
-                "text": content[:500],  # Truncate for readability
+                "text": text[:500],
             })
 
         return out
@@ -553,26 +558,28 @@ def register_search_tools(server: FastMCP) -> None:
                 graph_id, query, limit, doc_filter, auth, context,
             )
 
-        # Merge results
+        # Merge results — keyed by doc_id:block_id to avoid cross-doc collisions
         merged: dict[str, dict] = {}
 
+        def _merge_key(r: dict) -> str:
+            return f"{r.get('document_id', '')}:{r.get('block_id', '')}"
+
         for r in lexical_results:
-            bid = r.get("block_id", "")
-            if bid:
-                merged[bid] = {**r, "match_source": "lexical"}
+            key = _merge_key(r)
+            if r.get("block_id"):
+                merged[key] = {**r, "match_source": "lexical"}
 
         for r in semantic_results:
-            bid = r.get("block_id", "")
-            if not bid:
+            if not r.get("block_id"):
                 continue
-            if bid in merged:
-                merged[bid]["match_source"] = "both"
-                merged[bid]["similarity_score"] = r.get("similarity_score")
-                # Prefer semantic's document_title if lexical's is empty
-                if not merged[bid].get("document_title") and r.get("document_title"):
-                    merged[bid]["document_title"] = r["document_title"]
+            key = _merge_key(r)
+            if key in merged:
+                merged[key]["match_source"] = "both"
+                merged[key]["similarity_score"] = r.get("similarity_score")
+                if not merged[key].get("document_title") and r.get("document_title"):
+                    merged[key]["document_title"] = r["document_title"]
             else:
-                merged[bid] = {**r, "match_source": "semantic"}
+                merged[key] = {**r, "match_source": "semantic"}
 
         # Sort: both > lexical > semantic
         source_order = {"both": 0, "lexical": 1, "semantic": 2}
