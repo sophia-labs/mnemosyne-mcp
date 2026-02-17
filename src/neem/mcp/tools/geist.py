@@ -522,7 +522,15 @@ async def _sparql_update(
             if sparql_stripped.endswith("}"):
                 sparql_stripped = sparql_stripped[:-1] + "} }"
         else:
-            sparql_stripped = f"WITH <{graph_uri}>\n{sparql_stripped}"
+            # Insert WITH after any PREFIX declarations (WITH must follow the prologue)
+            prefix_pattern = re.compile(r"^(\s*(PREFIX|BASE)\s+[^\n]*\n)+", re.IGNORECASE)
+            m = prefix_pattern.match(sparql_stripped)
+            if m:
+                prologue = m.group(0)
+                body = sparql_stripped[m.end():]
+                sparql_stripped = f"{prologue}WITH <{graph_uri}>\n{body}"
+            else:
+                sparql_stripped = f"WITH <{graph_uri}>\n{sparql_stripped}"
 
     if job_stream:
         try:
@@ -1630,9 +1638,7 @@ WHERE {{
         # Uses DELETE { } WHERE { } form (not DELETE WHERE shorthand) so the
         # _sparql_update helper injects a WITH <graph> clause correctly.
         delete_values = " ".join(f"(<{c['val_uri']}>)" for c in computed)
-        delete_sparql = f"""
-PREFIX doc: <http://mnemosyne.dev/doc#>
-DELETE {{ ?v ?p ?o }}
+        delete_sparql = f"""DELETE {{ ?v ?p ?o }}
 WHERE {{
   VALUES (?v) {{ {delete_values} }}
   ?v ?p ?o .
