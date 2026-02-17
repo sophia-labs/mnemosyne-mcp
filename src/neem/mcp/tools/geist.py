@@ -1749,33 +1749,37 @@ WHERE {{
 ORDER BY DESC(xsd:float(?cumImp))
 LIMIT {min(limit * 3, 200)}
 """
-        rows = await _sparql_query(backend_config, job_stream, auth, graph_id, query)
+        # Run SPARQL query, weights load, and wire index build concurrently
+        async def _fetch_rows() -> list[dict]:
+            return await _sparql_query(backend_config, job_stream, auth, graph_id, query)
 
-        # Load weights config
-        weights = dict(DEFAULT_WEIGHTS)
-        try:
-            await _ensure_scratchpad(hp_client, graph_id, auth)
-            await hp_client.connect_document(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
-            w_channel = hp_client.get_document_channel(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
-            if w_channel:
-                w_reader = DocumentReader(w_channel.doc)
-                w_xml = w_reader.to_xml()
-                weights = _parse_weights_text(tiptap_xml_to_markdown(w_xml))
-        except Exception:
-            logger.debug("Could not load weights config, using defaults")
+        async def _fetch_weights() -> dict:
+            try:
+                await _ensure_scratchpad(hp_client, graph_id, auth)
+                await hp_client.connect_document(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
+                w_channel = hp_client.get_document_channel(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
+                if w_channel:
+                    w_reader = DocumentReader(w_channel.doc)
+                    w_xml = w_reader.to_xml()
+                    return _parse_weights_text(tiptap_xml_to_markdown(w_xml))
+            except Exception:
+                logger.debug("Could not load weights config, using defaults")
+            return dict(DEFAULT_WEIGHTS)
 
-        # Build wire indexes (fail-safe — composite degrades gracefully without wires)
-        doc_wire_counts: Dict[str, int] = {}
-        block_wire_counts: Dict[str, int] = {}
-        doc_newest_wire: Dict[str, str] = {}
-        try:
-            await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
-            ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
-            if ws_channel:
-                all_wires = _get_all_wires(ws_channel.doc)
-                doc_wire_counts, block_wire_counts, doc_newest_wire = _build_wire_indexes(all_wires)
-        except Exception:
-            logger.debug("Could not load wire data for composite scoring")
+        async def _fetch_wires() -> tuple[Dict[str, int], Dict[str, int], Dict[str, str]]:
+            try:
+                await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
+                ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
+                if ws_channel:
+                    all_wires = _get_all_wires(ws_channel.doc)
+                    return _build_wire_indexes(all_wires)
+            except Exception:
+                logger.debug("Could not load wire data for composite scoring")
+            return {}, {}, {}
+
+        rows, weights, (doc_wire_counts, block_wire_counts, doc_newest_wire) = (
+            await asyncio.gather(_fetch_rows(), _fetch_weights(), _fetch_wires())
+        )
 
         now = datetime.now(timezone.utc)
 
@@ -1905,34 +1909,40 @@ WHERE {{
 ORDER BY DESC(xsd:float(?cumImp))
 LIMIT {min(limit * 3, 60)}
 """
-        rows = await _sparql_query(backend_config, job_stream, auth, graph_id, query)
+        # Run SPARQL query, weights load, and wire index build concurrently
+        async def _fetch_rows() -> list[dict]:
+            return await _sparql_query(backend_config, job_stream, auth, graph_id, query)
 
-        # Load weights
-        weights = dict(DEFAULT_WEIGHTS)
-        try:
-            await _ensure_scratchpad(hp_client, graph_id, auth)
-            await hp_client.connect_document(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
-            w_channel = hp_client.get_document_channel(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
-            if w_channel:
-                w_reader = DocumentReader(w_channel.doc)
-                weights = _parse_weights_text(tiptap_xml_to_markdown(w_reader.to_xml()))
-        except Exception:
-            pass
+        async def _fetch_weights() -> dict:
+            try:
+                await _ensure_scratchpad(hp_client, graph_id, auth)
+                await hp_client.connect_document(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
+                w_channel = hp_client.get_document_channel(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
+                if w_channel:
+                    w_reader = DocumentReader(w_channel.doc)
+                    return _parse_weights_text(tiptap_xml_to_markdown(w_reader.to_xml()))
+            except Exception:
+                pass
+            return dict(DEFAULT_WEIGHTS)
 
-        # Build wire indexes
-        doc_wire_counts: Dict[str, int] = {}
-        block_wire_counts: Dict[str, int] = {}
-        doc_newest_wire: Dict[str, str] = {}
         ws_doc = None
-        try:
-            await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
-            ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
-            if ws_channel:
-                ws_doc = ws_channel.doc
-                all_wires = _get_all_wires(ws_doc)
-                doc_wire_counts, block_wire_counts, doc_newest_wire = _build_wire_indexes(all_wires)
-        except Exception:
-            pass
+
+        async def _fetch_wires() -> tuple[Dict[str, int], Dict[str, int], Dict[str, str]]:
+            nonlocal ws_doc
+            try:
+                await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
+                ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
+                if ws_channel:
+                    ws_doc = ws_channel.doc
+                    all_wires = _get_all_wires(ws_doc)
+                    return _build_wire_indexes(all_wires)
+            except Exception:
+                pass
+            return {}, {}, {}
+
+        rows, weights, (doc_wire_counts, block_wire_counts, doc_newest_wire) = (
+            await asyncio.gather(_fetch_rows(), _fetch_weights(), _fetch_wires())
+        )
 
         now = datetime.now(timezone.utc)
 
@@ -1992,24 +2002,24 @@ LIMIT {min(limit * 3, 60)}
         scored = scored[:limit]
 
         # Fetch content and titles for the top blocks
-        results = []
-        # Group by doc_id to minimize connections
+        # Group by doc_id and connect to all documents concurrently
         doc_groups: Dict[str, list] = {}
         for item in scored:
             doc_groups.setdefault(item["doc_id"], []).append(item)
 
-        for did, items in doc_groups.items():
+        async def _fetch_doc_blocks(did: str, items: list) -> list[dict]:
             title = _resolve_title_from_workspace(ws_doc, did) or did
             try:
                 await hp_client.connect_document(graph_id, did, user_id=auth.user_id)
                 channel = hp_client.get_document_channel(graph_id, did, user_id=auth.user_id)
                 if channel is None:
-                    continue
+                    raise RuntimeError("no channel")
                 reader = DocumentReader(channel.doc)
+                doc_results = []
                 for item in items:
                     block_info = reader.get_block_info(item["block_id"])
                     content = block_info["text_content"] if block_info else "(deleted)"
-                    results.append({
+                    doc_results.append({
                         "content": content,
                         "document": title,
                         "score": item["composite"],
@@ -2020,21 +2030,26 @@ LIMIT {min(limit * 3, 60)}
                         "block_wires": item["block_wires"],
                         "doc_wires": item["doc_wires"],
                     })
+                return doc_results
             except Exception:
-                for item in items:
-                    results.append({
-                        "content": "(unavailable)",
-                        "document": title,
-                        "score": item["composite"],
-                        "importance": item["importance"],
-                        "valence": item["valence"],
-                        "block_id": item["block_id"],
-                        "doc_id": item["doc_id"],
-                        "block_wires": item["block_wires"],
-                        "doc_wires": item["doc_wires"],
-                    })
+                return [{
+                    "content": "(unavailable)",
+                    "document": title,
+                    "score": item["composite"],
+                    "importance": item["importance"],
+                    "valence": item["valence"],
+                    "block_id": item["block_id"],
+                    "doc_id": item["doc_id"],
+                    "block_wires": item["block_wires"],
+                    "doc_wires": item["doc_wires"],
+                } for item in items]
 
-        # Re-sort since doc grouping may have scrambled order
+        doc_result_lists = await asyncio.gather(
+            *[_fetch_doc_blocks(did, items) for did, items in doc_groups.items()]
+        )
+        results = [entry for sublist in doc_result_lists for entry in sublist]
+
+        # Re-sort since concurrent fetch may have scrambled order
         results.sort(key=lambda b: b["score"], reverse=True)
 
         return _render_json({"blocks": results, "count": len(results)})
