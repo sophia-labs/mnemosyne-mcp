@@ -1504,8 +1504,9 @@ INSERT DATA {{
                 output["error_count"] = len(errors)
             return _render_json(output)
 
-        # 2. Single SPARQL SELECT to read all current valuations
-        values_clause = " ".join(f"(<{e['val_uri']}>)" for e in valid_entries)
+        # 2. Single SPARQL SELECT to read current valuations (unique valuation URIs)
+        unique_val_uris = list(dict.fromkeys(e["val_uri"] for e in valid_entries))
+        values_clause = " ".join(f"(<{val_uri}>)" for val_uri in unique_val_uris)
         read_query = f"""
 PREFIX doc: <http://mnemosyne.dev/doc#>
 SELECT ?valUri ?rawImp ?impCount ?rawVal ?valCount
@@ -1526,41 +1527,102 @@ WHERE {{
             if uri:
                 current_by_uri[uri] = row
 
-        # 3. Compute new values for each entry
+        # 3. Compute new values for each entry (in order), so duplicate block
+        # entries in the same batch accumulate correctly.
+        def _safe_float(value: Any, default: float = 0.0) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _safe_int(value: Any, default: int = 0) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        state_by_uri: Dict[str, Dict[str, float | int]] = {}
+        uri_meta: Dict[str, Dict[str, str]] = {}
+        for entry in valid_entries:
+            val_uri = entry["val_uri"]
+            if val_uri not in state_by_uri:
+                current = current_by_uri.get(val_uri, {})
+                state_by_uri[val_uri] = {
+                    "raw_imp": _safe_float(current.get("rawImp", 0)),
+                    "imp_count": _safe_int(current.get("impCount", 0)),
+                    "raw_val": _safe_float(current.get("rawVal", 0)),
+                    "val_count": _safe_int(current.get("valCount", 0)),
+                }
+                uri_meta[val_uri] = {
+                    "doc_id": entry["doc_id"],
+                    "blk_id": entry["blk_id"],
+                    "block_uri": entry["block_uri"],
+                }
+
         now = _now_iso()
         results: List[Dict[str, Any]] = []
-        computed: List[Dict[str, Any]] = []
-
         for entry in valid_entries:
-            current = current_by_uri.get(entry["val_uri"], {})
-            old_raw_imp = float(current.get("rawImp", 0))
-            old_imp_count = int(current.get("impCount", 0))
-            old_raw_val = float(current.get("rawVal", 0))
-            old_val_count = int(current.get("valCount", 0))
+            state = state_by_uri[entry["val_uri"]]
+            raw_imp = float(state["raw_imp"])
+            imp_count = int(state["imp_count"])
+            raw_val = float(state["raw_val"])
+            val_count = int(state["val_count"])
 
             imp = entry["imp"]
             val = entry["val"]
+            if imp is not None:
+                raw_imp += float(imp)
+                imp_count += 1
+            if val is not None:
+                raw_val += float(val)
+                val_count += 1
 
-            new_raw_imp = old_raw_imp + (imp if imp is not None else 0)
-            new_imp_count = old_imp_count + (1 if imp is not None else 0)
-            new_raw_val = old_raw_val + (val if val is not None else 0)
-            new_val_count = old_val_count + (1 if val is not None else 0)
-
-            new_cum_imp = math.log2(1 + new_raw_imp) if new_raw_imp > 0 else 0.0
-            if new_raw_val != 0:
-                sign = 1 if new_raw_val >= 0 else -1
-                new_cum_val = sign * math.log2(1 + abs(new_raw_val))
+            new_cum_imp = math.log2(1 + raw_imp) if raw_imp > 0 else 0.0
+            if raw_val != 0:
+                sign = 1 if raw_val >= 0 else -1
+                new_cum_val = sign * math.log2(1 + abs(raw_val))
             else:
                 new_cum_val = 0.0
 
+            state["raw_imp"] = raw_imp
+            state["imp_count"] = imp_count
+            state["raw_val"] = raw_val
+            state["val_count"] = val_count
+
+            results.append({
+                "block_id": entry["blk_id"],
+                "document_id": entry["doc_id"],
+                "cumulative_importance": round(new_cum_imp, 4),
+                "cumulative_valence": round(new_cum_val, 4),
+            })
+
+        # Final state per unique valuation URI for writeback
+        computed: List[Dict[str, Any]] = []
+        for val_uri in unique_val_uris:
+            state = state_by_uri[val_uri]
+            raw_imp = float(state["raw_imp"])
+            imp_count = int(state["imp_count"])
+            raw_val = float(state["raw_val"])
+            val_count = int(state["val_count"])
+            cum_imp = math.log2(1 + raw_imp) if raw_imp > 0 else 0.0
+            if raw_val != 0:
+                sign = 1 if raw_val >= 0 else -1
+                cum_val = sign * math.log2(1 + abs(raw_val))
+            else:
+                cum_val = 0.0
+
+            meta = uri_meta[val_uri]
             computed.append({
-                **entry,
-                "new_raw_imp": new_raw_imp,
-                "new_imp_count": new_imp_count,
-                "new_cum_imp": round(new_cum_imp, 4),
-                "new_raw_val": new_raw_val,
-                "new_val_count": new_val_count,
-                "new_cum_val": round(new_cum_val, 4),
+                "val_uri": val_uri,
+                "block_uri": meta["block_uri"],
+                "doc_id": meta["doc_id"],
+                "blk_id": meta["blk_id"],
+                "new_raw_imp": raw_imp,
+                "new_imp_count": imp_count,
+                "new_cum_imp": round(cum_imp, 4),
+                "new_raw_val": raw_val,
+                "new_val_count": val_count,
+                "new_cum_val": round(cum_val, 4),
                 "now": now,
             })
 
@@ -1576,7 +1638,15 @@ WHERE {{
   ?v ?p ?o .
 }}
 """
-        await _sparql_update(backend_config, job_stream, auth, graph_id, delete_sparql)
+        delete_success = await _sparql_update(backend_config, job_stream, auth, graph_id, delete_sparql)
+        if not delete_success:
+            for entry in valid_entries:
+                errors.append({"index": entry["index"], "error": "Batch SPARQL DELETE failed"})
+            output = {"results": [], "updated_count": 0}
+            if errors:
+                output["errors"] = errors
+                output["error_count"] = len(errors)
+            return _render_json(output)
 
         # 5. Single SPARQL INSERT for all new triples
         insert_triples = []
@@ -1601,16 +1671,9 @@ INSERT DATA {{
 
         if not success:
             # INSERT failed — report all as errors
-            for c in computed:
-                errors.append({"index": c["index"], "error": "Batch SPARQL INSERT failed"})
-        else:
-            for c in computed:
-                results.append({
-                    "block_id": c["blk_id"],
-                    "document_id": c["doc_id"],
-                    "cumulative_importance": c["new_cum_imp"],
-                    "cumulative_valence": c["new_cum_val"],
-                })
+            for entry in valid_entries:
+                errors.append({"index": entry["index"], "error": "Batch SPARQL INSERT failed"})
+            results = []
 
         output = {"results": results, "updated_count": len(results)}
         if errors:

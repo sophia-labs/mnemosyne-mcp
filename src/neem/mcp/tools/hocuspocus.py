@@ -1337,10 +1337,12 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
 
         # In folders_only mode, annotate each folder with document counts
         # from the raw snapshot (documents weren't added as tree nodes).
+        docs_per_folder: dict[str | None, int] = {}
         if folders_only:
             # Count direct documents per folder, and unfiled (root-level) docs
-            docs_per_folder: dict[str | None, int] = {}
             for did, ddata in documents.items():
+                if excluded_doc_ids and did in excluded_doc_ids:
+                    continue
                 pid = ddata.get("parentId")
                 docs_per_folder[pid] = docs_per_folder.get(pid, 0) + 1
 
@@ -1355,6 +1357,14 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
 
             _annotate_doc_counts(root)
 
+            def _count_folder_docs(folder_node: dict[str, Any]) -> int:
+                """Count documents under a folder using raw snapshot counts."""
+                total = docs_per_folder.get(folder_node.get("id"), 0)
+                for child in folder_node.get("children", []):
+                    if child.get("type") == "folder":
+                        total += _count_folder_docs(child)
+                return total
+
         # Sort children by order, then strip internal _order keys
         # Apply depth truncation: at max_depth, collapse folders to counts
         def _sort_and_clean(items: list[dict[str, Any]], current_depth: int = 1) -> list[dict[str, Any]]:
@@ -1364,7 +1374,11 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
                 if "children" in item:
                     if max_depth > 0 and current_depth >= max_depth:
                         # Collapse: count children recursively instead of listing them
-                        doc_count, val_count = _count_descendants(item["children"])
+                        if folders_only:
+                            doc_count = _count_folder_docs(item)
+                            val_count = 0
+                        else:
+                            doc_count, val_count = _count_descendants(item["children"])
                         del item["children"]
                         if doc_count > 0:
                             if valued_doc_ids and val_count > 0:
@@ -1492,8 +1506,9 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
                 result["folders_only"] = True
                 # Count unfiled (root-level) documents
                 unfiled = sum(
-                    1 for d in snapshot.get("documents", {}).values()
+                    1 for did, d in snapshot.get("documents", {}).items()
                     if not d.get("parentId")
+                    and not (excluded_doc_ids and did in excluded_doc_ids)
                 )
                 if unfiled > 0:
                     result["unfiled_documents"] = unfiled
