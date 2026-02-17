@@ -42,9 +42,19 @@ class JobLinks:
 
     @classmethod
     def from_api(cls, data: JsonDict) -> "JobLinks":
+        status_url = (
+            data.get("status")
+            or data.get("poll_url")
+            or data.get("status_url")
+            or ""
+        )
+        result_url = (
+            data.get("result")
+            or data.get("result_url")
+        )
         return cls(
-            status=data.get("status", ""),
-            result=data.get("result"),
+            status=status_url,
+            result=result_url,
             websocket=WebSocketSubscriptionHint.from_api(data.get("websocket")),
         )
 
@@ -74,7 +84,27 @@ class JobSubmitMetadata:
 
     @classmethod
     def from_api(cls, payload: JsonDict, base_url: str) -> "JobSubmitMetadata":
-        links = JobLinks.from_api(payload.get("links", {})).expand(base_url)
+        raw_links = payload.get("links")
+        links_payload = dict(raw_links) if isinstance(raw_links, dict) else {}
+
+        # Back-compat: newer API variants can return top-level poll/result URLs
+        # instead of nested links.status/links.result.
+        if not links_payload.get("status"):
+            links_payload["status"] = (
+                payload.get("poll_url")
+                or payload.get("status_url")
+                or payload.get("status")
+                or ""
+            )
+        if not links_payload.get("result"):
+            links_payload["result"] = (
+                payload.get("result_url")
+                or payload.get("result")
+            )
+        if not links_payload.get("websocket") and isinstance(payload.get("websocket"), dict):
+            links_payload["websocket"] = payload.get("websocket")
+
+        links = JobLinks.from_api(links_payload).expand(base_url)
         return cls(
             job_id=payload["job_id"],
             status=payload.get("status", "queued"),

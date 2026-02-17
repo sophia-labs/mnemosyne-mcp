@@ -445,18 +445,29 @@ async def _wait_for_job_result(
             await context.report_progress(80, 100)
         for event in reversed(ws_events):
             event_type = event.get("type", "")
-            if event_type in ("job_completed", "completed", "succeeded"):
+            payload = event.get("payload", {})
+            payload_status = payload.get("status", "") if isinstance(payload, dict) else ""
+
+            is_success = (
+                event_type in ("job_completed", "completed", "succeeded")
+                or (event_type == "job_update" and payload_status == "succeeded")
+            )
+            is_failure = (
+                event_type in ("failed", "error")
+                or (event_type == "job_update" and payload_status == "failed")
+            )
+
+            if is_success:
                 if context:
                     await context.report_progress(100, 100)
                 result: JsonDict = {"status": "succeeded", "events": len(ws_events)}
-                payload = event.get("payload", {})
                 if isinstance(payload, dict):
                     detail = payload.get("detail")
                     if detail:
                         result["detail"] = detail
                 return result
-            if event_type in ("failed", "error"):
-                error = event.get("error", "Job failed")
+            if is_failure:
+                error = event.get("error") or payload.get("error", "Job failed")
                 return {"status": "failed", "error": error}
         # No terminal event in WS — fall through to poll result
 

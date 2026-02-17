@@ -334,8 +334,9 @@ async def await_job_completion(
 ) -> tuple[Optional[list[JsonDict]], Optional[JsonDict]]:
     """Race WS streaming against HTTP polling. Returns (ws_events, poll_payload).
 
-    Whichever method returns first wins; the other is cancelled.
-    If WS is unavailable, only polls. Returns (None, None) on total failure.
+    Tries both WS streaming and HTTP polling, preferring whichever yields usable
+    terminal data first. Unlike a strict first-completed race, this keeps waiting
+    when the first completed branch returns None/non-terminal payloads.
     """
     trace("  race: starting (timeout=%.1fs, has_ws=%s)" % (timeout, job_stream is not None))
 
@@ -354,39 +355,64 @@ async def await_job_completion(
     ws_task = asyncio.create_task(_do_stream(), name="race-ws")
     poll_task = asyncio.create_task(_do_poll(), name="race-poll")
 
-    done, pending = await asyncio.wait(
-        {ws_task, poll_task},
-        timeout=timeout,
-        return_when=asyncio.FIRST_COMPLETED,
-    )
+    ws_events: Optional[list[JsonDict]] = None
+    poll_payload: Optional[JsonDict] = None
+    pending: set[asyncio.Task[Any]] = {ws_task, poll_task}
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
 
-    # Cancel the loser(s)
+    while pending:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+
+        done_now, pending = await asyncio.wait(
+            pending,
+            timeout=remaining,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done_now:
+            break
+
+        for task in done_now:
+            if task is ws_task:
+                try:
+                    ws_events = task.result()
+                    trace("  race: WS completed (events=%s)" % (len(ws_events) if ws_events else None))
+                except Exception as exc:
+                    trace("  race: WS task failed: %s" % exc)
+            elif task is poll_task:
+                try:
+                    poll_payload = task.result()
+                    trace("  race: poll completed (status=%s)" % (
+                        poll_payload.get("status") if poll_payload else None,
+                    ))
+                except Exception as exc:
+                    trace("  race: poll task failed: %s" % exc)
+
+        poll_status = (poll_payload.get("status") or "").lower() if isinstance(poll_payload, dict) else ""
+        if poll_status in {"succeeded", "failed"}:
+            # Terminal poll result is authoritative and usually includes detail.
+            break
+
+        # If one side returned None/empty quickly, keep waiting for the other side.
+        if ws_task not in pending and poll_task in pending and ws_events is None:
+            continue
+        if poll_task not in pending and ws_task in pending and poll_payload is None:
+            continue
+
+        # Both sides have produced some signal (or one side finished and other unavailable).
+        if ws_task not in pending and poll_task not in pending:
+            break
+
+    # Cancel any still-pending task(s)
     for task in pending:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    ws_events: Optional[list[JsonDict]] = None
-    poll_payload: Optional[JsonDict] = None
-
-    if ws_task in done:
-        try:
-            ws_events = ws_task.result()
-            trace("  race: WS finished first (events=%s)" % (len(ws_events) if ws_events else None))
-        except Exception as exc:
-            trace("  race: WS task failed: %s" % exc)
-
-    if poll_task in done:
-        try:
-            poll_payload = poll_task.result()
-            trace("  race: poll finished first (status=%s)" % (
-                poll_payload.get("status") if poll_payload else None,
-            ))
-        except Exception as exc:
-            trace("  race: poll task failed: %s" % exc)
-
-    if not done:
-        trace("  race: BOTH timed out after %.1fs" % timeout)
+    if pending and ws_events is None and poll_payload is None:
+        trace("  race: timed out after %.1fs with no result" % timeout)
 
     return ws_events, poll_payload
 
