@@ -7,6 +7,7 @@ for real-time state synchronization of sessions, workspaces, and documents.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
@@ -76,6 +77,8 @@ class HocuspocusClient:
         dev_user_id: Optional[str] = None,
         internal_service_secret: Optional[str] = None,
         connect_timeout: float = 10.0,
+        sync_timeout: float = 20.0,
+        connect_retries: int = 1,
         heartbeat_interval: float = 30.0,
     ) -> None:
         """Initialize the Hocuspocus client.
@@ -86,6 +89,8 @@ class HocuspocusClient:
             dev_user_id: Optional dev mode user ID (bypasses OAuth)
             internal_service_secret: Shared secret for cluster-internal auth
             connect_timeout: WebSocket connection timeout in seconds
+            sync_timeout: Max seconds to wait for initial Y.js sync step 2
+            connect_retries: Retries on sync timeout (per channel connect)
             heartbeat_interval: Interval between ping messages
         """
         self._base_url = base_url.rstrip("/")
@@ -93,6 +98,14 @@ class HocuspocusClient:
         self._dev_user_id = dev_user_id
         self._internal_service_secret = internal_service_secret
         self._connect_timeout = connect_timeout
+        self._sync_timeout = max(
+            1.0,
+            float(os.getenv("MNEMOSYNE_HOCUSPOCUS_SYNC_TIMEOUT", str(sync_timeout))),
+        )
+        self._connect_retries = max(
+            0,
+            int(os.getenv("MNEMOSYNE_HOCUSPOCUS_CONNECT_RETRIES", str(connect_retries))),
+        )
         self._heartbeat_interval = heartbeat_interval
 
         # HTTP session for WebSocket connections
@@ -100,8 +113,8 @@ class HocuspocusClient:
 
         # Channel state management
         self._session_channel: Optional[ChannelState] = None
-        self._workspace_channels: Dict[str, ChannelState] = {}  # graph_id -> state
-        self._document_channels: Dict[str, ChannelState] = {}  # graph_id:doc_id -> state
+        self._workspace_channels: Dict[str, ChannelState] = {}  # user_id:graph_id -> state
+        self._document_channels: Dict[str, ChannelState] = {}  # user_id:graph_id:doc_id -> state
 
         # Per-key connection locks to prevent concurrent channel creation races.
         # Without these, parallel callers can overwrite each other's ChannelState,
@@ -267,21 +280,33 @@ class HocuspocusClient:
 
             # Wait for sync to complete (server sends sync_step2)
             try:
-                await asyncio.wait_for(channel.synced.wait(), timeout=10.0)
+                await asyncio.wait_for(channel.synced.wait(), timeout=self._sync_timeout)
                 channel.synced_at = time.monotonic()
                 logger.info(
                     "Hocuspocus channel synced",
                     extra_context={"channel": channel_name},
                 )
             except asyncio.TimeoutError:
+                close_code = channel.ws.close_code if channel.ws is not None else None
+                ws_exception = None
+                try:
+                    if channel.ws is not None:
+                        ws_exception = channel.ws.exception()
+                except Exception:
+                    ws_exception = None
                 logger.error(
                     "Hocuspocus sync timeout",
                     extra_context={
                         "channel": channel_name,
-                        "timeout_seconds": 10.0,
+                        "timeout_seconds": self._sync_timeout,
+                        "close_code": close_code,
+                        "ws_exception": str(ws_exception) if ws_exception else None,
                     },
                 )
-                raise TimeoutError(f"Hocuspocus sync timed out for channel: {channel_name}")
+                raise TimeoutError(
+                    f"Hocuspocus sync timed out for channel: {channel_name} "
+                    f"(timeout={self._sync_timeout}s close_code={close_code})"
+                )
 
         except Exception as exc:
             await self._reset_channel(channel)
@@ -614,16 +639,38 @@ class HocuspocusClient:
                 if channel.ws and not channel.ws.closed and channel.synced.is_set():
                     return
 
-            channel = ChannelState()
-            self._workspace_channels[channel_key] = channel
+            for attempt in range(self._connect_retries + 1):
+                channel = ChannelState()
+                self._workspace_channels[channel_key] = channel
 
-            async with channel.lock:
-                await self._connect_channel(
-                    channel,
-                    f"/hocuspocus/workspace/{effective_user_id}/{graph_id}",
-                    f"workspace:{graph_id}",
-                    user_id=user_id,
-                )
+                try:
+                    async with channel.lock:
+                        await self._connect_channel(
+                            channel,
+                            f"/hocuspocus/workspace/{effective_user_id}/{graph_id}",
+                            f"workspace:{graph_id}",
+                            user_id=user_id,
+                        )
+                    return
+                except TimeoutError:
+                    # Remove broken/unsynced channel before retry.
+                    self._workspace_channels.pop(channel_key, None)
+                    if attempt >= self._connect_retries:
+                        raise
+                    retry_delay = 0.25 * (attempt + 1)
+                    logger.warning(
+                        "Workspace sync timed out; retrying connect",
+                        extra_context={
+                            "graph_id": graph_id,
+                            "attempt": attempt + 1,
+                            "max_retries": self._connect_retries,
+                            "retry_delay_seconds": retry_delay,
+                        },
+                    )
+                    await asyncio.sleep(retry_delay)
+                except Exception:
+                    self._workspace_channels.pop(channel_key, None)
+                    raise
 
     def get_workspace_channel(
         self, graph_id: str, user_id: Optional[str] = None
@@ -774,21 +821,39 @@ class HocuspocusClient:
                 if channel.ws and not channel.ws.closed and channel.synced.is_set():
                     return
 
-            channel = ChannelState()
-            self._document_channels[key] = channel
+            for attempt in range(self._connect_retries + 1):
+                channel = ChannelState()
+                self._document_channels[key] = channel
 
-            try:
-                async with channel.lock:
-                    await self._connect_channel(
-                        channel,
-                        f"/hocuspocus/docs/{graph_id}/{doc_id}",
-                        f"doc:{graph_id}:{doc_id}",
-                        user_id=user_id,
+                try:
+                    async with channel.lock:
+                        await self._connect_channel(
+                            channel,
+                            f"/hocuspocus/docs/{graph_id}/{doc_id}",
+                            f"doc:{graph_id}:{doc_id}",
+                            user_id=user_id,
+                        )
+                    return
+                except TimeoutError:
+                    # Clean up the broken entry so future calls don't see a zombie
+                    self._document_channels.pop(key, None)
+                    if attempt >= self._connect_retries:
+                        raise
+                    retry_delay = 0.25 * (attempt + 1)
+                    logger.warning(
+                        "Document sync timed out; retrying connect",
+                        extra_context={
+                            "graph_id": graph_id,
+                            "doc_id": doc_id,
+                            "attempt": attempt + 1,
+                            "max_retries": self._connect_retries,
+                            "retry_delay_seconds": retry_delay,
+                        },
                     )
-            except Exception:
-                # Clean up the broken entry so future calls don't see a zombie
-                self._document_channels.pop(key, None)
-                raise
+                    await asyncio.sleep(retry_delay)
+                except Exception:
+                    self._document_channels.pop(key, None)
+                    raise
 
     def get_document_channel(
         self, graph_id: str, doc_id: str, user_id: Optional[str] = None
