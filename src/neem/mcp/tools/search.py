@@ -18,7 +18,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from neem.hocuspocus import HocuspocusClient
 from neem.mcp.auth import MCPAuthContext
 from neem.mcp.jobs import RealtimeJobClient
-from neem.mcp.tools.basic import await_job_completion, submit_job
+from neem.mcp.tools.basic import await_job_completion, poll_job_until_terminal, submit_job
 from neem.mcp.trace import trace
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_user_id_from_token
@@ -672,6 +672,7 @@ async def _wait_for_job_result(
     ws_events, poll_payload = await await_job_completion(
         job_stream, metadata, auth, timeout=STREAM_TIMEOUT_SECONDS,
     )
+    ws_succeeded_without_detail = False
 
     if ws_events:
         if context:
@@ -695,15 +696,31 @@ async def _wait_for_job_result(
                 if context:
                     await context.report_progress(100, 100)
                 result: JsonDict = {"status": "succeeded", "events": len(ws_events)}
+                detail: Any = None
                 if isinstance(payload, dict):
                     detail = payload.get("detail")
-                    if detail:
-                        result["detail"] = detail
-                return result
+                    if not detail and payload.get("result_inline") is not None:
+                        detail = {"result_inline": payload.get("result_inline")}
+                if not detail and event.get("result_inline") is not None:
+                    detail = {"result_inline": event.get("result_inline")}
+                if detail:
+                    result["detail"] = detail
+                    return result
+
+                # Cloud WS frequently emits terminal job_update events without inline detail.
+                # Fall back to status polling below instead of silently returning empty.
+                ws_succeeded_without_detail = True
+                logger.warning(
+                    "job_ws_terminal_without_detail",
+                    extra_context={
+                        "event_type": event_type,
+                        "job_id": getattr(metadata, "job_id", None),
+                    },
+                )
+                break
             if is_failure:
                 error = event.get("error") or payload.get("error", "Job failed")
                 return {"status": "failed", "error": error}
-        return {"status": "unknown", "event_count": len(ws_events)}
 
     if context:
         await context.report_progress(100, 100)
@@ -720,5 +737,26 @@ async def _wait_for_job_result(
         if detail:
             result["detail"] = detail
         return result
+
+    # If WS reached terminal state but did not include inline detail, poll once more.
+    if ws_succeeded_without_detail:
+        status_url = getattr(getattr(metadata, "links", None), "status", None)
+        refreshed = await poll_job_until_terminal(status_url, auth) if status_url else None
+        if refreshed:
+            status = refreshed.get("status", "unknown")
+            detail = refreshed.get("detail")
+            if status == "failed":
+                error = refreshed.get("error") or (
+                    detail.get("error") if isinstance(detail, dict) else None
+                )
+                return {"status": "failed", "error": error}
+            result = {"status": status}
+            if detail:
+                result["detail"] = detail
+            return result
+        return {"status": "succeeded", "event_count": len(ws_events)}
+
+    if ws_events:
+        return {"status": "unknown", "event_count": len(ws_events)}
 
     return {"status": "unknown"}
