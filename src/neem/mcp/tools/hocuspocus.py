@@ -1439,7 +1439,7 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             "understanding what's in a graph. Use get_user_location first if you need to know which "
             "graph the user is in.\n\n"
             "**Parameters:**\n"
-            "- depth (default 2): Maximum folder nesting depth. At the limit, folders collapse to "
+            "- depth (default 1): Maximum folder nesting depth. At the limit, folders collapse to "
             "show document counts instead of full listings. Use depth=0 for unlimited (full tree). "
             "Organize documents into folders for cleaner workspace views at default depth.\n"
             "- folder_id (optional): Return only the subtree under this folder. Useful for "
@@ -1457,7 +1457,7 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
     )
     async def get_workspace_tool(
         graph_id: str,
-        depth: int = 2,
+        depth: int = 1,
         folder_id: Optional[str] = None,
         min_score: Optional[float] = None,
         folders_only: bool = False,
