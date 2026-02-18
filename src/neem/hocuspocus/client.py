@@ -258,6 +258,7 @@ class HocuspocusClient:
                 protocols=protocols or [],
                 timeout=aiohttp.ClientTimeout(total=self._connect_timeout),
                 heartbeat=self._heartbeat_interval,
+                max_msg_size=16 * 1024 * 1024,  # 16MB — match uvicorn default
             )
 
             # Start receiver task

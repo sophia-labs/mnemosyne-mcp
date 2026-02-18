@@ -386,7 +386,7 @@ def register_search_tools(server: FastMCP) -> None:
         doc_filter_clause = ""
         if doc_filter:
             safe_doc_filter = _escape_sparql_string(doc_filter)
-            doc_uri_prefix = f"{graph_uri}:doc:{safe_doc_filter}#"
+            doc_uri_prefix = f"{graph_uri}:doc:{safe_doc_filter}"
             doc_filter_clause = f'\n    FILTER(STRSTARTS(STR(?block), "{doc_uri_prefix}"))'
 
         # Join TextNodes → parent block (via doc:childNode+) to get
