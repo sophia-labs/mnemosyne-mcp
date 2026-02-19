@@ -378,6 +378,100 @@ class WorkspaceWriter:
 
         return children
 
+    def delete_wire(self, wire_id: str) -> list[str]:
+        """Delete a wire by ID, including its inverse if bidirectional.
+
+        Args:
+            wire_id: The wire ID to delete (e.g. "w-a3f1b9c20d4e").
+
+        Returns:
+            List of wire IDs that were deleted (includes inverse if present).
+
+        Raises:
+            ValueError: If wire_id not found.
+        """
+        if wire_id not in self._wires:
+            raise ValueError(f"Wire '{wire_id}' not found")
+
+        deleted_ids: list[str] = []
+
+        # If this IS an inverse wire, also delete the canonical
+        if wire_id.endswith("-inv"):
+            canonical_id = wire_id[:-4]
+            if canonical_id in self._wires:
+                del self._wires[canonical_id]
+                deleted_ids.append(canonical_id)
+        else:
+            # Check if this wire has an inverse (bidirectional)
+            inv_id = f"{wire_id}-inv"
+            if inv_id in self._wires:
+                del self._wires[inv_id]
+                deleted_ids.append(inv_id)
+
+        del self._wires[wire_id]
+        deleted_ids.append(wire_id)
+
+        return deleted_ids
+
+    def delete_wires_matching(
+        self, document_id: str, block_id: str | None = None
+    ) -> list[str]:
+        """Delete all wires connected to a document or block.
+
+        Finds all wires where the document (and optionally block) appears as
+        source or target, then deletes them along with their bidirectional
+        inverses. Deduplicates so no wire is deleted twice.
+
+        Args:
+            document_id: Delete wires connected to this document.
+            block_id: If provided, only delete wires where this block is the
+                source or target block. Without this, all wires touching the
+                document are deleted.
+
+        Returns:
+            List of all wire IDs that were deleted.
+        """
+        # Collect candidate wire IDs
+        candidates: set[str] = set()
+        for wire_id in list(self._wires.keys()):
+            wire = self._wires.get(wire_id)
+            if not isinstance(wire, pycrdt.Map):
+                continue
+
+            src_doc = wire.get("sourceDocumentId")
+            tgt_doc = wire.get("targetDocumentId")
+
+            if src_doc != document_id and tgt_doc != document_id:
+                continue
+
+            if block_id is not None:
+                src_block = wire.get("sourceBlockId")
+                tgt_block = wire.get("targetBlockId")
+                # Wire must touch this block on the matching document side
+                doc_matches_src = src_doc == document_id and src_block == block_id
+                doc_matches_tgt = tgt_doc == document_id and tgt_block == block_id
+                if not doc_matches_src and not doc_matches_tgt:
+                    continue
+
+            candidates.add(wire_id)
+
+        # Expand to include bidirectional inverses, then delete
+        to_delete: set[str] = set()
+        for wire_id in candidates:
+            to_delete.add(wire_id)
+            if wire_id.endswith("-inv"):
+                to_delete.add(wire_id[:-4])
+            else:
+                to_delete.add(f"{wire_id}-inv")
+
+        deleted: list[str] = []
+        for wire_id in to_delete:
+            if wire_id in self._wires:
+                del self._wires[wire_id]
+                deleted.append(wire_id)
+
+        return deleted
+
     def _delete_wires_for_document(self, doc_id: str) -> int:
         """Delete all workspace wires connected to a document.
 

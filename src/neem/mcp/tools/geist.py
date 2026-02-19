@@ -3,7 +3,7 @@ MCP tools for Project Geist — Sophia's persistent memory, valuation, and self-
 
 Provides 13 tools organized in four groups:
 - Memory Queue: remember, recall, care, archive_memories
-- Valuation: valuate, batch_valuate, get_block_values, get_values, revaluate
+- Valuation: valuate, get_block_values, get_values, revaluate
 - Song: music, sing, counterpoint, coda
 - Orientation: quick_orient
 
@@ -792,8 +792,8 @@ def register_geist_tools(server: FastMCP) -> None:
     async def store_memory_tool(
         graph_id: str,
         content: str,
-        block_ids: Optional[List[str]] = None,
-        predicates: Optional[List[str]] = None,
+        block_ids: list[str] | None = None,
+        predicates: list[str] | None = None,
         context: Context | None = None,
     ) -> str:
         auth = MCPAuthContext.from_context(context)
@@ -1323,9 +1323,12 @@ def register_geist_tools(server: FastMCP) -> None:
 
     @server.tool(
         name="valuate",
-        title="Valuate Block",
+        title="Valuate Block(s)",
         description=(
-            "Assign importance (0-5) and/or valence (-5 to +5) to any block in the graph. "
+            "Assign importance (0-5) and/or valence (-5 to +5) to block(s) in the graph. "
+            "For a single block, pass document_id, block_id, and importance/valence directly. "
+            "For multiple blocks, pass a `valuations` list where each entry has "
+            "document_id, block_id, and at least one of importance or valence.\n\n"
             "Uses logarithmic accumulation: each valuation adds to a cumulative sum, so "
             "repeated attention builds durable scores. Valuating at 0 = active forgetting.\n\n"
             "Call get_values first to understand your scoring criteria — the importance and valence "
@@ -1336,139 +1339,46 @@ def register_geist_tools(server: FastMCP) -> None:
     )
     async def valuate_tool(
         graph_id: str,
-        document_id: str,
-        block_id: str,
+        document_id: Optional[str] = None,
+        block_id: Optional[str] = None,
         importance: Optional[int] = None,
         valence: Optional[int] = None,
+        valuations: list[dict[str, Any]] | None = None,
         context: Context | None = None,
     ) -> str:
-        auth = MCPAuthContext.from_context(context)
-        auth.require_auth()
-        user_id = _resolve_user_id(auth)
-
-        if importance is None and valence is None:
-            raise ValueError("At least one of importance (0-5) or valence (-5 to +5) must be provided")
-        if importance is not None and not (0 <= importance <= 5):
-            raise ValueError("importance must be between 0 and 5")
-        if valence is not None and not (-5 <= valence <= 5):
-            raise ValueError("valence must be between -5 and +5")
-
-        graph_id = graph_id.strip()
-        document_id = document_id.strip()
-        block_id = block_id.strip()
-
-        # Valuation URI (NOT a #-fragment — survives MATERIALIZE_DOC)
-        val_uri = (
-            f"urn:mnemosyne:user:{user_id}:graph:{graph_id}"
-            f":valuation:{document_id}:{block_id}"
-        )
-        block_uri = (
-            f"urn:mnemosyne:user:{user_id}:graph:{graph_id}"
-            f":doc:{document_id}#block-{block_id}"
-        )
-
-        # 1. Read current values
-        query = f"""
-PREFIX doc: <http://mnemosyne.dev/doc#>
-SELECT ?rawImp ?impCount ?rawVal ?valCount
-WHERE {{
-  OPTIONAL {{ <{val_uri}> doc:rawImportanceSum ?rawImp }}
-  OPTIONAL {{ <{val_uri}> doc:importanceCount ?impCount }}
-  OPTIONAL {{ <{val_uri}> doc:rawValenceSum ?rawVal }}
-  OPTIONAL {{ <{val_uri}> doc:valenceCount ?valCount }}
-}}
-"""
-        rows = await _sparql_query(backend_config, job_stream, auth, graph_id, query)
-        current = rows[0] if rows else {}
-
-        old_raw_imp = float(current.get("rawImp", 0))
-        old_imp_count = int(current.get("impCount", 0))
-        old_raw_val = float(current.get("rawVal", 0))
-        old_val_count = int(current.get("valCount", 0))
-
-        # 2. Accumulate
-        new_raw_imp = old_raw_imp + (importance if importance is not None else 0)
-        new_imp_count = old_imp_count + (1 if importance is not None else 0)
-        new_raw_val = old_raw_val + (valence if valence is not None else 0)
-        new_val_count = old_val_count + (1 if valence is not None else 0)
-
-        new_cum_imp = math.log2(1 + new_raw_imp) if new_raw_imp > 0 else 0.0
-        if new_raw_val != 0:
-            sign = 1 if new_raw_val >= 0 else -1
-            new_cum_val = sign * math.log2(1 + abs(new_raw_val))
-        else:
-            new_cum_val = 0.0
-
-        now = _now_iso()
-
-        # 3. DELETE old, then INSERT new (separate calls so each gets proper graph scope)
-        delete_sparql = f"""
-PREFIX doc: <http://mnemosyne.dev/doc#>
-DELETE WHERE {{ <{val_uri}> ?p ?o }}
-"""
-        await _sparql_update(backend_config, job_stream, auth, graph_id, delete_sparql)
-
-        insert_sparql = f"""
-PREFIX doc: <http://mnemosyne.dev/doc#>
-PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
-INSERT DATA {{
-  <{val_uri}> doc:blockRef <{block_uri}> .
-  <{val_uri}> doc:rawImportanceSum "{new_raw_imp}"^^xsd:float .
-  <{val_uri}> doc:importanceCount "{new_imp_count}"^^xsd:integer .
-  <{val_uri}> doc:cumulativeImportance "{round(new_cum_imp, 4)}"^^xsd:float .
-  <{val_uri}> doc:rawValenceSum "{new_raw_val}"^^xsd:float .
-  <{val_uri}> doc:valenceCount "{new_val_count}"^^xsd:integer .
-  <{val_uri}> doc:cumulativeValence "{round(new_cum_val, 4)}"^^xsd:float .
-  <{val_uri}> doc:lastValuatedAt "{now}"^^xsd:dateTime .
-}}
-"""
-        success = await _sparql_update(backend_config, job_stream, auth, graph_id, insert_sparql)
-
-        if not success:
-            return _render_json({"success": False, "error": "SPARQL update failed"})
-
-        return _render_json({
-            "block_id": block_id,
-            "document_id": document_id,
-            "cumulative_importance": round(new_cum_imp, 4),
-            "cumulative_valence": round(new_cum_val, 4),
-            "importance_count": new_imp_count,
-            "valence_count": new_val_count,
-        })
-
-    @server.tool(
-        name="batch_valuate",
-        title="Batch Valuate Blocks",
-        description=(
-            "Assign importance and/or valence to multiple blocks in a single call. "
-            "More efficient than repeated valuate() calls when surveying a cluster of documents. "
-            "Each entry requires document_id and block_id, plus at least one of importance (0-5) "
-            "or valence (-5 to +5). Returns results for each valuation."
-        ),
-    )
-    async def batch_valuate_tool(
-        graph_id: str,
-        valuations: List[Dict[str, Any]],
-        context: Context | None = None,
-    ) -> str:
-        """Valuate multiple blocks in batch.
+        """Valuate one or more blocks.
 
         Uses 3 SPARQL round-trips total (1 read + 1 delete + 1 insert)
-        regardless of batch size, instead of 3 per block.
+        regardless of batch size.
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
         user_id = _resolve_user_id(auth)
 
-        if not valuations:
-            raise ValueError("valuations list is required and must not be empty")
+        # Resolve single vs batch
+        if valuations is not None and (document_id is not None or block_id is not None):
+            raise ValueError("Provide either 'document_id'/'block_id' (single) or 'valuations' (batch), not both")
 
         graph_id = graph_id.strip()
+
+        if valuations is not None:
+            if not valuations:
+                raise ValueError("valuations list must not be empty")
+            entries_input = valuations
+        elif document_id is not None and block_id is not None:
+            if importance is None and valence is None:
+                raise ValueError("At least one of importance (0-5) or valence (-5 to +5) must be provided")
+            entries_input = [{"document_id": document_id, "block_id": block_id,
+                             "importance": importance, "valence": valence}]
+        else:
+            raise ValueError("Either 'document_id' and 'block_id' (single) or 'valuations' (batch) is required")
+
+        is_single = valuations is None
         errors: List[Dict[str, Any]] = []
 
         # 1. Validate all entries and build URI maps
         valid_entries: List[Dict[str, Any]] = []
-        for i, entry in enumerate(valuations):
+        for i, entry in enumerate(entries_input):
             doc_id = str(entry.get("document_id", "")).strip()
             blk_id = str(entry.get("block_id", "")).strip()
             imp = entry.get("importance")
@@ -1506,6 +1416,8 @@ INSERT DATA {{
             })
 
         if not valid_entries:
+            if is_single and errors:
+                raise RuntimeError(f"Valuation failed: {errors[0].get('error', 'unknown error')}")
             output: Dict[str, Any] = {"results": [], "updated_count": 0}
             if errors:
                 output["errors"] = errors
@@ -1602,6 +1514,8 @@ WHERE {{
                 "document_id": entry["doc_id"],
                 "cumulative_importance": round(new_cum_imp, 4),
                 "cumulative_valence": round(new_cum_val, 4),
+                "importance_count": imp_count,
+                "valence_count": val_count,
             })
 
         # Final state per unique valuation URI for writeback
@@ -1635,8 +1549,6 @@ WHERE {{
             })
 
         # 4. Single SPARQL DELETE for all valuation URIs
-        # Uses DELETE { } WHERE { } form (not DELETE WHERE shorthand) so the
-        # _sparql_update helper injects a WITH <graph> clause correctly.
         delete_values = " ".join(f"(<{c['val_uri']}>)" for c in computed)
         delete_sparql = f"""DELETE {{ ?v ?p ?o }}
 WHERE {{
@@ -1647,7 +1559,7 @@ WHERE {{
         delete_success = await _sparql_update(backend_config, job_stream, auth, graph_id, delete_sparql)
         if not delete_success:
             for entry in valid_entries:
-                errors.append({"index": entry["index"], "error": "Batch SPARQL DELETE failed"})
+                errors.append({"index": entry["index"], "error": "SPARQL DELETE failed"})
             output = {"results": [], "updated_count": 0}
             if errors:
                 output["errors"] = errors
@@ -1676,10 +1588,16 @@ INSERT DATA {{
         success = await _sparql_update(backend_config, job_stream, auth, graph_id, insert_sparql)
 
         if not success:
-            # INSERT failed — report all as errors
             for entry in valid_entries:
-                errors.append({"index": entry["index"], "error": "Batch SPARQL INSERT failed"})
+                errors.append({"index": entry["index"], "error": "SPARQL INSERT failed"})
             results = []
+
+        # Single mode: return flat result or raise on error. Batch mode: return list.
+        if is_single:
+            if errors:
+                raise RuntimeError(f"Valuation failed: {errors[0].get('error', 'unknown error')}")
+            if results:
+                return _render_json(results[0])
 
         output = {"results": results, "updated_count": len(results)}
         if errors:

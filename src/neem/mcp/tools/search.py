@@ -3,7 +3,6 @@
 Provides:
 - search_documents: Fast title/path search against workspace Y.Doc
 - search_blocks: Hybrid lexical (SPARQL) + semantic (Qdrant) content search
-- reindex_graph: Admin tool for re-embedding all documents
 """
 
 from __future__ import annotations
@@ -603,62 +602,63 @@ def register_search_tools(server: FastMCP) -> None:
         })
 
     # ==================================================================
-    # reindex_graph — admin tool
+    # reindex_graph — admin tool (commented out, no longer needed for
+    # standard agent surface; all docs auto-index on save now)
     # ==================================================================
 
-    @server.tool(
-        name="reindex_graph",
-        title="Reindex Graph",
-        description=(
-            "Re-embed all documents in a graph. Used for initial embedding of "
-            "existing graphs, after model upgrades, or recovery after vector "
-            "store data loss. Enqueues a COMPUTE_EMBEDDINGS job for each document.\n\n"
-            "This is an admin/maintenance operation — normal document edits "
-            "are automatically indexed via the MATERIALIZE_DOC pipeline."
-        ),
-    )
-    async def reindex_graph_tool(
-        graph_id: str,
-        context: Context | None = None,
-    ) -> str:
-        """Re-embed all documents in a graph."""
-        auth = MCPAuthContext.from_context(context)
-        auth.require_auth()
+    # @server.tool(
+    #     name="reindex_graph",
+    #     title="Reindex Graph",
+    #     description=(
+    #         "Re-embed all documents in a graph. Used for initial embedding of "
+    #         "existing graphs, after model upgrades, or recovery after vector "
+    #         "store data loss. Enqueues a COMPUTE_EMBEDDINGS job for each document.\n\n"
+    #         "This is an admin/maintenance operation — normal document edits "
+    #         "are automatically indexed via the MATERIALIZE_DOC pipeline."
+    #     ),
+    # )
+    # async def reindex_graph_tool(
+    #     graph_id: str,
+    #     context: Context | None = None,
+    # ) -> str:
+    #     """Re-embed all documents in a graph."""
+    #     auth = MCPAuthContext.from_context(context)
+    #     auth.require_auth()
+    #
+    #     if not graph_id or not graph_id.strip():
+    #         raise ValueError("graph_id is required")
+    #
+    #     if job_stream:
+    #         try:
+    #             await job_stream.ensure_ready()
+    #         except Exception:
+    #             pass
+    #
+    #     metadata = await submit_job(
+    #         base_url=backend_config.base_url,
+    #         auth=auth,
+    #         task_type="reindex_graph",
+    #         payload={"graph_id": graph_id.strip()},
+    #     )
+    #
+    #     if context:
+    #         await context.report_progress(10, 100)
+    #
+    #     result = await _wait_for_job_result(job_stream, metadata, context, auth)
+    #     inline = _extract_inline_result(result)
+    #
+    #     if inline and isinstance(inline, dict):
+    #         error = inline.get("error")
+    #         if error:
+    #             return _render_json({"error": error})
+    #         return _render_json(inline)
+    #
+    #     if result.get("status") == "failed":
+    #         return _render_json({"error": result.get("error", "Reindex failed")})
+    #
+    #     return _render_json({"error": "Failed to get reindex result"})
 
-        if not graph_id or not graph_id.strip():
-            raise ValueError("graph_id is required")
-
-        if job_stream:
-            try:
-                await job_stream.ensure_ready()
-            except Exception:
-                pass
-
-        metadata = await submit_job(
-            base_url=backend_config.base_url,
-            auth=auth,
-            task_type="reindex_graph",
-            payload={"graph_id": graph_id.strip()},
-        )
-
-        if context:
-            await context.report_progress(10, 100)
-
-        result = await _wait_for_job_result(job_stream, metadata, context, auth)
-        inline = _extract_inline_result(result)
-
-        if inline and isinstance(inline, dict):
-            error = inline.get("error")
-            if error:
-                return _render_json({"error": error})
-            return _render_json(inline)
-
-        if result.get("status") == "failed":
-            return _render_json({"error": result.get("error", "Reindex failed")})
-
-        return _render_json({"error": "Failed to get reindex result"})
-
-    logger.info("Registered search tools (search_documents, search_blocks, reindex_graph)")
+    logger.info("Registered search tools (search_documents, search_blocks)")
 
 
 async def _wait_for_job_result(

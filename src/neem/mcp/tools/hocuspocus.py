@@ -424,7 +424,7 @@ GROUP BY ?docId
         description="""Reads document content with wire counts. Supports multiple output formats.
 
 Formats (set via 'format' parameter):
-- default (None): TipTap XML with full formatting and data-block-id attributes on every block. Use this when you need block IDs for surgical editing (edit_block_text, update_block, insert_block, delete_block) or block-level wire connections.
+- default (None): TipTap XML with full formatting and data-block-id attributes on every block. Use this when you need block IDs for surgical editing (edit_block_text, update_blocks, insert_block, delete_block) or block-level wire connections.
 - 'markdown': Clean Markdown. Use this when you just need to read/understand a document's content without editing it. Much more compact than XML.
 - 'ids_only': Returns just the ordered list of block IDs and count, no content. Use this when you already know the content but need block IDs for wiring or editing.
 
@@ -953,85 +953,6 @@ LIMIT {top_valued}
             raise RuntimeError(f"Failed to create document digest: {e}")
 
     @server.tool(
-        name="export_document",
-        title="Export Document",
-        description=(
-            "DEPRECATED: Prefer read_document with format='markdown' instead, which also "
-            "includes wire counts.\n\n"
-            "Export a document in a specified format. Returns the document content "
-            "converted to the requested format along with the document title.\n\n"
-            "Formats:\n"
-            "- 'xml': Raw TipTap XML (lossless, includes block IDs and all attributes)\n"
-            "- 'markdown': Clean Markdown with headings, lists, code blocks, bold/italic/etc.\n"
-            "- 'html': Self-contained HTML with Garden theming (serif typography, dark/light mode)\n\n"
-            "The only unique capability here is 'html' export (themed HTML). For xml or markdown, "
-            "use read_document instead."
-        ),
-    )
-    async def export_document_tool(
-        graph_id: str,
-        document_id: str,
-        format: str = "markdown",
-        context: Context | None = None,
-    ) -> dict:
-        """Export a document (deprecated — prefer read_document with format param).
-
-        Args:
-            graph_id: The graph containing the document
-            document_id: The document to export
-            format: Export format - "xml", "markdown" (default), or "html"
-        """
-        auth = MCPAuthContext.from_context(context)
-        auth.require_auth()
-
-        if format not in ("xml", "markdown", "html"):
-            raise ValueError("format must be 'xml', 'markdown', or 'html'")
-
-        try:
-            # Validate document exists in workspace before connecting
-            await _validate_document_in_workspace(graph_id, document_id, auth.user_id)
-
-            await _connect_for_read(graph_id, document_id, auth.user_id)
-
-            channel = hp_client.get_document_channel(graph_id, document_id, user_id=auth.user_id)
-            if channel is None:
-                raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
-
-            reader = DocumentReader(channel.doc)
-            xml_content = reader.to_xml()
-
-            # Extract title from content
-            title = extract_title_from_xml(xml_content) or document_id
-
-            # Convert to requested format
-            if format == "markdown":
-                content = tiptap_xml_to_markdown(xml_content)
-            elif format == "html":
-                content = tiptap_xml_to_html(xml_content, title=title, themed=True)
-            else:
-                content = xml_content
-
-            return {
-                "graph_id": graph_id,
-                "document_id": document_id,
-                "title": title,
-                "format": format,
-                "content": content,
-            }
-
-        except Exception as e:
-            logger.error(
-                "Failed to export document",
-                extra_context={
-                    "graph_id": graph_id,
-                    "document_id": document_id,
-                    "format": format,
-                    "error": str(e),
-                },
-            )
-            raise RuntimeError(f"Failed to export document: {e}")
-
-    @server.tool(
         name="write_document",
         title="Write Document Content",
         description="""Replaces document content with TipTap XML. Syncs to UI in real-time.
@@ -1051,7 +972,7 @@ Markdown is also accepted and auto-converted to TipTap XML.
 
 Returns block_ids: an ordered list of all block IDs in the written document, enabling immediate block-level wiring without a separate read call.
 
-NOT for: editing existing documents (use edit_block_text, update_block, or insert_block instead). Only use write_document for brand-new documents or when the user explicitly asks for a full rewrite.
+NOT for: editing existing documents (use edit_block_text, update_blocks, or insert_block instead). Only use write_document for brand-new documents or when the user explicitly asks for a full rewrite.
 
 Write tools use a persistent cached channel (no automatic reconnect like read tools). In multi-agent environments, always call read_document first to get current content before writing — this ensures your channel has the latest state from the server. CRDT merge prevents data corruption, but writing without reading first may silently overwrite another agent's recent changes.""",
     )
@@ -1162,13 +1083,11 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
         name="append_to_document",
         title="Append Block to Document",
         description=(
-            "Appends a block to the end of a document. Accepts TipTap XML for any block type. "
-            "Use this for incremental additions without replacing existing content. "
-            "For plain text, wrap in <paragraph>text</paragraph>. For structured content, "
-            "provide full XML like <heading level=\"2\">Title</heading> or <listItem listType=\"bullet\">...</listItem>. "
-            "Plain text without XML tags is auto-wrapped in a <paragraph>. "
-            "Only accepts a single top-level XML block element per call. To append multiple blocks, make multiple calls. "
-            "Markdown is also accepted and auto-converted.\n\n"
+            "Appends one or more blocks to the end of a document. Accepts TipTap XML, markdown, "
+            "or plain text. Use this for incremental additions without replacing existing content.\n\n"
+            "Supports multiple blocks in a single call: pass markdown with multiple paragraphs, "
+            "or XML with multiple top-level elements. Each block is appended in order within a "
+            "single transaction. Plain text without XML tags is auto-wrapped in a <paragraph>.\n\n"
             "For appending to documents written by other agents, call read_document first to sync "
             "the channel — otherwise the append may conflict with content you haven't seen yet."
         ),
@@ -1845,83 +1764,6 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
     # -------------------------------------------------------------------------
 
     @server.tool(
-        name="move_artifact",
-        title="Move Artifact",
-        description=(
-            "Move an artifact to a different folder. "
-            "Set new_parent_id to null to move to root level."
-        ),
-    )
-    async def move_artifact_tool(
-        graph_id: str,
-        artifact_id: str,
-        new_parent_id: Optional[str] = None,
-        new_order: Optional[float] = None,
-        context: Context | None = None,
-    ) -> dict:
-        """Move an artifact (document with readOnly) to a different folder."""
-        # Artifacts are documents — delegate to move_document
-        return await move_document_tool(
-            graph_id=graph_id,
-            document_id=artifact_id,
-            new_parent_id=new_parent_id,
-            context=context,
-        )
-
-    @server.tool(
-        name="rename_artifact",
-        title="Rename Artifact",
-        description="Rename an artifact's display label.",
-    )
-    async def rename_artifact_tool(
-        graph_id: str,
-        artifact_id: str,
-        new_label: str,
-        context: Context | None = None,
-    ) -> dict:
-        """Rename an artifact (document with readOnly)."""
-        auth = MCPAuthContext.from_context(context)
-        auth.require_auth()
-
-        if not graph_id or not graph_id.strip():
-            raise ValueError("graph_id is required and cannot be empty")
-        if not artifact_id or not artifact_id.strip():
-            raise ValueError("artifact_id is required and cannot be empty")
-        if not new_label or not new_label.strip():
-            raise ValueError("new_label is required and cannot be empty")
-
-        try:
-            await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
-
-            # Artifacts are documents — update title in documents map
-            await hp_client.transact_workspace(
-                graph_id.strip(),
-                lambda doc: WorkspaceWriter(doc).update_document(
-                    artifact_id.strip(),
-                    title=new_label.strip(),
-                ),
-                user_id=auth.user_id,
-            )
-
-            return {
-                "success": True,
-                "artifact_id": artifact_id.strip(),
-                "graph_id": graph_id.strip(),
-                "new_label": new_label.strip(),
-            }
-
-        except Exception as e:
-            logger.error(
-                "Failed to rename artifact",
-                extra_context={
-                    "graph_id": graph_id,
-                    "artifact_id": artifact_id,
-                    "error": str(e),
-                },
-            )
-            raise RuntimeError(f"Failed to rename artifact: {e}")
-
-    @server.tool(
         name="read_artifact",
         title="Read Artifact Content",
         description=(
@@ -2272,71 +2114,80 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
         }
 
     @server.tool(
-        name="move_document",
-        title="Move Document",
+        name="move_documents",
+        title="Move Document(s)",
         description=(
-            "Move a document to a folder. "
-            "Set new_parent_id to null to move to root level (unfiled). "
-            "Set target_graph_id to move the document to a different graph "
+            "Move document(s) to a folder. For a single document, pass document_id. "
+            "For multiple documents, pass a document_ids list. All documents are moved "
+            "to the same new_parent_id (null for root level). "
+            "Set target_graph_id to move to a different graph "
             "(content and comments are preserved; wires and block IDs are not). "
             "Note: This updates the document's folder assignment in workspace navigation."
         ),
     )
-    async def move_document_tool(
+    async def move_documents_tool(
         graph_id: str,
-        document_id: str,
-        new_parent_id: Optional[str] = None,
-        target_graph_id: Optional[str] = None,
+        document_id: Optional[str] = None,
+        document_ids: list[str] | None = None,
+        new_parent_id: str | None = None,
+        target_graph_id: str | None = None,
         context: Context | None = None,
     ) -> dict:
-        """Move a document to a folder, or to a different graph entirely."""
+        """Move one or more documents to a folder, or to a different graph."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required and cannot be empty")
-        if not document_id or not document_id.strip():
-            raise ValueError("document_id is required and cannot be empty")
 
-        # Cross-graph move?
-        if target_graph_id and target_graph_id.strip() != graph_id.strip():
-            try:
-                return await _move_document_cross_graph(
-                    auth,
-                    graph_id.strip(),
-                    target_graph_id.strip(),
-                    document_id.strip(),
-                    new_parent_id,
-                )
-            except Exception as e:
-                logger.error(
-                    "Failed to move document cross-graph",
-                    extra_context={
-                        "graph_id": graph_id,
-                        "target_graph_id": target_graph_id,
-                        "document_id": document_id,
-                        "error": str(e),
-                    },
-                )
-                raise RuntimeError(f"Failed to move document cross-graph: {e}")
+        # Resolve single vs batch
+        if document_ids is not None and document_id is not None:
+            raise ValueError("Provide either 'document_id' (single) or 'document_ids' (batch), not both")
 
-        # Same-graph move (existing behavior)
+        if document_ids is not None:
+            if not document_ids:
+                raise ValueError("document_ids list must not be empty")
+            ids_to_move = [d.strip() for d in document_ids]
+        elif document_id is not None:
+            ids_to_move = [document_id.strip()]
+        else:
+            raise ValueError("Either 'document_id' or 'document_ids' is required")
+
+        is_single = document_id is not None
+        is_cross_graph = target_graph_id and target_graph_id.strip() != graph_id.strip()
+
+        if is_cross_graph:
+            # Cross-graph move — iterate over each document
+            results: List[Dict[str, Any]] = []
+            errors: List[Dict[str, Any]] = []
+            for did in ids_to_move:
+                try:
+                    result = await _move_document_cross_graph(
+                        auth, graph_id.strip(), target_graph_id.strip(), did, new_parent_id,
+                    )
+                    results.append(result)
+                except Exception as e:
+                    errors.append({"document_id": did, "error": str(e)})
+
+            if is_single:
+                if errors:
+                    raise RuntimeError(f"Failed to move document cross-graph: {errors[0]['error']}")
+                return results[0]
+
+            output: Dict[str, Any] = {"results": results, "moved_count": len(results)}
+            if errors:
+                output["errors"] = errors
+                output["error_count"] = len(errors)
+            return output
+
+        # Same-graph move
         try:
             await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
-
-            # Verify document exists in workspace
             channel = hp_client.get_workspace_channel(graph_id.strip(), user_id=auth.user_id)
             if channel is None:
                 raise RuntimeError(f"Workspace not connected: {graph_id}")
 
             reader = WorkspaceReader(channel.doc)
-            current = reader.get_document(document_id.strip())
-
-            if not current:
-                raise RuntimeError(
-                    f"Document '{document_id}' not found in graph '{graph_id}'. "
-                    f"Use get_workspace to see available documents."
-                )
 
             # Validate target folder exists
             if new_parent_id and not reader.folder_exists(new_parent_id.strip()):
@@ -2345,107 +2196,144 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
                     f"Use get_workspace to see available folder IDs."
                 )
 
-            # Update document parent via Y.js
-            await hp_client.transact_workspace(
-                graph_id.strip(),
-                lambda doc: WorkspaceWriter(doc).update_document(
-                    document_id.strip(),
-                    parent_id=new_parent_id.strip() if new_parent_id else None,
-                ),
-                user_id=auth.user_id,
-            )
+            results = []
+            errors = []
+            for did in ids_to_move:
+                current = reader.get_document(did)
+                if not current:
+                    errors.append({"document_id": did, "error": f"Document '{did}' not found in graph '{graph_id}'"})
+                    continue
 
-            return {
-                "success": True,
-                "document_id": document_id.strip(),
-                "graph_id": graph_id.strip(),
-                "new_parent_id": new_parent_id.strip() if new_parent_id else None,
-            }
+                try:
+                    await hp_client.transact_workspace(
+                        graph_id.strip(),
+                        lambda doc, _did=did: WorkspaceWriter(doc).update_document(
+                            _did,
+                            parent_id=new_parent_id.strip() if new_parent_id else None,
+                        ),
+                        user_id=auth.user_id,
+                    )
+                    results.append({
+                        "success": True,
+                        "document_id": did,
+                        "graph_id": graph_id.strip(),
+                        "new_parent_id": new_parent_id.strip() if new_parent_id else None,
+                    })
+                except Exception as e:
+                    errors.append({"document_id": did, "error": str(e)})
+
+            if is_single:
+                if errors:
+                    raise RuntimeError(f"Failed to move document: {errors[0]['error']}")
+                return results[0]
+
+            output = {"results": results, "moved_count": len(results)}
+            if errors:
+                output["errors"] = errors
+                output["error_count"] = len(errors)
+            return output
 
         except Exception as e:
             logger.error(
-                "Failed to move document",
-                extra_context={
-                    "graph_id": graph_id,
-                    "document_id": document_id,
-                    "error": str(e),
-                },
+                "Failed to move documents",
+                extra_context={"graph_id": graph_id, "error": str(e)},
             )
-            raise RuntimeError(f"Failed to move document: {e}")
+            raise RuntimeError(f"Failed to move documents: {e}")
 
     @server.tool(
-        name="delete_document",
-        title="Delete Document",
+        name="delete_documents",
+        title="Delete Document(s)",
         description=(
-            "Delete a document. By default, permanently deletes the document "
-            "including its content, RDF triples, and stored data. "
+            "Delete document(s). For a single document, pass document_id. "
+            "For multiple documents, pass a document_ids list. "
+            "By default, permanently deletes including content, RDF triples, and stored data. "
             "Set hard=false to only remove from workspace navigation (soft delete) "
-            "— the document can then be recreated by writing to the same document_id."
+            "— documents can then be recreated by writing to the same document_id."
         ),
     )
-    async def delete_document_tool(
+    async def delete_documents_tool(
         graph_id: str,
-        document_id: str,
+        document_id: Optional[str] = None,
+        document_ids: list[str] | None = None,
         hard: bool = True,
         context: Context | None = None,
     ) -> dict:
-        """Delete a document, optionally with permanent data destruction."""
+        """Delete one or more documents, optionally with permanent data destruction."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required and cannot be empty")
-        if not document_id or not document_id.strip():
-            raise ValueError("document_id is required and cannot be empty")
+
+        # Resolve single vs batch
+        if document_ids is not None and document_id is not None:
+            raise ValueError("Provide either 'document_id' (single) or 'document_ids' (batch), not both")
+
+        if document_ids is not None:
+            if not document_ids:
+                raise ValueError("document_ids list must not be empty")
+            ids_to_delete = [d.strip() for d in document_ids]
+        elif document_id is not None:
+            ids_to_delete = [document_id.strip()]
+        else:
+            raise ValueError("Either 'document_id' or 'document_ids' is required")
+
+        is_single = document_id is not None
 
         try:
             await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
-
-            # Verify document exists in workspace
             channel = hp_client.get_workspace_channel(graph_id.strip(), user_id=auth.user_id)
             if channel is None:
                 raise RuntimeError(f"Workspace not connected: {graph_id}")
 
             reader = WorkspaceReader(channel.doc)
-            current = reader.get_document(document_id.strip())
+            results: List[Dict[str, Any]] = []
+            errors: List[Dict[str, Any]] = []
 
-            if not current:
-                raise RuntimeError(
-                    f"Document '{document_id}' not found in graph '{graph_id}'. "
-                    f"Use get_workspace to see available documents."
-                )
+            for did in ids_to_delete:
+                current = reader.get_document(did)
+                if not current:
+                    errors.append({"document_id": did, "error": f"Document '{did}' not found in graph '{graph_id}'"})
+                    continue
 
-            # Remove document from workspace CRDT
-            await hp_client.transact_workspace(
-                graph_id.strip(),
-                lambda doc: WorkspaceWriter(doc).delete_document(document_id.strip()),
-                user_id=auth.user_id,
-            )
+                try:
+                    await hp_client.transact_workspace(
+                        graph_id.strip(),
+                        lambda doc, _did=did: WorkspaceWriter(doc).delete_document(_did),
+                        user_id=auth.user_id,
+                    )
 
-            # Hard delete: also destroy backend data (RDF, S3, Redis)
-            if hard:
-                await _hard_delete_document(auth, graph_id.strip(), document_id.strip())
+                    if hard:
+                        await _hard_delete_document(auth, graph_id.strip(), did)
 
-            return {
-                "success": True,
-                "deleted": True,
-                "hard": hard,
-                "document_id": document_id.strip(),
-                "graph_id": graph_id.strip(),
-                "title": current.get("title", "Untitled"),
-                "parent_id": current.get("parentId"),
-            }
+                    results.append({
+                        "success": True,
+                        "deleted": True,
+                        "hard": hard,
+                        "document_id": did,
+                        "graph_id": graph_id.strip(),
+                        "title": current.get("title", "Untitled"),
+                    })
+                except Exception as e:
+                    errors.append({"document_id": did, "error": str(e)})
+
+            if is_single:
+                if errors:
+                    raise RuntimeError(f"Failed to delete document: {errors[0]['error']}")
+                return results[0]
+
+            output: Dict[str, Any] = {"results": results, "deleted_count": len(results)}
+            if errors:
+                output["errors"] = errors
+                output["error_count"] = len(errors)
+            return output
 
         except Exception as e:
             logger.error(
-                "Failed to delete document",
-                extra_context={
-                    "graph_id": graph_id,
-                    "document_id": document_id,
-                    "error": str(e),
-                },
+                "Failed to delete documents",
+                extra_context={"graph_id": graph_id, "error": str(e)},
             )
-            raise RuntimeError(f"Failed to delete document: {e}")
+            raise RuntimeError(f"Failed to delete documents: {e}")
 
     # -------------------------------------------------------------------------
     # Block-Level Document Operations
@@ -2609,35 +2497,29 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             raise RuntimeError(f"Failed to query blocks: {e}")
 
     @server.tool(
-        name="update_block",
-        title="Update Block",
+        name="update_blocks",
+        title="Update Block(s)",
         description=(
-            "Update a block by its ID. Can update attributes (indent, checked, listType) "
-            "without changing content, or replace the entire block content. "
-            "This is the most surgical edit - only modifies what you specify. "
-            "Plain text in xml_content is auto-wrapped in a <paragraph>. "
-            "Markdown is also accepted and auto-converted.\n\n"
+            "Update block(s) by ID. For a single block, pass block_id with attributes "
+            "and/or xml_content. For multiple blocks, pass an `updates` list where each "
+            "entry has block_id and optionally attributes and/or xml_content.\n\n"
+            "Can update attributes (indent, checked, listType) without changing content, "
+            "or replace entire block content. Plain text in xml_content is auto-wrapped "
+            "in a <paragraph>. Markdown is also accepted and auto-converted.\n\n"
             "Always read the document or block first (read_document or get_block) before updating — "
             "write tools use a cached channel and need a preceding read to sync latest state from the server."
         ),
     )
-    async def update_block_tool(
+    async def update_blocks_tool(
         graph_id: str,
         document_id: str,
-        block_id: str,
+        block_id: Optional[str] = None,
         attributes: Optional[Dict[str, Any]] = None,
         xml_content: Optional[str] = None,
+        updates: list[dict[str, Any]] | None = None,
         context: Context | None = None,
     ) -> dict:
-        """Update a block's attributes or content.
-
-        Args:
-            graph_id: The graph containing the document
-            document_id: The document containing the block
-            block_id: The block to update
-            attributes: Dict of attributes to update (indent, checked, listType, collapsed)
-            xml_content: If provided, replaces the entire block content (preserves block_id)
-        """
+        """Update one or more blocks' attributes or content."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -2645,49 +2527,88 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             raise ValueError("graph_id is required")
         if not document_id or not document_id.strip():
             raise ValueError("document_id is required")
-        if not block_id or not block_id.strip():
-            raise ValueError("block_id is required")
-        if attributes is None and xml_content is None:
-            raise ValueError("Either attributes or xml_content must be provided")
 
-        # Auto-wrap plain text in a paragraph element
-        resolved_xml = _ensure_xml(xml_content) if xml_content else None
+        # Resolve single vs batch
+        if updates is not None and block_id is not None:
+            raise ValueError("Provide either 'block_id' (single) or 'updates' (batch), not both")
+
+        if updates is not None:
+            if not updates:
+                raise ValueError("updates list must not be empty")
+        elif block_id is not None:
+            if attributes is None and xml_content is None:
+                raise ValueError("Either attributes or xml_content must be provided")
+            updates = [{"block_id": block_id, "attributes": attributes, "xml_content": xml_content}]
+        else:
+            raise ValueError("Either 'block_id' (single) or 'updates' (batch) is required")
+
+        is_single = block_id is not None
 
         try:
-            # Validate document exists in workspace
             await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id)
-
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
-            def perform_update(doc: Any) -> None:
+            results: list[Dict[str, Any]] = []
+
+            def perform_updates(doc: Any) -> None:
                 writer = DocumentWriter(doc)
-                if resolved_xml:
-                    # Full content replacement (preserves block_id)
-                    writer.replace_block_by_id(block_id.strip(), resolved_xml)
-                if attributes:
-                    # Surgical attribute update
-                    writer.update_block_attributes(block_id.strip(), attributes)
+                for update in updates:
+                    bid = update.get("block_id")
+                    if not bid:
+                        results.append({"error": "missing block_id"})
+                        continue
+
+                    try:
+                        content = update.get("xml_content") or update.get("content")
+                        attrs = update.get("attributes")
+
+                        if content is None and attrs is None:
+                            results.append({
+                                "block_id": bid,
+                                "error": "No xml_content or attributes provided — nothing to update",
+                            })
+                            continue
+
+                        if content:
+                            resolved = _ensure_xml(content)
+                            writer.replace_block_by_id(bid.strip(), resolved)
+                        if attrs:
+                            writer.update_block_attributes(bid.strip(), attrs)
+                        results.append({"block_id": bid, "success": True})
+                    except Exception as e:
+                        results.append({"block_id": bid, "error": str(e)})
 
             await hp_client.transact_document(
                 graph_id.strip(),
                 document_id.strip(),
-                perform_update,
+                perform_updates,
                 user_id=auth.user_id,
             )
 
-            return {"success": True, "block_id": block_id.strip()}
+            # Single mode: return flat result or raise on error
+            if is_single and results:
+                r = results[0]
+                if "error" in r:
+                    raise RuntimeError(f"Failed to update block {r.get('block_id', '?')}: {r['error']}")
+                return r
+
+            return {
+                "success": all(r.get("success") for r in results),
+                "results": results,
+                "updated_count": sum(1 for r in results if r.get("success")),
+                "error_count": sum(1 for r in results if "error" in r),
+            }
 
         except Exception as e:
             logger.error(
-                "Failed to update block",
+                "Failed to update blocks",
                 extra_context={
                     "graph_id": graph_id,
                     "document_id": document_id,
-                    "block_id": block_id,
                     "error": str(e),
                 },
             )
-            raise RuntimeError(f"Failed to update block: {e}")
+            raise RuntimeError(f"Failed to update blocks: {e}")
 
     @server.tool(
         name="edit_block_text",
@@ -2695,7 +2616,7 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
         description=(
             "Insert or delete text at specific character offsets within a block, using "
             "CRDT-native operations that merge cleanly with concurrent browser edits. "
-            "Unlike update_block (which replaces entire content), this enables true "
+            "Unlike update_blocks (which replaces entire content), this enables true "
             "collaborative editing without data loss.\n\n"
             "Workflow: 1) Call get_block to read current text and length (this also syncs "
             "the channel to latest server state), "
@@ -2944,107 +2865,6 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
     # -------------------------------------------------------------------------
     # Batch Operations
     # -------------------------------------------------------------------------
-
-    @server.tool(
-        name="batch_update_blocks",
-        title="Batch Update Blocks",
-        description=(
-            "Update multiple blocks in a single transaction. More efficient than "
-            "individual update_block calls. Each update object should have a block_id (required), "
-            "and optionally attributes (object) and/or xml_content (string), matching the "
-            "parameters of update_block. Returns results for each update.\n\n"
-            "Always read the document first (read_document) before batch updating — "
-            "write tools use a cached channel and need a preceding read to sync latest state from the server."
-        ),
-    )
-    async def batch_update_blocks_tool(
-        graph_id: str,
-        document_id: str,
-        updates: list[Dict[str, Any]],
-        context: Context | None = None,
-    ) -> dict:
-        """Batch update multiple blocks atomically.
-
-        Args:
-            graph_id: The graph containing the document
-            document_id: The document containing the blocks
-            updates: List of update specs, each with:
-                - block_id (required): The block to update
-                - attributes (optional): Dict of attributes to update
-                - content (optional): New XML content for the block
-        """
-        auth = MCPAuthContext.from_context(context)
-        auth.require_auth()
-
-        if not graph_id or not graph_id.strip():
-            raise ValueError("graph_id is required")
-        if not document_id or not document_id.strip():
-            raise ValueError("document_id is required")
-        if not updates:
-            raise ValueError("updates list is required and cannot be empty")
-
-        try:
-            # Validate document exists in workspace
-            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id)
-
-            await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
-
-            results: list[Dict[str, Any]] = []
-
-            def perform_batch(doc: Any) -> None:
-                writer = DocumentWriter(doc)
-                for update in updates:
-                    block_id = update.get("block_id")
-                    if not block_id:
-                        results.append({"error": "missing block_id"})
-                        continue
-
-                    try:
-                        # Accept both "xml_content" (matches update_block param name)
-                        # and "content" (legacy) for the XML content key
-                        xml_content = update.get("xml_content") or update.get("content")
-                        attrs = update.get("attributes")
-
-                        if xml_content is None and attrs is None:
-                            results.append({
-                                "block_id": block_id,
-                                "error": "No xml_content or attributes provided — nothing to update",
-                            })
-                            continue
-
-                        if xml_content:
-                            writer.replace_block_by_id(block_id, xml_content)
-                        if attrs:
-                            writer.update_block_attributes(block_id, attrs)
-                        results.append({"block_id": block_id, "success": True})
-                    except Exception as e:
-                        results.append({"block_id": block_id, "error": str(e)})
-
-            await hp_client.transact_document(
-                graph_id.strip(),
-                document_id.strip(),
-                perform_batch,
-                user_id=auth.user_id,
-            )
-
-            return {
-                "success": all(r.get("success") for r in results),
-                "results": results,
-                "updated_count": sum(1 for r in results if r.get("success")),
-                "error_count": sum(1 for r in results if "error" in r),
-            }
-
-        except Exception as e:
-            logger.error(
-                "Failed to batch update blocks",
-                extra_context={
-                    "graph_id": graph_id,
-                    "document_id": document_id,
-                    "update_count": len(updates),
-                    "error": str(e),
-                },
-            )
-            raise RuntimeError(f"Failed to batch update blocks: {e}")
 
     # ------------------------------------------------------------------
     # dump_chat — Save conversation content to a timestamped document

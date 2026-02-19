@@ -390,11 +390,11 @@ def create_standalone_mcp_server() -> FastMCP:
     _original_call_tool = mcp_server.call_tool
 
     async def _throttled_call_tool(*args, **kwargs):
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.2)
         return await _original_call_tool(*args, **kwargs)
 
     mcp_server.call_tool = _throttled_call_tool  # type: ignore[method-assign]
-    logger.info("Tool throttle enabled: 0.5s sleep before every tool call")
+    logger.info("Tool throttle enabled: 0.2s sleep before every tool call")
 
     # Remove excluded tools based on MCP_EXCLUDED_TOOLS env var.
     # Comma-separated list of tool names, e.g. "export_document,upload_artifact,sparql_update"
