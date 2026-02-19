@@ -57,6 +57,7 @@ class WorkspaceWriter:
         self._doc = doc
         self._documents: pycrdt.Map = doc.get("documents", type=pycrdt.Map)
         self._folders: pycrdt.Map = doc.get("folders", type=pycrdt.Map)
+        self._wires: pycrdt.Map = doc.get("wires", type=pycrdt.Map)
 
     def upsert_document(
         self,
@@ -120,10 +121,11 @@ class WorkspaceWriter:
             True if the document was removed, False if it didn't exist.
         """
         if doc_id in self._documents:
+            deleted_wires = self._delete_wires_for_document(doc_id)
             del self._documents[doc_id]
             logger.debug(
                 "Deleted document from workspace",
-                extra_context={"doc_id": doc_id},
+                extra_context={"doc_id": doc_id, "deleted_wires": deleted_wires},
             )
             return True
         return False
@@ -376,6 +378,30 @@ class WorkspaceWriter:
 
         return children
 
+    def _delete_wires_for_document(self, doc_id: str) -> int:
+        """Delete all workspace wires connected to a document.
+
+        Args:
+            doc_id: Document ID whose related wires should be removed.
+
+        Returns:
+            Number of wires removed.
+        """
+        wire_ids_to_delete: list[str] = []
+        for wire_id in list(self._wires.keys()):
+            wire = self._wires.get(wire_id)
+            if not isinstance(wire, pycrdt.Map):
+                continue
+
+            if wire.get("sourceDocumentId") == doc_id or wire.get("targetDocumentId") == doc_id:
+                wire_ids_to_delete.append(wire_id)
+
+        for wire_id in wire_ids_to_delete:
+            if wire_id in self._wires:
+                del self._wires[wire_id]
+
+        return len(wire_ids_to_delete)
+
     def _delete_children_recursive(self, parent_id: str) -> None:
         """Recursively delete all children of a folder.
 
@@ -389,7 +415,7 @@ class WorkspaceWriter:
                 self._delete_children_recursive(entity_id)
                 del self._folders[entity_id]
             elif entity_type == "document":
-                del self._documents[entity_id]
+                self.delete_document(entity_id)
 
 
 class WorkspaceReader:
