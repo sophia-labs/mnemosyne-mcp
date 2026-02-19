@@ -2170,12 +2170,115 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
     # Document Navigation Operations
     # -------------------------------------------------------------------------
 
+    async def _move_document_cross_graph(
+        auth: MCPAuthContext,
+        source_graph_id: str,
+        target_graph_id: str,
+        document_id: str,
+        new_parent_id: Optional[str],
+    ) -> dict:
+        """Move a document between graphs by reading content, writing to target, and deleting source.
+
+        Content and comments are preserved. Wires and block IDs are not — they are
+        graph-scoped and cannot be transferred. The write happens before the delete
+        so that a failure mid-operation leaves the source intact (at worst, duplicated).
+        """
+        # 1. Read source document content
+        await _connect_for_read(source_graph_id, document_id, auth.user_id)
+        channel = hp_client.get_document_channel(source_graph_id, document_id, user_id=auth.user_id)
+        if channel is None:
+            raise RuntimeError(f"Could not connect to document '{document_id}' in graph '{source_graph_id}'")
+
+        reader = DocumentReader(channel.doc)
+        xml_content = reader.to_xml()
+        comments = reader.get_all_comments()
+
+        # Get title from source workspace metadata
+        await hp_client.connect_workspace(source_graph_id, user_id=auth.user_id)
+        ws_channel = hp_client.get_workspace_channel(source_graph_id, user_id=auth.user_id)
+        ws_reader = WorkspaceReader(ws_channel.doc)
+        doc_meta = ws_reader.get_document(document_id)
+        title = doc_meta.get("title", "Untitled") if doc_meta else "Untitled"
+
+        # 2. Validate target graph and folder
+        await hp_client.connect_workspace(target_graph_id, user_id=auth.user_id)
+        if new_parent_id:
+            target_ws = hp_client.get_workspace_channel(target_graph_id, user_id=auth.user_id)
+            if target_ws is None:
+                raise RuntimeError(f"Could not connect to workspace for graph '{target_graph_id}'")
+            target_reader = WorkspaceReader(target_ws.doc)
+            if not target_reader.folder_exists(new_parent_id.strip()):
+                raise ValueError(
+                    f"Target folder '{new_parent_id}' not found in graph '{target_graph_id}'. "
+                    f"Use get_workspace to see available folder IDs."
+                )
+
+        # 3. Write content to target graph
+        await hp_client.connect_document(target_graph_id, document_id, user_id=auth.user_id)
+
+        def _write_content(doc):
+            writer = DocumentWriter(doc)
+            writer.replace_all_content(xml_content)
+            if comments:
+                for cid, cdata in comments.items():
+                    writer.set_comment(
+                        cid,
+                        text=cdata.get("text", ""),
+                        author=cdata.get("author", "Unknown"),
+                        author_id=cdata.get("authorId", "unknown"),
+                        resolved=cdata.get("resolved", False),
+                        quoted_text=cdata.get("quotedText"),
+                    )
+
+        await hp_client.transact_document(
+            target_graph_id, document_id, _write_content, user_id=auth.user_id,
+        )
+
+        # Register in target workspace
+        parent = new_parent_id.strip() if new_parent_id else None
+        await hp_client.transact_workspace(
+            target_graph_id,
+            lambda doc: WorkspaceWriter(doc).upsert_document(document_id, title, parent_id=parent),
+            user_id=auth.user_id,
+        )
+
+        # 4. Delete from source (write succeeded — safe to delete)
+        await hp_client.transact_workspace(
+            source_graph_id,
+            lambda doc: WorkspaceWriter(doc).delete_document(document_id),
+            user_id=auth.user_id,
+        )
+        await _hard_delete_document(auth, source_graph_id, document_id)
+
+        logger.info(
+            "cross_graph_move_complete",
+            extra_context={
+                "document_id": document_id,
+                "source_graph_id": source_graph_id,
+                "target_graph_id": target_graph_id,
+                "title": title,
+            },
+        )
+
+        return {
+            "success": True,
+            "moved_cross_graph": True,
+            "document_id": document_id,
+            "source_graph_id": source_graph_id,
+            "target_graph_id": target_graph_id,
+            "new_parent_id": parent,
+            "title": title,
+            "warning": "Wires and block-level connections were not preserved in cross-graph move. Block IDs have changed.",
+        }
+
     @server.tool(
         name="move_document",
         title="Move Document",
         description=(
             "Move a document to a folder. "
             "Set new_parent_id to null to move to root level (unfiled). "
+            "Set target_graph_id to move the document to a different graph "
+            "(content and comments are preserved; wires and block IDs are not). "
             "Note: This updates the document's folder assignment in workspace navigation."
         ),
     )
@@ -2183,9 +2286,10 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
         graph_id: str,
         document_id: str,
         new_parent_id: Optional[str] = None,
+        target_graph_id: Optional[str] = None,
         context: Context | None = None,
     ) -> dict:
-        """Move a document to a folder via Y.js."""
+        """Move a document to a folder, or to a different graph entirely."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -2194,6 +2298,29 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
         if not document_id or not document_id.strip():
             raise ValueError("document_id is required and cannot be empty")
 
+        # Cross-graph move?
+        if target_graph_id and target_graph_id.strip() != graph_id.strip():
+            try:
+                return await _move_document_cross_graph(
+                    auth,
+                    graph_id.strip(),
+                    target_graph_id.strip(),
+                    document_id.strip(),
+                    new_parent_id,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to move document cross-graph",
+                    extra_context={
+                        "graph_id": graph_id,
+                        "target_graph_id": target_graph_id,
+                        "document_id": document_id,
+                        "error": str(e),
+                    },
+                )
+                raise RuntimeError(f"Failed to move document cross-graph: {e}")
+
+        # Same-graph move (existing behavior)
         try:
             await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
 
