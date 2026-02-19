@@ -19,6 +19,7 @@ from urllib.parse import urlparse, urlunparse
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from neem.mcp.jobs.realtime import RealtimeJobClient
 from neem.mcp.tools.basic import register_basic_tools
@@ -405,7 +406,7 @@ def create_standalone_mcp_server() -> FastMCP:
             try:
                 mcp_server.remove_tool(name)
                 logger.info("Excluded tool", extra_context={"tool": name})
-            except KeyError:
+            except (KeyError, ToolError):
                 logger.warning(
                     "MCP_EXCLUDED_TOOLS references unknown tool",
                     extra_context={"tool": name},
