@@ -103,6 +103,26 @@ def _resolve_predicate(predicate: str) -> str:
     return _SHORT_TO_URI.get(predicate, f"{MNEMO_NS}{predicate}")
 
 
+def _get_document_block_ids(doc: pycrdt.Doc) -> set[str]:
+    """Extract all block IDs from a document Y.Doc's content fragment.
+
+    Iterates top-level children of the ``content`` XmlFragment and collects
+    ``data-block-id`` attributes.  Returns an empty set if the document has
+    no content or no blocks with IDs.
+    """
+    try:
+        fragment: pycrdt.XmlFragment = doc.get("content", type=pycrdt.XmlFragment)
+        ids: set[str] = set()
+        for child in fragment.children:
+            if hasattr(child, "attributes"):
+                bid = child.attributes.get("data-block-id")
+                if bid:
+                    ids.add(bid)
+        return ids
+    except Exception:
+        return set()
+
+
 def _get_all_wires(doc: pycrdt.Doc, include_tombstoned: bool = False) -> List[Dict[str, Any]]:
     """Read all wires from a workspace Y.Doc.
 
@@ -626,6 +646,77 @@ def register_wire_tools(server: FastMCP) -> None:
             # Validate document exists
             _validate_document_in_ws(channel.doc, graph_id, document_id)
 
+            # Reconciliation + sweep: connect to the document to get current
+            # block IDs, then in one workspace transaction:
+            # 1. Restore tombstoned wires whose blocks exist (undo happened)
+            # 2. Sweep expired tombstones (garbage collection)
+            swept: list[str] = []
+            restored: list[str] = []
+
+            try:
+                # Get current block IDs from document Y.Doc
+                doc_block_ids: set[str] = set()
+                try:
+                    await hp_client.connect_document(
+                        graph_id.strip(), document_id.strip(),
+                        user_id=auth.user_id,
+                    )
+                    doc_channel = hp_client.get_document_channel(
+                        graph_id.strip(), document_id.strip(),
+                        user_id=auth.user_id,
+                    )
+                    if doc_channel and doc_channel.doc:
+                        doc_block_ids = _get_document_block_ids(doc_channel.doc)
+                except Exception as e:
+                    logger.debug(
+                        "Could not read document block IDs for reconciliation",
+                        extra_context={
+                            "document_id": document_id,
+                            "error": str(e),
+                        },
+                    )
+
+                def _reconcile_and_sweep(ws_doc: pycrdt.Doc) -> None:
+                    nonlocal swept, restored
+                    ws = WorkspaceWriter(ws_doc)
+
+                    # Restore wires whose blocks have reappeared (e.g. undo)
+                    if doc_block_ids:
+                        for wire_id in list(ws._wires.keys()):
+                            wire = ws._wires.get(wire_id)
+                            if not isinstance(wire, pycrdt.Map):
+                                continue
+                            if wire.get("_tombstonedAt") is None:
+                                continue
+
+                            src_doc = wire.get("sourceDocumentId")
+                            tgt_doc = wire.get("targetDocumentId")
+                            src_block = wire.get("sourceBlockId")
+                            tgt_block = wire.get("targetBlockId")
+
+                            # Check if the tombstoned block is back
+                            block_exists = False
+                            if src_doc == document_id and src_block in doc_block_ids:
+                                block_exists = True
+                            if tgt_doc == document_id and tgt_block in doc_block_ids:
+                                block_exists = True
+
+                            if block_exists:
+                                del wire["_tombstonedAt"]
+                                restored.append(wire_id)
+
+                    # Sweep expired tombstones
+                    swept = ws.sweep_tombstoned_wires()
+
+                await hp_client.transact_workspace(
+                    graph_id, _reconcile_and_sweep, user_id=auth.user_id,
+                )
+            except Exception as e:
+                logger.debug(
+                    "Reconciliation/sweep failed (non-fatal)",
+                    extra_context={"graph_id": graph_id, "error": str(e)},
+                )
+
             wires = _get_wires_for_document(channel.doc, document_id, direction)
 
             # Filter by predicate if specified (accept short names or full URIs)
@@ -635,7 +726,12 @@ def register_wire_tools(server: FastMCP) -> None:
 
             formatted = [_format_wire_summary(w, ws_doc=channel.doc) for w in wires]
 
-            return json.dumps({"wires": formatted, "count": len(formatted)})
+            result: Dict[str, Any] = {"wires": formatted, "count": len(formatted)}
+            if restored:
+                result["restored_wires"] = len(restored)
+            if swept:
+                result["swept_tombstones"] = len(swept)
+            return json.dumps(result)
 
         except Exception as e:
             raise RuntimeError(f"Failed to get wires: {e}")
@@ -833,6 +929,16 @@ def register_wire_tools(server: FastMCP) -> None:
 
         try:
             await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
+
+            # Opportunistic sweep of expired tombstones
+            try:
+                def _sweep(doc: pycrdt.Doc) -> None:
+                    WorkspaceWriter(doc).sweep_tombstoned_wires()
+                await hp_client.transact_workspace(
+                    graph_id, _sweep, user_id=auth.user_id,
+                )
+            except Exception:
+                pass  # Non-fatal
 
             # Mode: delete by document/block match
             if has_doc:
