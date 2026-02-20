@@ -55,12 +55,60 @@ def _build_folder_paths(folders: dict[str, dict]) -> dict[str, str]:
     return paths
 
 
+_PUNCT_RE = re_mod.compile(r"[-_'']+")
+
+
+def _normalize(s: str) -> str:
+    """Collapse hyphens, underscores, and apostrophes for fuzzy comparison.
+
+    "Anti-Oedipus" → "antioedipus", "don't" → "dont"
+    """
+    return _PUNCT_RE.sub("", s.lower())
+
+
+def _tokenize(s: str) -> set[str]:
+    """Split on whitespace AND hyphens/underscores for better token matching.
+
+    "Anti-Oedipus notes" → {"anti", "oedipus", "notes", "anti-oedipus", "antioedipus"}
+    Keeps compound tokens alongside their parts AND a collapsed form so both
+    exact and normalized matches work.
+    """
+    words = s.lower().split()
+    tokens = set(words)
+    for w in words:
+        parts = re_mod.split(r"[-_]", w)
+        if len(parts) > 1:
+            tokens.update(p for p in parts if p)
+            # Also add the collapsed form (hyphens/underscores removed)
+            collapsed = "".join(p for p in parts if p)
+            if collapsed:
+                tokens.add(collapsed)
+    return tokens
+
+
 def _fuzzy_score(query_tokens: set[str], text_tokens: set[str]) -> float:
-    """Simple token-overlap fuzzy score between 0 and 1."""
+    """Token-overlap fuzzy score with partial matching.
+
+    Exact token matches score 1.0 each. Partial matches (query token is a
+    substring of a text token or vice versa) score 0.5 each.
+    """
     if not query_tokens or not text_tokens:
         return 0.0
-    overlap = len(query_tokens & text_tokens)
-    return overlap / max(len(query_tokens), len(text_tokens))
+
+    # Exact overlap
+    exact = query_tokens & text_tokens
+    score = len(exact)
+
+    # Partial: query token appears within a text token (or vice versa)
+    remaining_q = query_tokens - exact
+    remaining_t = text_tokens - exact
+    for qt in remaining_q:
+        for tt in remaining_t:
+            if qt in tt or tt in qt:
+                score += 0.5
+                break
+
+    return score / max(len(query_tokens), len(text_tokens))
 
 
 def _escape_sparql_string(s: str) -> str:
@@ -198,6 +246,9 @@ def register_search_tools(server: FastMCP) -> None:
                 "_title_lower": title.lower(),
                 "_path_lower": fpath.lower(),
                 "_searchable": f"{title} {fpath}".lower(),
+                "_title_norm": _normalize(title),
+                "_path_norm": _normalize(fpath),
+                "_searchable_norm": _normalize(f"{title} {fpath}"),
             })
 
         # Search based on mode
@@ -206,16 +257,27 @@ def register_search_tools(server: FastMCP) -> None:
 
         def _search_exact_title() -> list[dict]:
             q = query.lower()
-            return [e for e in entries if e["_title_lower"] == q]
+            q_norm = _normalize(query)
+            results = [e for e in entries if e["_title_lower"] == q]
+            if not results and q_norm:
+                results = [e for e in entries if e["_title_norm"] == q_norm]
+            return results
 
         def _search_substring() -> list[dict]:
             q = query.lower()
+            q_norm = _normalize(query)
             results = []
             for e in entries:
                 if q in e["_title_lower"]:
                     e = {**e, "match_type": "title_substring"}
                     results.append(e)
                 elif q in e["_path_lower"]:
+                    e = {**e, "match_type": "path_substring"}
+                    results.append(e)
+                elif q_norm and q_norm in e["_title_norm"]:
+                    e = {**e, "match_type": "title_substring"}
+                    results.append(e)
+                elif q_norm and q_norm in e["_path_norm"]:
                     e = {**e, "match_type": "path_substring"}
                     results.append(e)
             return results
@@ -236,12 +298,12 @@ def register_search_tools(server: FastMCP) -> None:
             return results
 
         def _search_fuzzy() -> list[dict]:
-            q_tokens = set(query.lower().split())
+            q_tokens = _tokenize(query)
             scored = []
             for e in entries:
-                t_tokens = set(e["_searchable"].split())
+                t_tokens = _tokenize(e["_searchable"])
                 score = _fuzzy_score(q_tokens, t_tokens)
-                if score >= 0.4:
+                if score >= 0.3:
                     scored.append(({**e, "match_type": "fuzzy"}, score))
             scored.sort(key=lambda x: x[1], reverse=True)
             return [s[0] for s in scored]
