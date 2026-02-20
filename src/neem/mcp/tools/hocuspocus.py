@@ -350,19 +350,85 @@ GROUP BY ?docId
                 force_fresh=True,
             )
 
+    async def _force_flush_document_via_api(
+        auth: MCPAuthContext,
+        graph_id: str,
+        document_id: str,
+        *,
+        include_materialization: bool = False,
+        attempts: int = 3,
+    ) -> bool:
+        """Call backend flush endpoint and return True if active session was flushed."""
+        url = f"{backend_config.base_url}/documents/{graph_id}/{document_id}/flush"
+        headers = auth.http_headers()
+        params = {"include_materialization": "true" if include_materialization else "false"}
+
+        for attempt in range(1, attempts + 1):
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+                    resp = await client.post(url, params=params, headers=headers)
+
+                # Rolling deploy safety: endpoint may not exist yet on some pods.
+                if resp.status_code == 404:
+                    logger.debug(
+                        "document_flush_endpoint_unavailable",
+                        extra_context={"graph_id": graph_id, "document_id": document_id},
+                    )
+                    return False
+
+                if resp.status_code != 200:
+                    logger.warning(
+                        "document_flush_http_error",
+                        extra_context={
+                            "graph_id": graph_id,
+                            "document_id": document_id,
+                            "status": resp.status_code,
+                            "attempt": attempt,
+                            "attempts": attempts,
+                        },
+                    )
+                else:
+                    try:
+                        payload = resp.json()
+                    except Exception:
+                        payload = {}
+                    active = bool(payload.get("activeSession"))
+                    if active:
+                        return True
+            except Exception as exc:
+                logger.warning(
+                    "document_flush_request_failed",
+                    extra_context={
+                        "graph_id": graph_id,
+                        "document_id": document_id,
+                        "attempt": attempt,
+                        "attempts": attempts,
+                        "error": str(exc),
+                    },
+                )
+
+            if attempt < attempts:
+                await asyncio.sleep(0.12 * attempt)
+
+        return False
+
     async def _await_document_durable(
         graph_id: str,
         document_id: str,
         user_id: str,
         *,
         attempts: int = 3,
-    ) -> None:
+        auth: Optional[MCPAuthContext] = None,
+    ) -> bool:
         """Require a durable write checkpoint via a fresh document channel.
 
         This intentionally avoids same-channel verification:
         1. Tear down the current channel.
         2. Reconnect with force_fresh=True.
         3. Retry with short backoff on transient sync timeouts.
+
+        If auth is provided, also calls backend flush endpoint for an
+        immediate server-side persist checkpoint.
         """
         last_error: Optional[Exception] = None
 
@@ -377,7 +443,24 @@ GROUP BY ?docId
                     force_fresh=True,
                     disconnect_first=True,
                 )
-                return
+                flush_confirmed = False
+                if auth is not None:
+                    flush_confirmed = await _force_flush_document_via_api(
+                        auth,
+                        graph_id,
+                        document_id,
+                        include_materialization=False,
+                    )
+                    if not flush_confirmed:
+                        logger.warning(
+                            "document_flush_unconfirmed",
+                            extra_context={
+                                "graph_id": graph_id,
+                                "document_id": document_id,
+                                "note": "fresh channel durable read succeeded, but flush endpoint did not confirm active session",
+                            },
+                        )
+                return flush_confirmed
             except Exception as exc:
                 last_error = exc
                 if attempt < attempts:
@@ -1093,7 +1176,12 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             expected_count = len(block_ids)
             if expected_count > 0:
                 if await_durable:
-                    await _await_document_durable(graph_id, document_id, auth.user_id)
+                    await _await_document_durable(
+                        graph_id,
+                        document_id,
+                        auth.user_id,
+                        auth=auth,
+                    )
                 else:
                     await _connect_for_read(graph_id, document_id, auth.user_id)
                 verify_channel = hp_client.get_document_channel(
@@ -2142,7 +2230,12 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
         )
 
         # Force fresh-channel durability checkpoint before deleting source.
-        await _await_document_durable(target_graph_id, document_id, auth.user_id)
+        await _await_document_durable(
+            target_graph_id,
+            document_id,
+            auth.user_id,
+            auth=auth,
+        )
 
         # Register in target workspace
         parent = new_parent_id.strip() if new_parent_id else None
@@ -3006,7 +3099,12 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             )
 
             # Force fresh-channel durability checkpoint before exposing in navigation.
-            await _await_document_durable(graph_id, doc_id, auth.user_id)
+            await _await_document_durable(
+                graph_id,
+                doc_id,
+                auth.user_id,
+                auth=auth,
+            )
 
             # 3. Register document in workspace under Chat Logs folder
             await hp_client.transact_workspace(
