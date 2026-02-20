@@ -7,6 +7,7 @@ CRDT synchronization, bypassing the job queue for lower latency operations.
 
 from __future__ import annotations
 
+import asyncio
 import html as html_mod
 import json
 import math
@@ -316,6 +317,9 @@ GROUP BY ?docId
 
     async def _connect_for_read(
         graph_id: str, document_id: str, user_id: str,
+        *,
+        force_fresh: bool = False,
+        disconnect_first: bool = False,
     ) -> None:
         """Connect to a document channel for a read operation.
 
@@ -324,9 +328,12 @@ GROUP BY ?docId
         are refreshed.  Retries once on timeout (disconnect + fresh connect).
         """
         try:
+            if disconnect_first:
+                await hp_client.disconnect_document(graph_id, document_id, user_id=user_id)
             await hp_client.connect_document(
                 graph_id, document_id, user_id=user_id,
-                max_age=_READ_MAX_AGE,
+                force_fresh=force_fresh,
+                max_age=None if force_fresh else _READ_MAX_AGE,
             )
         except TimeoutError:
             logger.warning(
@@ -342,6 +349,56 @@ GROUP BY ?docId
                 graph_id, document_id, user_id=user_id,
                 force_fresh=True,
             )
+
+    async def _await_document_durable(
+        graph_id: str,
+        document_id: str,
+        user_id: str,
+        *,
+        attempts: int = 3,
+    ) -> None:
+        """Require a durable write checkpoint via a fresh document channel.
+
+        This intentionally avoids same-channel verification:
+        1. Tear down the current channel.
+        2. Reconnect with force_fresh=True.
+        3. Retry with short backoff on transient sync timeouts.
+        """
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                # Give the event loop a moment to flush websocket send callbacks.
+                await asyncio.sleep(0)
+                await _connect_for_read(
+                    graph_id,
+                    document_id,
+                    user_id,
+                    force_fresh=True,
+                    disconnect_first=True,
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+                if attempt < attempts:
+                    backoff = 0.15 * attempt
+                    logger.warning(
+                        "durable_read_retry",
+                        extra_context={
+                            "graph_id": graph_id,
+                            "document_id": document_id,
+                            "attempt": attempt,
+                            "attempts": attempts,
+                            "backoff_seconds": backoff,
+                            "error": str(exc),
+                        },
+                    )
+                    await asyncio.sleep(backoff)
+
+        raise RuntimeError(
+            f"Failed to establish fresh durability check channel for '{document_id}' "
+            f"after {attempts} attempts: {last_error}"
+        )
 
     @server.tool(
         name="get_user_location",
@@ -972,6 +1029,8 @@ Markdown is also accepted and auto-converted to TipTap XML.
 
 Returns block_ids: an ordered list of all block IDs in the written document, enabling immediate block-level wiring without a separate read call.
 
+`await_durable` (default true) forces post-write verification through a fresh document channel rather than the same cached channel.
+
 NOT for: editing existing documents (use edit_block_text, update_blocks, or insert_block instead). Only use write_document for brand-new documents or when the user explicitly asks for a full rewrite.
 
 Write tools use a persistent cached channel (no automatic reconnect like read tools). In multi-agent environments, always call read_document first to get current content before writing — this ensures your channel has the latest state from the server. CRDT merge prevents data corruption, but writing without reading first may silently overwrite another agent's recent changes.""",
@@ -981,6 +1040,7 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
         document_id: str,
         content: str,
         comments: Optional[Dict[str, Any]] = None,
+        await_durable: bool = True,
         context: Context | None = None,
     ) -> dict:
         """Write TipTap XML content to a document."""
@@ -1028,10 +1088,14 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
                             block_ids.append(bid)
 
             # 2. Verify content persisted (detect tombstoned document IDs)
-            # Read back through a fresh channel to confirm the write landed.
+            # Optionally force a fresh channel so verification does not read from
+            # the same in-memory channel that just performed the write.
             expected_count = len(block_ids)
             if expected_count > 0:
-                await _connect_for_read(graph_id, document_id, auth.user_id)
+                if await_durable:
+                    await _await_document_durable(graph_id, document_id, auth.user_id)
+                else:
+                    await _connect_for_read(graph_id, document_id, auth.user_id)
                 verify_channel = hp_client.get_document_channel(
                     graph_id, document_id, user_id=auth.user_id,
                 )
@@ -1066,6 +1130,7 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
                 "document_id": document_id,
                 "title": title,
                 "block_ids": block_ids,
+                "durability_checked": await_durable,
             }
 
         except Exception as e:
@@ -2076,6 +2141,9 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             target_graph_id, document_id, _write_content, user_id=auth.user_id,
         )
 
+        # Force fresh-channel durability checkpoint before deleting source.
+        await _await_document_durable(target_graph_id, document_id, auth.user_id)
+
         # Register in target workspace
         parent = new_parent_id.strip() if new_parent_id else None
         await hp_client.transact_workspace(
@@ -2936,6 +3004,9 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
                 lambda doc: DocumentWriter(doc).replace_all_content(xml_content),
                 user_id=auth.user_id,
             )
+
+            # Force fresh-channel durability checkpoint before exposing in navigation.
+            await _await_document_durable(graph_id, doc_id, auth.user_id)
 
             # 3. Register document in workspace under Chat Logs folder
             await hp_client.transact_workspace(
