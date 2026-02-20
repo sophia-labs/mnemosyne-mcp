@@ -412,6 +412,39 @@ GROUP BY ?docId
 
         return False
 
+    async def _get_location_via_rest(auth: MCPAuthContext) -> Optional[dict]:
+        """Fetch user's current location from the backend REST API.
+
+        Returns dict with graph_id and document_id, or None if unavailable
+        (endpoint not deployed yet — rolling deploy safety).
+        """
+        url = f"{backend_config.base_url}/sessions/location"
+        headers = auth.http_headers()
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+                resp = await client.get(url, headers=headers)
+            if resp.status_code == 404:
+                # Endpoint not yet deployed on this pod — fall back to WebSocket path
+                return None
+            if resp.status_code != 200:
+                logger.warning(
+                    "session_location_http_error",
+                    extra_context={"status": resp.status_code},
+                )
+                return None
+            payload = resp.json()
+            graph_id = payload.get("graph_id")
+            document_id = payload.get("document_id")
+            if graph_id or document_id:
+                return {"graph_id": graph_id, "document_id": document_id}
+            return None
+        except Exception as exc:
+            logger.warning(
+                "session_location_request_failed",
+                extra_context={"error": str(exc)},
+            )
+            return None
+
     async def _await_document_durable(
         graph_id: str,
         document_id: str,
@@ -503,8 +536,15 @@ GROUP BY ?docId
         user_id = _resolve_user_id(auth, token, user_id)
 
         try:
-            # Reconnect to get fresh session state (the persistent WebSocket
-            # doesn't receive incremental Y.js updates after initial sync)
+            # Try REST endpoint first — reads from in-memory session on the server
+            # pod, always fresh. Falls back to WebSocket reconnect if not deployed.
+            location = await _get_location_via_rest(auth)
+            if location is not None:
+                return location
+
+            # Fallback: reconnect WebSocket to get fresh session state
+            # (the persistent WebSocket doesn't receive incremental Y.js updates
+            # after initial sync, so reconnect gets latest from server memory/Redis)
             await hp_client.refresh_session(user_id)
 
             return {
