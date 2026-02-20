@@ -3006,9 +3006,28 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
                 user_id=auth.user_id,
             )
 
+            # Tombstone (not delete) wires connected to deleted blocks.
+            # Tombstoned wires are hidden from queries but survive for a
+            # grace period so undo can restore them.  Permanent deletion
+            # happens via sweep_tombstoned_wires on workspace flush.
+            tombstoned_wires: list[str] = []
+            if deleted_ids:
+                def tombstone_wires(ws_doc: Any) -> None:
+                    nonlocal tombstoned_wires
+                    ws = WorkspaceWriter(ws_doc)
+                    for bid in deleted_ids:
+                        tombstoned_wires.extend(
+                            ws.tombstone_wires_for_block(document_id.strip(), bid)
+                        )
+
+                await hp_client.transact_workspace(
+                    graph_id.strip(), tombstone_wires, user_id=auth.user_id,
+                )
+
             return {
                 "success": True,
                 "deleted_block_ids": deleted_ids,
+                "tombstoned_wire_ids": tombstoned_wires,
             }
 
         except Exception as e:
