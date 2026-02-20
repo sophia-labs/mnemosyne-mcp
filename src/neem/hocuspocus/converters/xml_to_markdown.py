@@ -207,17 +207,31 @@ def _list_item_content(
     elem: ET.Element,
     footnotes: list[str],
 ) -> str:
-    """Extract content from a list/task item's child paragraph(s)."""
-    parts = []
-    for child in elem:
-        if child.tag == PARAGRAPH_TAG:
-            parts.append(_inline_content(child, footnotes))
-        else:
-            # Nested content — just extract inline
-            text = _inline_content(child, footnotes)
-            if text:
-                parts.append(text)
-    return " ".join(parts) if parts else ""
+    """Extract content from a list/task item.
+
+    List items may contain:
+    1. Child <paragraph> elements (TipTap canonical form)
+    2. Direct text on the element with optional inline marks (flat form
+       produced by DocumentWriter._flatten_list_container)
+
+    For case 1, we extract each paragraph's inline content separately.
+    For case 2, we treat the listItem itself as an inline container
+    (handles elem.text, child marks like <code>/<strong>, and tail text).
+    """
+    # Check if any child is a paragraph — if so, use paragraph-extraction mode
+    has_paragraph = any(child.tag == PARAGRAPH_TAG for child in elem)
+    if has_paragraph:
+        parts = []
+        for child in elem:
+            if child.tag == PARAGRAPH_TAG:
+                parts.append(_inline_content(child, footnotes))
+            else:
+                text = _inline_content(child, footnotes)
+                if text:
+                    parts.append(text)
+        return " ".join(parts)
+    # Flat list item: text and inline marks live directly on the element
+    return _inline_content(elem, footnotes)
 
 
 def _inline_content(
