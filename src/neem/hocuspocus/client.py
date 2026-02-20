@@ -148,14 +148,21 @@ class HocuspocusClient:
         ws_base = f"{ws_scheme}://{parsed.netloc}"
         return urljoin(ws_base, path)
 
-    def _build_auth_headers(self) -> Dict[str, str]:
-        """Build authentication headers for WebSocket connection."""
+    def _build_auth_headers(self, user_id: Optional[str] = None) -> Dict[str, str]:
+        """Build authentication headers for WebSocket connection.
+
+        Args:
+            user_id: Optional per-connection user override. When provided,
+                this must take precedence over the global dev fallback user so
+                sidecars do not accidentally write to the wrong user namespace.
+        """
         headers: Dict[str, str] = {}
         token = self._token_provider()
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        if self._dev_user_id:
-            headers["X-User-ID"] = self._dev_user_id
+        effective_user_id = user_id or self._dev_user_id
+        if effective_user_id:
+            headers["X-User-ID"] = effective_user_id
         # Add internal service auth header for cluster-internal requests
         if self._internal_service_secret:
             headers["X-Internal-Service"] = self._internal_service_secret
@@ -242,7 +249,7 @@ class HocuspocusClient:
             user_id: Override user_id for auth (uses _dev_user_id if not provided)
         """
         ws_url = self._build_ws_url(path)
-        headers = self._build_auth_headers()
+        headers = self._build_auth_headers(user_id=user_id)
         protocols = self._build_ws_protocols(user_id=user_id)
 
         logger.info(
