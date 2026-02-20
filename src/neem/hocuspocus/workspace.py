@@ -496,6 +496,170 @@ class WorkspaceWriter:
 
         return len(wire_ids_to_delete)
 
+    # ------------------------------------------------------------------
+    # Wire tombstoning (undo-safe block-level wire cleanup)
+    # ------------------------------------------------------------------
+
+    def tombstone_wires_for_block(
+        self, document_id: str, block_id: str, grace_seconds: float = 60.0,
+    ) -> list[str]:
+        """Mark wires connected to a block as tombstoned instead of deleting.
+
+        Tombstoned wires have a ``_tombstonedAt`` timestamp. They are hidden
+        from normal queries and will be permanently deleted by
+        ``sweep_tombstoned_wires`` after the grace period expires.  If the
+        block is restored (e.g. via undo), call ``restore_wires_for_block``
+        to clear the tombstone and bring them back.
+
+        Args:
+            document_id: Document containing the deleted block.
+            block_id: Block that was deleted.
+            grace_seconds: Seconds before tombstoned wires become eligible
+                for permanent deletion (default 60 s).
+
+        Returns:
+            List of wire IDs that were tombstoned.
+        """
+        now = time.time()
+        tombstoned: list[str] = []
+
+        for wire_id in list(self._wires.keys()):
+            wire = self._wires.get(wire_id)
+            if not isinstance(wire, pycrdt.Map):
+                continue
+
+            src_doc = wire.get("sourceDocumentId")
+            tgt_doc = wire.get("targetDocumentId")
+            src_block = wire.get("sourceBlockId")
+            tgt_block = wire.get("targetBlockId")
+
+            touches_block = (
+                (src_doc == document_id and src_block == block_id) or
+                (tgt_doc == document_id and tgt_block == block_id)
+            )
+            if not touches_block:
+                continue
+
+            # Already tombstoned — skip
+            if wire.get("_tombstonedAt") is not None:
+                continue
+
+            wire["_tombstonedAt"] = now
+            tombstoned.append(wire_id)
+
+            # Also tombstone the inverse if bidirectional
+            if wire_id.endswith("-inv"):
+                canonical_id = wire_id[:-4]
+            else:
+                canonical_id = None
+                inv_id = f"{wire_id}-inv"
+                if inv_id in self._wires:
+                    inv_wire = self._wires.get(inv_id)
+                    if isinstance(inv_wire, pycrdt.Map) and inv_wire.get("_tombstonedAt") is None:
+                        inv_wire["_tombstonedAt"] = now
+                        tombstoned.append(inv_id)
+
+            if canonical_id and canonical_id in self._wires:
+                can_wire = self._wires.get(canonical_id)
+                if isinstance(can_wire, pycrdt.Map) and can_wire.get("_tombstonedAt") is None:
+                    can_wire["_tombstonedAt"] = now
+                    tombstoned.append(canonical_id)
+
+        if tombstoned:
+            logger.debug(
+                "Tombstoned wires for block",
+                extra_context={
+                    "document_id": document_id,
+                    "block_id": block_id,
+                    "tombstoned": tombstoned,
+                },
+            )
+
+        return tombstoned
+
+    def restore_wires_for_block(self, document_id: str, block_id: str) -> list[str]:
+        """Clear tombstones on wires connected to a block (e.g. after undo).
+
+        Args:
+            document_id: Document containing the restored block.
+            block_id: Block that was restored.
+
+        Returns:
+            List of wire IDs that were restored.
+        """
+        restored: list[str] = []
+
+        for wire_id in list(self._wires.keys()):
+            wire = self._wires.get(wire_id)
+            if not isinstance(wire, pycrdt.Map):
+                continue
+            if wire.get("_tombstonedAt") is None:
+                continue
+
+            src_doc = wire.get("sourceDocumentId")
+            tgt_doc = wire.get("targetDocumentId")
+            src_block = wire.get("sourceBlockId")
+            tgt_block = wire.get("targetBlockId")
+
+            touches_block = (
+                (src_doc == document_id and src_block == block_id) or
+                (tgt_doc == document_id and tgt_block == block_id)
+            )
+            if not touches_block:
+                continue
+
+            del wire["_tombstonedAt"]
+            restored.append(wire_id)
+
+        if restored:
+            logger.debug(
+                "Restored tombstoned wires for block",
+                extra_context={
+                    "document_id": document_id,
+                    "block_id": block_id,
+                    "restored": restored,
+                },
+            )
+
+        return restored
+
+    def sweep_tombstoned_wires(self, grace_seconds: float = 60.0) -> list[str]:
+        """Permanently delete wires whose tombstone has expired.
+
+        Call this periodically (e.g. on workspace flush or session cleanup)
+        to garbage-collect wires that were tombstoned and never restored.
+
+        Args:
+            grace_seconds: Only delete wires tombstoned longer than this.
+
+        Returns:
+            List of wire IDs permanently deleted.
+        """
+        now = time.time()
+        to_delete: list[str] = []
+
+        for wire_id in list(self._wires.keys()):
+            wire = self._wires.get(wire_id)
+            if not isinstance(wire, pycrdt.Map):
+                continue
+            ts = wire.get("_tombstonedAt")
+            if ts is None:
+                continue
+            if now - ts >= grace_seconds:
+                to_delete.append(wire_id)
+
+        for wire_id in to_delete:
+            if wire_id in self._wires:
+                del self._wires[wire_id]
+
+        if to_delete:
+            logger.debug(
+                "Swept tombstoned wires",
+                extra_context={"deleted": to_delete, "grace_seconds": grace_seconds},
+            )
+
+        return to_delete
+
     def _delete_children_recursive(self, parent_id: str) -> None:
         """Recursively delete all children of a folder.
 

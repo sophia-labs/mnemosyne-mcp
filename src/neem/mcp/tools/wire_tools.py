@@ -103,13 +103,20 @@ def _resolve_predicate(predicate: str) -> str:
     return _SHORT_TO_URI.get(predicate, f"{MNEMO_NS}{predicate}")
 
 
-def _get_all_wires(doc: pycrdt.Doc) -> List[Dict[str, Any]]:
-    """Read all wires from a workspace Y.Doc."""
+def _get_all_wires(doc: pycrdt.Doc, include_tombstoned: bool = False) -> List[Dict[str, Any]]:
+    """Read all wires from a workspace Y.Doc.
+
+    By default, wires with a ``_tombstonedAt`` timestamp are excluded.
+    These are wires pending deletion after a block was removed — they'll
+    be restored if the user undoes the deletion within the grace period.
+    """
     wires_map = _read_wires_map(doc)
     result: List[Dict[str, Any]] = []
     for wire_id in wires_map.keys():
         wire = wires_map.get(wire_id)
         if isinstance(wire, pycrdt.Map):
+            if not include_tombstoned and wire.get("_tombstonedAt") is not None:
+                continue
             result.append(_wire_to_dict(wire_id, wire))
     return result
 
