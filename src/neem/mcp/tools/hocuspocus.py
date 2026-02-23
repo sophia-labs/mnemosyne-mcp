@@ -1145,6 +1145,8 @@ Blocks: paragraph, heading (level="1-3"), bulletList, orderedList, blockquote, c
 Marks (nestable): strong, em, strike, code, mark (highlight), a (href="..."), footnote (data-footnote-content="..."), commentMark (data-comment-id="...")
 Example: <paragraph>Text with <mark>highlight</mark> and a note<footnote data-footnote-content="This is a footnote"/></paragraph>
 
+IMPORTANT: Container blocks (blockquote, tableCell, tableHeader) require paragraph children — they cannot contain inline text directly. Auto-wrapping is applied as a fallback, but prefer explicit wrapping: <blockquote><paragraph>text</paragraph></blockquote>
+
 Comments: Pass a dict mapping comment IDs to metadata. Comment IDs must match data-comment-id attributes in the content.
 Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}
 
@@ -1281,6 +1283,8 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             "Supports multiple blocks in a single call: pass markdown with multiple paragraphs, "
             "or XML with multiple top-level elements. Each block is appended in order within a "
             "single transaction. Plain text without XML tags is auto-wrapped in a <paragraph>.\n\n"
+            "Container blocks (blockquote, tableCell, tableHeader) require paragraph children. "
+            "Auto-wrapping is applied as a fallback, but prefer: <blockquote><paragraph>text</paragraph></blockquote>\n\n"
             "For appending to documents written by other agents, call read_document first to sync "
             "the channel — otherwise the append may conflict with content you haven't seen yet."
         ),
@@ -2707,6 +2711,8 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             "Can update attributes (indent, checked, listType) without changing content, "
             "or replace entire block content. Plain text in xml_content is auto-wrapped "
             "in a <paragraph>. Markdown is also accepted and auto-converted.\n\n"
+            "Container blocks (blockquote, tableCell, tableHeader) require paragraph children — "
+            "auto-wrapping applied as fallback, but prefer explicit: <blockquote><paragraph>text</paragraph></blockquote>\n\n"
             "Always read the document or block first (read_document or get_block) before updating — "
             "write tools use a cached channel and need a preceding read to sync latest state from the server."
         ),
@@ -2909,6 +2915,8 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             "to specify where to insert. Returns the new block's generated ID. "
             "For appending to the end, use append_to_document instead. "
             "Plain text in xml_content is auto-wrapped in a <paragraph>. "
+            "Container blocks (blockquote, tableCell, tableHeader) require paragraph children — "
+            "auto-wrapping applied as fallback, but prefer explicit: <blockquote><paragraph>text</paragraph></blockquote> "
             "Markdown is also accepted and auto-converted.\n\n"
             "Always read the document first (read_document or get_block) before inserting — "
             "write tools use a cached channel and need a preceding read to sync latest state from the server."

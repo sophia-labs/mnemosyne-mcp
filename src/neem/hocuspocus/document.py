@@ -163,6 +163,15 @@ LIST_CONTAINER_TYPES = frozenset({
     "taskList",
 })
 
+# Block types that require paragraph children — cannot contain inline text directly.
+# TipTap's schema rejects XmlText nodes inside these; they must be wrapped in <paragraph>.
+# If bare text is written inside these, _xml_to_pycrdt auto-wraps it rather than silently dropping it.
+PARAGRAPH_REQUIRED_CONTAINERS = frozenset({
+    "blockquote",
+    "tableCell",
+    "tableHeader",
+})
+
 
 def _generate_block_id() -> str:
     """Generate a unique block ID matching TipTap's format."""
@@ -1736,6 +1745,17 @@ class DocumentWriter:
                     items = self._flatten_list_container(child, list_type, 0)
                     contents.extend(items)
                 # Note: We ignore non-block children in block containers
+        elif elem.tag in PARAGRAPH_REQUIRED_CONTAINERS:
+            # blockquote, tableCell, tableHeader require paragraph children.
+            # If an agent writes <blockquote>bare text</blockquote>, auto-wrap the
+            # inline content in a paragraph rather than silently dropping it.
+            has_content = bool(elem.text and elem.text.strip()) or len(elem) > 0
+            if has_content:
+                para = ET.Element("paragraph")
+                para.text = elem.text
+                for child in elem:
+                    para.append(child)
+                contents.append(self._xml_to_pycrdt(para))
         else:
             # Handle inline content (paragraph, heading with text/marks/inline nodes)
             # This produces a list of content items: XmlText and XmlElement mixed
