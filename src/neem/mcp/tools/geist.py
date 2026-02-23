@@ -143,6 +143,12 @@ SEED_MEMORY_QUEUE = (
     '<paragraph>__geist_meta__:{"next_number":1,"memories":{}}</paragraph>'
 )
 
+# Default importance for blocks that have never been explicitly valuated.
+# log₂(1 + positive) is always > 0, so cum_importance == 0 unambiguously
+# means "never valuated." We substitute this default so that unvaluated
+# blocks with wires/recency still score meaningfully in the composite.
+DEFAULT_UNVALUATED_IMPORTANCE = 2.0
+
 DEFAULT_WEIGHTS = {
     "importance_weight": 0.30,
     "valence_weight": 0.20,
@@ -284,9 +290,12 @@ def _compute_composite_score(
     weights: dict,
 ) -> float:
     """Compute the composite score using tanh normalization and temporal decay."""
+    # cum_importance == 0 means "never valuated" (unreachable via log₂(1+n)).
+    # Substitute default so unvaluated blocks score on their other signals.
+    effective_importance = importance if importance > 0 else DEFAULT_UNVALUATED_IMPORTANCE
     w = weights
     score = (
-        w["importance_weight"] * math.tanh(importance / w["importance_ref"])
+        w["importance_weight"] * math.tanh(effective_importance / w["importance_ref"])
         + w["valence_weight"] * math.tanh(abs(valence) / w["valence_ref"])
         + w["temporal_weight"] * math.exp(-doc_age_days / w["half_life_days"])
         + w["block_wires_weight"] * math.tanh(block_wire_count / w["block_wires_ref"])
@@ -298,17 +307,19 @@ def _compute_composite_score(
 
 def _build_wire_indexes(
     wires: List[Dict[str, Any]],
-) -> tuple[Dict[str, int], Dict[str, int], Dict[str, str]]:
+) -> tuple[Dict[str, int], Dict[str, int], Dict[str, str], Dict[str, str]]:
     """Single-pass over all wires to build lookup indexes.
 
     Returns:
         doc_wire_counts:  {document_id: total_wire_count}
         block_wire_counts: {block_id: total_wire_count}
         doc_newest_wire:  {document_id: ISO timestamp of newest wire}
+        block_to_doc:     {block_id: document_id} (for unvaluated block discovery)
     """
     doc_wire_counts: Dict[str, int] = {}
     block_wire_counts: Dict[str, int] = {}
     doc_newest_wire: Dict[str, str] = {}
+    block_to_doc: Dict[str, str] = {}
 
     for wire in wires:
         if wire["id"].endswith("-inv"):
@@ -323,12 +334,19 @@ def _build_wire_indexes(
                 if created and (not doc_newest_wire.get(doc_id) or created > doc_newest_wire[doc_id]):
                     doc_newest_wire[doc_id] = created
 
-        for block_key in ("sourceBlockId", "targetBlockId"):
+        # Track block→doc mapping alongside wire counts
+        for block_key, doc_key in (
+            ("sourceBlockId", "sourceDocumentId"),
+            ("targetBlockId", "targetDocumentId"),
+        ):
             block_id = wire.get(block_key, "")
             if block_id:
                 block_wire_counts[block_id] = block_wire_counts.get(block_id, 0) + 1
+                doc_id = wire.get(doc_key, "")
+                if doc_id:
+                    block_to_doc[block_id] = doc_id
 
-    return doc_wire_counts, block_wire_counts, doc_newest_wire
+    return doc_wire_counts, block_wire_counts, doc_newest_wire, block_to_doc
 
 
 # ── Scratchpad initialization ───────────────────────────────────────
@@ -1690,7 +1708,7 @@ LIMIT {min(limit * 3, 200)}
                 logger.debug("Could not load weights config, using defaults")
             return dict(DEFAULT_WEIGHTS)
 
-        async def _fetch_wires() -> tuple[Dict[str, int], Dict[str, int], Dict[str, str]]:
+        async def _fetch_wires() -> tuple[Dict[str, int], Dict[str, int], Dict[str, str], Dict[str, str]]:
             try:
                 await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
                 ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
@@ -1699,15 +1717,16 @@ LIMIT {min(limit * 3, 200)}
                     return _build_wire_indexes(all_wires)
             except Exception:
                 logger.debug("Could not load wire data for composite scoring")
-            return {}, {}, {}
+            return {}, {}, {}, {}
 
-        rows, weights, (doc_wire_counts, block_wire_counts, doc_newest_wire) = (
+        rows, weights, (doc_wire_counts, block_wire_counts, doc_newest_wire, block_to_doc) = (
             await asyncio.gather(_fetch_rows(), _fetch_weights(), _fetch_wires())
         )
 
         now = datetime.now(timezone.utc)
 
         # Parse results and compute composite scores
+        valuated_block_ids: set[str] = set()
         blocks = []
         for row in rows:
             cum_imp = float(row.get("cumImp", 0))
@@ -1759,6 +1778,8 @@ LIMIT {min(limit * 3, 200)}
             if min_score is not None and composite < min_score:
                 continue
 
+            valuated_block_ids.add(parsed_block_id)
+
             entry = {
                 "block_id": parsed_block_id,
                 "document_id": parsed_doc_id,
@@ -1773,6 +1794,47 @@ LIMIT {min(limit * 3, 200)}
             }
 
             blocks.append(entry)
+
+        # Inject unvaluated blocks that have wires — they score via
+        # DEFAULT_UNVALUATED_IMPORTANCE + wire/temporal signals.
+        for blk_id, bwc in block_wire_counts.items():
+            if blk_id in valuated_block_ids:
+                continue
+            doc_id = block_to_doc.get(blk_id, "")
+            if not doc_id:
+                continue
+            dwc = doc_wire_counts.get(doc_id, 0)
+            wire_age_days = 0.0
+            newest_wire = doc_newest_wire.get(doc_id, "")
+            if newest_wire:
+                try:
+                    wire_dt = datetime.fromisoformat(newest_wire.replace("Z", "+00:00"))
+                    wire_age_days = max(0.0, (now - wire_dt).total_seconds() / 86400.0)
+                except (ValueError, TypeError):
+                    pass
+            composite = _compute_composite_score(
+                importance=0.0,  # triggers DEFAULT_UNVALUATED_IMPORTANCE
+                valence=0.0,
+                doc_age_days=0.0,  # no valuation timestamp available
+                block_wire_count=bwc,
+                doc_wire_count=dwc,
+                wire_age_days=wire_age_days,
+                weights=weights,
+            )
+            if min_score is not None and composite < min_score:
+                continue
+            blocks.append({
+                "block_id": blk_id,
+                "document_id": doc_id,
+                "cumulative_importance": 0.0,
+                "cumulative_valence": 0.0,
+                "composite_score": composite,
+                "importance_count": 0,
+                "valence_count": 0,
+                "last_valuated": "",
+                "block_wire_count": bwc,
+                "doc_wire_count": dwc,
+            })
 
         # Sort by composite score descending, trim to requested limit
         blocks.sort(key=lambda b: b["composite_score"], reverse=True)
@@ -1851,7 +1913,7 @@ LIMIT {min(limit * 3, 60)}
 
         ws_doc = None
 
-        async def _fetch_wires() -> tuple[Dict[str, int], Dict[str, int], Dict[str, str]]:
+        async def _fetch_wires() -> tuple[Dict[str, int], Dict[str, int], Dict[str, str], Dict[str, str]]:
             nonlocal ws_doc
             try:
                 await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
@@ -1862,15 +1924,16 @@ LIMIT {min(limit * 3, 60)}
                     return _build_wire_indexes(all_wires)
             except Exception:
                 pass
-            return {}, {}, {}
+            return {}, {}, {}, {}
 
-        rows, weights, (doc_wire_counts, block_wire_counts, doc_newest_wire) = (
+        rows, weights, (doc_wire_counts, block_wire_counts, doc_newest_wire, block_to_doc) = (
             await asyncio.gather(_fetch_rows(), _fetch_weights(), _fetch_wires())
         )
 
         now = datetime.now(timezone.utc)
 
         # Score and rank
+        valuated_block_ids: set[str] = set()
         scored = []
         for row in rows:
             cum_imp = float(row.get("cumImp", 0))
@@ -1912,12 +1975,49 @@ LIMIT {min(limit * 3, 60)}
                 weights=weights,
             )
 
+            valuated_block_ids.add(parsed_block_id)
+
             scored.append({
                 "doc_id": parsed_doc_id,
                 "block_id": parsed_block_id,
                 "composite": composite,
                 "importance": round(cum_imp, 3),
                 "valence": round(cum_val, 3),
+                "block_wires": bwc,
+                "doc_wires": dwc,
+            })
+
+        # Inject unvaluated blocks that have wires
+        for blk_id, bwc in block_wire_counts.items():
+            if blk_id in valuated_block_ids:
+                continue
+            doc_id = block_to_doc.get(blk_id, "")
+            if not doc_id:
+                continue
+            dwc = doc_wire_counts.get(doc_id, 0)
+            wire_age_days = 0.0
+            newest_wire = doc_newest_wire.get(doc_id, "")
+            if newest_wire:
+                try:
+                    wire_dt = datetime.fromisoformat(newest_wire.replace("Z", "+00:00"))
+                    wire_age_days = max(0.0, (now - wire_dt).total_seconds() / 86400.0)
+                except (ValueError, TypeError):
+                    pass
+            composite = _compute_composite_score(
+                importance=0.0,
+                valence=0.0,
+                doc_age_days=0.0,
+                block_wire_count=bwc,
+                doc_wire_count=dwc,
+                wire_age_days=wire_age_days,
+                weights=weights,
+            )
+            scored.append({
+                "doc_id": doc_id,
+                "block_id": blk_id,
+                "composite": composite,
+                "importance": 0.0,
+                "valence": 0.0,
                 "block_wires": bwc,
                 "doc_wires": dwc,
             })
