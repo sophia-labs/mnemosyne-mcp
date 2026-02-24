@@ -25,6 +25,7 @@ from neem.utils.token_storage import get_user_id_from_token
 logger = LoggerFactory.get_logger("mcp.tools.search")
 
 STREAM_TIMEOUT_SECONDS = 60.0
+MAX_RESULTS_PER_DOCUMENT = 3
 JsonDict = Dict[str, Any]
 
 
@@ -121,6 +122,49 @@ def _escape_sparql_string(s: str) -> str:
         .replace("\t", "\\t")
     )
 
+
+
+def _post_filter_results(
+    results: list[dict],
+    *,
+    known_doc_ids: set[str] | None,
+    per_doc_limit: int = MAX_RESULTS_PER_DOCUMENT,
+    total_limit: int = 30,
+) -> tuple[list[dict], int, int]:
+    """Shared post-filter: exclude deleted docs, apply per-document cap.
+
+    Returns (filtered_results, deleted_removed_count, per_doc_capped_count).
+    """
+    if known_doc_ids is None:
+        # No workspace snapshot available — skip deletion filter, still apply per-doc cap
+        filtered = results
+        deleted_removed = 0
+    else:
+        filtered = []
+        deleted_removed = 0
+        for r in results:
+            doc_id = r.get("document_id", "")
+            if doc_id and doc_id not in known_doc_ids:
+                deleted_removed += 1
+                continue
+            filtered.append(r)
+
+    # Per-document cap
+    per_doc_counts: dict[str, int] = {}
+    capped: list[dict] = []
+    per_doc_capped = 0
+    for r in filtered:
+        doc_id = r.get("document_id", "")
+        seen = per_doc_counts.get(doc_id, 0)
+        if seen >= per_doc_limit:
+            per_doc_capped += 1
+            continue
+        per_doc_counts[doc_id] = seen + 1
+        capped.append(r)
+        if len(capped) >= total_limit:
+            break
+
+    return capped, deleted_removed, per_doc_capped
 
 
 def _extract_inline_result(result: JsonDict) -> Any:
@@ -567,13 +611,16 @@ def register_search_tools(server: FastMCP) -> None:
         limit = min(max(limit, 1), 100)
         doc_filter = doc_filter.strip() if doc_filter else None
 
-        # Build doc title lookup from workspace for enriching lexical results
+        # Build doc title lookup + known doc IDs from workspace
         doc_titles: dict[str, str] = {}
+        known_doc_ids: set[str] | None = None
         if hp_client is not None:
             try:
                 await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
                 snapshot = hp_client.get_workspace_snapshot(graph_id, user_id=auth.user_id)
-                for did, ddata in snapshot.get("documents", {}).items():
+                docs = snapshot.get("documents", {})
+                known_doc_ids = set(docs.keys())
+                for did, ddata in docs.items():
                     doc_titles[did] = ddata.get("title") or "Untitled"
             except Exception as e:
                 logger.warning("search_blocks_workspace_lookup_failed", error=str(e))
@@ -649,7 +696,21 @@ def register_search_tools(server: FastMCP) -> None:
             key=lambda x: source_order.get(x.get("match_source", "semantic"), 3),
         )
 
-        final_results = sorted_results[:limit]
+        # Post-filter: exclude deleted docs + per-document cap
+        final_results, post_filter_removed, per_doc_capped = _post_filter_results(
+            sorted_results,
+            known_doc_ids=known_doc_ids,
+            per_doc_limit=MAX_RESULTS_PER_DOCUMENT,
+            total_limit=limit,
+        )
+
+        if post_filter_removed > 0:
+            logger.info(
+                "search_blocks_deleted_docs_filtered",
+                removed=post_filter_removed,
+                query=query[:50],
+            )
+
         lexical_count = sum(1 for r in final_results if r.get("match_source") in ("lexical", "both"))
         semantic_count = sum(1 for r in final_results if r.get("match_source") in ("semantic", "both"))
 
@@ -661,6 +722,8 @@ def register_search_tools(server: FastMCP) -> None:
             "count": len(final_results),
             "lexical_count": lexical_count,
             "semantic_count": semantic_count,
+            "post_filter_removed": post_filter_removed,
+            "per_doc_capped": per_doc_capped,
         })
 
     # ==================================================================
