@@ -1447,13 +1447,14 @@ def register_geist_tools(server: FastMCP) -> None:
         values_clause = " ".join(f"(<{val_uri}>)" for val_uri in unique_val_uris)
         read_query = f"""
 PREFIX doc: <http://mnemosyne.dev/doc#>
-SELECT ?valUri ?rawImp ?impCount ?rawVal ?valCount
+SELECT ?valUri ?rawImp ?impCount ?rawVal ?valCount ?lastVal
 WHERE {{
   VALUES (?valUri) {{ {values_clause} }}
   OPTIONAL {{ ?valUri doc:rawImportanceSum ?rawImp }}
   OPTIONAL {{ ?valUri doc:importanceCount ?impCount }}
   OPTIONAL {{ ?valUri doc:rawValenceSum ?rawVal }}
   OPTIONAL {{ ?valUri doc:valenceCount ?valCount }}
+  OPTIONAL {{ ?valUri doc:lastValuatedAt ?lastVal }}
 }}
 """
         rows = await _sparql_query(backend_config, job_stream, auth, graph_id, read_query)
@@ -1490,6 +1491,8 @@ WHERE {{
                     "imp_count": _safe_int(current.get("impCount", 0)),
                     "raw_val": _safe_float(current.get("rawVal", 0)),
                     "val_count": _safe_int(current.get("valCount", 0)),
+                    "update_timestamp": False,
+                    "existing_last_val": current.get("lastVal", ""),
                 }
                 uri_meta[val_uri] = {
                     "doc_id": entry["doc_id"],
@@ -1509,11 +1512,20 @@ WHERE {{
             imp = entry["imp"]
             val = entry["val"]
             if imp is not None:
-                raw_imp += float(imp)
+                imp_val = float(imp)
+                if imp_val == 0 and raw_imp > 0:
+                    # Active forgetting: decay raw_imp by 0.2× instead of adding 0.
+                    # Don't update timestamp — touching to forget shouldn't boost freshness.
+                    raw_imp *= 0.2
+                else:
+                    raw_imp += imp_val
+                    if imp_val > 0:
+                        state["update_timestamp"] = True
                 imp_count += 1
             if val is not None:
                 raw_val += float(val)
                 val_count += 1
+                state["update_timestamp"] = True
 
             new_cum_imp = math.log2(1 + raw_imp) if raw_imp > 0 else 0.0
             if raw_val != 0:
@@ -1564,6 +1576,8 @@ WHERE {{
                 "new_val_count": val_count,
                 "new_cum_val": round(cum_val, 4),
                 "now": now,
+                "update_timestamp": state["update_timestamp"],
+                "existing_last_val": state.get("existing_last_val", ""),
             })
 
         # 4. Single SPARQL DELETE for all valuation URIs
@@ -1587,6 +1601,13 @@ WHERE {{
         # 5. Single SPARQL INSERT for all new triples
         insert_triples = []
         for c in computed:
+            if c["update_timestamp"]:
+                timestamp_triple = f"""  <{c['val_uri']}> doc:lastValuatedAt "{c['now']}"^^xsd:dateTime ."""
+            elif c["existing_last_val"]:
+                # Active forgetting: preserve existing timestamp instead of refreshing
+                timestamp_triple = f"""  <{c['val_uri']}> doc:lastValuatedAt "{c['existing_last_val']}"^^xsd:dateTime ."""
+            else:
+                timestamp_triple = ""
             insert_triples.append(f"""  <{c['val_uri']}> doc:blockRef <{c['block_uri']}> .
   <{c['val_uri']}> doc:rawImportanceSum "{c['new_raw_imp']}"^^xsd:float .
   <{c['val_uri']}> doc:importanceCount "{c['new_imp_count']}"^^xsd:integer .
@@ -1594,7 +1615,7 @@ WHERE {{
   <{c['val_uri']}> doc:rawValenceSum "{c['new_raw_val']}"^^xsd:float .
   <{c['val_uri']}> doc:valenceCount "{c['new_val_count']}"^^xsd:integer .
   <{c['val_uri']}> doc:cumulativeValence "{c['new_cum_val']}"^^xsd:float .
-  <{c['val_uri']}> doc:lastValuatedAt "{c['now']}"^^xsd:dateTime .""")
+{timestamp_triple}""")
 
         insert_sparql = f"""
 PREFIX doc: <http://mnemosyne.dev/doc#>
