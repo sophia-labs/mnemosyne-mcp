@@ -5,6 +5,7 @@ This version uses stdin/stdout transport instead of HTTP/SSE for better
 compatibility with Claude Code's MCP client.
 """
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -31,12 +32,21 @@ logger = LoggerFactory.get_logger("mcp.standalone_server_stdio")
 
 def run_stdio_mcp_server():
     """Run the standalone MCP server with stdio transport."""
+    parser = argparse.ArgumentParser(description="Mnemosyne MCP server (stdio)")
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        help='Tool profile: "lite" for reduced read-only tool set (default: full)',
+    )
+    args = parser.parse_args()
+
     # Only log startup message if not in quiet mode
     if log_level not in ["WARNING", "ERROR", "CRITICAL"]:
         logger.info("🚀 Starting MCP server with stdio transport")
 
     # Create the MCP server (same as HTTP version)
-    mcp_server = create_standalone_mcp_server()
+    mcp_server = create_standalone_mcp_server(profile=args.profile)
 
     try:
         if log_level not in ["WARNING", "ERROR", "CRITICAL"]:

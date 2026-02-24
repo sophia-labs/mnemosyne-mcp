@@ -257,13 +257,39 @@ def verify_backend_connectivity(config: BackendConfig) -> None:
         )
 
 
-def create_standalone_mcp_server() -> FastMCP:
+# Tools available in the "lite" profile — read-only graph research for
+# small-model agents (pathfinders, Choreograph workers, local models).
+LITE_TOOLS: frozenset[str] = frozenset({
+    # Read
+    "get_workspace",
+    "read_document",
+    "read_blocks",
+    "document_digest",
+    "get_block",
+    "search_documents",
+    "search_blocks",
+    # Wires (read-only)
+    "get_wires",
+    "traverse_wires",
+    # Geist (read-only)
+    "music",
+    "get_important_blocks",
+    "recall",
+})
+
+
+def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
     """
     Create an MCP server bound to the local FastAPI backend.
 
     Tool registration is intentionally deferred until the new architecture is
     ready; for now we only set up connectivity and metadata.
+
+    Args:
+        profile: Optional profile name ("lite" for reduced tool set).
+                 Falls back to MCP_PROFILE env var if not provided.
     """
+    active_profile = profile or os.getenv("MCP_PROFILE", "")
     backend_config = resolve_backend_config()
 
     trace_separator("MCP SERVER STARTUP")
@@ -386,16 +412,34 @@ def create_standalone_mcp_server() -> FastMCP:
     register_geist_tools(mcp_server)
     register_search_tools(mcp_server)
 
+    # --- Profile filtering: keep only allowlisted tools for lite profiles ---
+    if active_profile == "lite":
+        # Access internal tool registry (sync) — list_tools() is async.
+        all_names = set(mcp_server._tool_manager._tools.keys())
+        to_remove = all_names - LITE_TOOLS
+        for name in to_remove:
+            try:
+                mcp_server.remove_tool(name)
+            except (KeyError, ToolError):
+                pass
+        logger.info(
+            "Lite profile applied",
+            extra_context={
+                "kept": len(all_names - to_remove),
+                "removed": len(to_remove),
+            },
+        )
+
     # LOCAL STOPGAP: throttle on every tool call to reduce backend pressure
     # when multiple Sophia instances hit the cluster simultaneously.
     _original_call_tool = mcp_server.call_tool
 
     async def _throttled_call_tool(*args, **kwargs):
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.1)
         return await _original_call_tool(*args, **kwargs)
 
     mcp_server.call_tool = _throttled_call_tool  # type: ignore[method-assign]
-    logger.info("Tool throttle enabled: 0.2s sleep before every tool call")
+    logger.info("Tool throttle enabled: 0.1s sleep before every tool call")
 
     # Remove excluded tools based on MCP_EXCLUDED_TOOLS env var.
     # Comma-separated list of tool names, e.g. "export_document,upload_artifact,sparql_update"
@@ -412,12 +456,13 @@ def create_standalone_mcp_server() -> FastMCP:
                     extra_context={"tool": name},
                 )
 
-    registered_tools = mcp_server.list_tools()
+    final_tool_count = len(mcp_server._tool_manager._tools)
     logger.info(
         "Standalone MCP server created",
         extra_context={
             "backend_url": backend_config.base_url,
-            "tool_count": len(registered_tools) if hasattr(registered_tools, '__len__') else "unknown",
+            "profile": active_profile or "full",
+            "tool_count": final_tool_count,
             "excluded": excluded_raw or "(none)",
         },
     )
