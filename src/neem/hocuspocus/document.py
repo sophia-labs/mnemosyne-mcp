@@ -326,8 +326,8 @@ def _map_block_attrs(tag: str, attrs: dict[str, Any]) -> dict[str, Any]:
             continue
         # Map the attribute name if there's a mapping, otherwise keep original
         mapped_key = attr_map.get(key, key)
-        # Convert indent to integer if present
-        if mapped_key == "indent" and value is not None:
+        # Convert numeric attributes from XML strings to integers
+        if mapped_key in ("indent", "level") and value is not None:
             try:
                 value = int(value)
             except (ValueError, TypeError):

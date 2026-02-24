@@ -301,8 +301,8 @@ class TestDocumentWriter:
         # Content should be updated
         info = reader.get_block_info(block_id)
         assert "New Title" in info["text_content"]
-        # Level attribute should be updated
-        assert info["attributes"].get("level") == "2"
+        # Level attribute should be updated (stored as numeric, pycrdt returns float)
+        assert info["attributes"].get("level") in (2, 2.0)
 
     def test_insert_block_after_id(self, populated_doc):
         """Test inserting a block after another."""
