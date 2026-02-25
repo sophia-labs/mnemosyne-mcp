@@ -19,6 +19,7 @@ This module provides:
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from typing import Any
 
 import pycrdt
@@ -29,6 +30,25 @@ logger = LoggerFactory.get_logger("hocuspocus.workspace")
 
 # Sentinel for "not provided" (distinct from None which means "set to null")
 _UNSET = object()
+
+
+def _entry_to_dict(value: Any) -> dict[str, Any] | None:
+    """Normalize a workspace entry into a plain dict.
+
+    Workspace values are usually ``pycrdt.Map`` but can occasionally surface as
+    dict-like values (e.g., transient decode/proxy states). Read paths should
+    tolerate both to avoid false "not found" errors.
+    """
+    if isinstance(value, pycrdt.Map):
+        return {key: value.get(key) for key in value.keys()}
+    if isinstance(value, Mapping):
+        return {str(key): val for key, val in value.items()}
+    if hasattr(value, "keys") and hasattr(value, "get"):
+        try:
+            return {str(key): value.get(key) for key in value.keys()}
+        except Exception:
+            return None
+    return None
 
 
 class WorkspaceWriter:
@@ -139,10 +159,7 @@ class WorkspaceWriter:
         Returns:
             Document data dict or None if not found.
         """
-        doc_map = self._documents.get(doc_id)
-        if isinstance(doc_map, pycrdt.Map):
-            return {key: doc_map.get(key) for key in doc_map.keys()}
-        return None
+        return _entry_to_dict(self._documents.get(doc_id))
 
     def document_exists(self, doc_id: str) -> bool:
         """Check if a document exists in workspace navigation.
@@ -206,10 +223,7 @@ class WorkspaceWriter:
         Returns:
             Folder data dict or None if not found.
         """
-        folder_map = self._folders.get(folder_id)
-        if isinstance(folder_map, pycrdt.Map):
-            return {key: folder_map.get(key) for key in folder_map.keys()}
-        return None
+        return _entry_to_dict(self._folders.get(folder_id))
 
     def folder_exists(self, folder_id: str) -> bool:
         """Check if a folder exists in workspace navigation.
@@ -732,10 +746,7 @@ class WorkspaceReader:
         Returns:
             Document data dict or None if not found.
         """
-        doc_map = self._documents.get(doc_id)
-        if isinstance(doc_map, pycrdt.Map):
-            return {key: doc_map.get(key) for key in doc_map.keys()}
-        return None
+        return _entry_to_dict(self._documents.get(doc_id))
 
     def get_children_of(self, parent_id: str | None) -> list[tuple[str, str, dict[str, Any]]]:
         """Get all entities that have this parent.
@@ -751,15 +762,15 @@ class WorkspaceReader:
         # Check folders
         for fid in self._folders.keys():
             folder = self._folders.get(fid)
-            if isinstance(folder, pycrdt.Map) and folder.get("parentId") == parent_id:
-                data = {key: folder.get(key) for key in folder.keys()}
+            data = _entry_to_dict(folder)
+            if data is not None and data.get("parentId") == parent_id:
                 children.append(("folder", fid, data))
 
         # Check documents (includes uploaded files / artifacts with readOnly=true)
         for did in self._documents.keys():
             doc = self._documents.get(did)
-            if isinstance(doc, pycrdt.Map) and doc.get("parentId") == parent_id:
-                data = {key: doc.get(key) for key in doc.keys()}
+            data = _entry_to_dict(doc)
+            if data is not None and data.get("parentId") == parent_id:
                 children.append(("document", did, data))
 
         return children
