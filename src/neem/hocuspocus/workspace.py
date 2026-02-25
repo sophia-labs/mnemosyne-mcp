@@ -732,10 +732,7 @@ class WorkspaceReader:
         Returns:
             Folder data dict or None if not found.
         """
-        folder_map = self._folders.get(folder_id)
-        if isinstance(folder_map, pycrdt.Map):
-            return {key: folder_map.get(key) for key in folder_map.keys()}
-        return None
+        return _entry_to_dict(self._folders.get(folder_id))
 
     def get_document(self, doc_id: str) -> dict[str, Any] | None:
         """Get a document entry from workspace navigation.
