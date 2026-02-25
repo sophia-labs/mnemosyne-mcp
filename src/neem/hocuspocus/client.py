@@ -102,6 +102,22 @@ class HocuspocusClient:
             1.0,
             float(os.getenv("MNEMOSYNE_HOCUSPOCUS_SYNC_TIMEOUT", str(sync_timeout))),
         )
+        workspace_max_age_env = os.getenv("MNEMOSYNE_HOCUSPOCUS_WORKSPACE_MAX_AGE", "2.0")
+        try:
+            workspace_max_age = float(workspace_max_age_env)
+        except ValueError:
+            logger.warning(
+                "Invalid MNEMOSYNE_HOCUSPOCUS_WORKSPACE_MAX_AGE, using default",
+                extra_context={
+                    "value": workspace_max_age_env,
+                    "default": 2.0,
+                },
+            )
+            workspace_max_age = 2.0
+        self._workspace_max_age = max(
+            0.0,
+            workspace_max_age,
+        )
         self._connect_retries = max(
             0,
             int(os.getenv("MNEMOSYNE_HOCUSPOCUS_CONNECT_RETRIES", str(connect_retries))),
@@ -402,6 +418,7 @@ class HocuspocusClient:
                 },
             )
             channel.doc.apply_update(data)
+            channel.synced_at = time.monotonic()
             return
 
         logger.info(
@@ -437,6 +454,7 @@ class HocuspocusClient:
 
                 channel.doc.apply_update(message.payload)
                 channel.synced.set()
+                channel.synced_at = time.monotonic()
 
                 # Log content AFTER applying
                 content_after = str(content_fragment) if content_fragment else "(no content)"
@@ -456,6 +474,7 @@ class HocuspocusClient:
                 content_before = str(content_fragment) if content_fragment else "(no content)"
 
                 channel.doc.apply_update(message.payload)
+                channel.synced_at = time.monotonic()
 
                 content_after = str(content_fragment) if content_fragment else "(no content)"
                 logger.info(
@@ -617,15 +636,48 @@ class HocuspocusClient:
     # Workspace Channel (per-graph filesystem)
     # -------------------------------------------------------------------------
 
-    async def connect_workspace(self, graph_id: str, user_id: Optional[str] = None) -> None:
+    async def connect_workspace(
+        self,
+        graph_id: str,
+        user_id: Optional[str] = None,
+        *,
+        force_fresh: bool = False,
+        max_age: Optional[float] = None,
+    ) -> None:
         """Connect to a workspace channel for the given graph.
 
         Args:
             graph_id: The graph ID
             user_id: The user ID for auth (uses _dev_user_id if not provided)
+            force_fresh: If True, always disconnect and reconnect.
+            max_age: Max seconds since last sync before reconnecting.
+                If not provided, uses MNEMOSYNE_HOCUSPOCUS_WORKSPACE_MAX_AGE
+                (default 2s). Set to 0 to disable age-based reconnect.
         """
         effective_user_id = user_id or self._dev_user_id
         channel_key = f"{effective_user_id}:{graph_id}"
+        effective_max_age = self._workspace_max_age if max_age is None else max_age
+
+        if force_fresh and channel_key in self._workspace_channels:
+            await self.disconnect_workspace(graph_id, user_id=effective_user_id)
+        elif (
+            effective_max_age is not None
+            and effective_max_age > 0
+            and channel_key in self._workspace_channels
+        ):
+            channel = self._workspace_channels[channel_key]
+            if channel.synced_at > 0:
+                age = time.monotonic() - channel.synced_at
+                if age > effective_max_age:
+                    logger.debug(
+                        "Workspace channel stale; reconnecting",
+                        extra_context={
+                            "graph_id": graph_id,
+                            "age_seconds": round(age, 3),
+                            "max_age_seconds": effective_max_age,
+                        },
+                    )
+                    await self.disconnect_workspace(graph_id, user_id=effective_user_id)
 
         # Fast path: already connected and synced (no lock needed)
         if channel_key in self._workspace_channels:
