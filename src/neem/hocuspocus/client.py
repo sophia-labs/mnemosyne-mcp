@@ -102,7 +102,7 @@ class HocuspocusClient:
             1.0,
             float(os.getenv("MNEMOSYNE_HOCUSPOCUS_SYNC_TIMEOUT", str(sync_timeout))),
         )
-        workspace_max_age_env = os.getenv("MNEMOSYNE_HOCUSPOCUS_WORKSPACE_MAX_AGE", "2.0")
+        workspace_max_age_env = os.getenv("MNEMOSYNE_HOCUSPOCUS_WORKSPACE_MAX_AGE", "5.0")
         try:
             workspace_max_age = float(workspace_max_age_env)
         except ValueError:
@@ -110,10 +110,10 @@ class HocuspocusClient:
                 "Invalid MNEMOSYNE_HOCUSPOCUS_WORKSPACE_MAX_AGE, using default",
                 extra_context={
                     "value": workspace_max_age_env,
-                    "default": 2.0,
+                    "default": 5.0,
                 },
             )
-            workspace_max_age = 2.0
+            workspace_max_age = 5.0
         self._workspace_max_age = max(
             0.0,
             workspace_max_age,
@@ -652,7 +652,7 @@ class HocuspocusClient:
             force_fresh: If True, always disconnect and reconnect.
             max_age: Max seconds since last sync before reconnecting.
                 If not provided, uses MNEMOSYNE_HOCUSPOCUS_WORKSPACE_MAX_AGE
-                (default 2s). Set to 0 to disable age-based reconnect.
+                (default 5s). Set to 0 to disable age-based reconnect.
         """
         effective_user_id = user_id or self._dev_user_id
         channel_key = f"{effective_user_id}:{graph_id}"
