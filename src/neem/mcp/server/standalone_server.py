@@ -266,6 +266,7 @@ LITE_TOOLS: frozenset[str] = frozenset({
     "read_blocks",
     "document_digest",
     "get_block",
+    "query_blocks",
     "search_documents",
     "search_blocks",
     # Wires (read-only)
@@ -367,6 +368,8 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
             "**Search:**\n"
             "- search_documents: Fast title/path search against workspace (no SPARQL needed). Modes: auto (default), exact, substring, regex\n"
             "- search_blocks: Cross-document content search. Modes: hybrid (default, lexical+semantic in parallel), lexical, semantic\n"
+            "- query_blocks: Single-document structural filter (block_type, heading_level, indent, list_type, checked, text_contains). "
+            "CRDT-native, instant, no backend round-trip. Use for structural navigation within one document; use search_blocks for cross-document discovery\n"
             "- reindex_graph: Re-embed all documents (admin/maintenance, auto-indexes on save)\n"
             "- recall with query param uses hybrid search: memory queue + vector similarity merged via RRF\n\n"
             "When making function calls using tools that accept array or object parameters "

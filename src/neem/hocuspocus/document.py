@@ -623,6 +623,7 @@ class DocumentReader:
     def query_blocks(
         self,
         block_type: str | None = None,
+        heading_level: int | None = None,
         indent: int | None = None,
         indent_gte: int | None = None,
         indent_lte: int | None = None,
@@ -635,6 +636,7 @@ class DocumentReader:
 
         Args:
             block_type: Filter by block type (paragraph, heading, listItem, etc.)
+            heading_level: Filter headings by level (1, 2, or 3). Implies block_type="heading".
             indent: Filter by exact indent level
             indent_gte: Filter by indent >= value
             indent_lte: Filter by indent <= value
@@ -663,8 +665,21 @@ class DocumentReader:
             tag = child.tag if hasattr(child, "tag") else "unknown"
 
             # Filter by type
+            if heading_level is not None and tag != "heading":
+                continue
             if block_type and tag != block_type:
                 continue
+
+            # Filter by heading level
+            if heading_level is not None:
+                elem_level = attrs.get("level", 1)
+                if isinstance(elem_level, (str, float)):
+                    try:
+                        elem_level = int(elem_level)
+                    except (ValueError, TypeError):
+                        elem_level = 1
+                if elem_level != heading_level:
+                    continue
 
             # Filter by indent
             elem_indent = attrs.get("indent", 0)

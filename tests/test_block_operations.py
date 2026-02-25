@@ -198,6 +198,41 @@ class TestDocumentReader:
         limited = reader.query_blocks(block_type="paragraph", limit=2)
         assert len(limited) == 2
 
+    def test_query_blocks_by_heading_level(self):
+        """Test querying blocks by heading level."""
+        doc = pycrdt.Doc()
+        writer = DocumentWriter(doc)
+        writer.replace_all_content("""
+<heading level="1">Title</heading>
+<heading level="2">Section A</heading>
+<paragraph>Body text.</paragraph>
+<heading level="2">Section B</heading>
+<heading level="3">Subsection</heading>
+        """.strip())
+
+        reader = DocumentReader(doc)
+
+        # All headings
+        all_headings = reader.query_blocks(block_type="heading")
+        assert len(all_headings) == 4
+
+        # Only h1
+        h1s = reader.query_blocks(heading_level=1)
+        assert len(h1s) == 1
+        assert "Title" in h1s[0]["text_preview"]
+
+        # Only h2
+        h2s = reader.query_blocks(heading_level=2)
+        assert len(h2s) == 2
+
+        # Only h3
+        h3s = reader.query_blocks(heading_level=3)
+        assert len(h3s) == 1
+        assert "Subsection" in h3s[0]["text_preview"]
+
+        # heading_level implies block_type="heading" — paragraphs excluded
+        assert all(b["type"] == "heading" for b in h2s)
+
 
 class TestDocumentWriter:
     """Tests for DocumentWriter block operations."""

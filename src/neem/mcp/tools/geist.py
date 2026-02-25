@@ -1,10 +1,10 @@
 """
 MCP tools for Project Geist — Sophia's persistent memory, valuation, and self-narrative.
 
-Provides 13 tools organized in four groups:
+Provides 11 tools organized in four groups:
 - Memory Queue: remember, recall, care, archive_memories
 - Valuation: valuate, get_block_values, get_values, revaluate
-- Song: music, sing, counterpoint, coda
+- Song: music, sing (verse/counterpoint/coda modes)
 - Orientation: quick_orient
 
 All state lives in the graph as standard Sophia documents. The "_sophia" folder
@@ -23,6 +23,9 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import httpx
+import xml.etree.ElementTree as ET
 
 import pycrdt
 from mcp.server.fastmcp import Context, FastMCP
@@ -792,6 +795,66 @@ def register_geist_tools(server: FastMCP) -> None:
 
     job_stream: Optional[RealtimeJobClient] = getattr(server, "_job_stream", None)
 
+    async def _await_song_durable(
+        graph_id: str,
+        document_id: str,
+        auth: MCPAuthContext,
+    ) -> None:
+        """Force server-side persistence of a Song/archive write.
+
+        Calls the backend flush endpoint while the WebSocket channel is
+        still connected.  We must NOT disconnect first — Song and archive
+        documents typically have no other connected clients (no browser
+        WebSocket), so disconnecting the only client may cause the server
+        to unload the in-memory Y.Doc before the update is persisted to S3.
+        """
+        # Brief yield so the event loop processes WebSocket send callbacks
+        # and the server has time to apply the incoming CRDT update.
+        await asyncio.sleep(0.05)
+
+        url = f"{backend_config.base_url}/documents/{graph_id}/{document_id}/flush"
+        headers = auth.http_headers()
+        for attempt in range(1, 4):
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+                    resp = await client.post(
+                        url,
+                        params={"include_materialization": "false"},
+                        headers=headers,
+                    )
+                if resp.status_code == 200:
+                    payload = resp.json() if resp.content else {}
+                    if payload.get("activeSession"):
+                        logger.info(
+                            "song_flush_confirmed",
+                            extra_context={
+                                "graph_id": graph_id,
+                                "document_id": document_id,
+                            },
+                        )
+                        return
+                logger.warning(
+                    "song_flush_unconfirmed",
+                    extra_context={
+                        "graph_id": graph_id,
+                        "document_id": document_id,
+                        "status": getattr(resp, "status_code", None),
+                        "attempt": attempt,
+                    },
+                )
+            except Exception as exc:
+                logger.warning(
+                    "song_flush_request_failed",
+                    extra_context={
+                        "graph_id": graph_id,
+                        "document_id": document_id,
+                        "error": str(exc),
+                        "attempt": attempt,
+                    },
+                )
+            if attempt < 3:
+                await asyncio.sleep(0.15 * attempt)
+
     # ================================================================
     # MEMORY QUEUE TOOLS
     # ================================================================
@@ -1092,28 +1155,43 @@ def register_geist_tools(server: FastMCP) -> None:
 
     @server.tool(
         name="sing",
-        title="Sing a New Verse",
+        title="Write to the Song",
         description=(
-            "Write a new verse to the Song. The oldest verse is ejected to past/songs archive. "
-            "Max 14 lines per verse. Use / at end of a line for stanza breaks.\n\n"
-            "Sing at phase transitions: discovering a structural insight, finding a cross-domain "
-            "connection, at session boundaries, when the nature of the work shifts. "
-            "The Song marks transitions, not just accumulations.\n\n"
+            "Write to Sophia's evolving self-narrative poem for this graph. "
+            "Max 14 lines. Use / at end of a line for stanza breaks.\n\n"
+            "Three modes (set via 'mode' parameter):\n"
+            "- 'verse' (default): Write a new verse. The oldest verse is ejected to "
+            "past/songs archive. Sing at phase transitions: structural insight, "
+            "cross-domain connection, session boundary, when the nature of the work shifts.\n"
+            "- 'counterpoint': Add a voice to an existing verse (verse_index required: "
+            "0, -1, or -2). Up to 3 total voices per verse. Counterpoint is additive — "
+            "the later voice interleaves line-by-line. Rendered as plain/italic/bold italic.\n"
+            "- 'coda': Write a concluding passage that persists through verse ejections "
+            "(survives 8 ejection events). Replaces any existing coda.\n\n"
             "Always call music() first to read the current Song before composing."
         ),
     )
     async def sing_tool(
         graph_id: str,
         verse: str,
+        mode: str = "verse",
+        verse_index: Optional[int] = None,
         context: Context | None = None,
     ) -> str:
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
         graph_id = graph_id.strip()
+        mode = mode.strip().lower()
+        if mode not in ("verse", "counterpoint", "coda"):
+            raise ValueError(f"mode must be 'verse', 'counterpoint', or 'coda' (got '{mode}')")
+        if mode == "counterpoint" and verse_index is None:
+            raise ValueError("verse_index is required for counterpoint mode (0, -1, or -2)")
+
         await _ensure_scratchpad(hp_client, graph_id, auth)
 
         ejected_count = 0
+        result: dict[str, Any] = {}
 
         # File lock serializes Song read-modify-write across MCP server processes
         async with _geist_file_lock(graph_id):
@@ -1128,54 +1206,112 @@ def register_geist_tools(server: FastMCP) -> None:
             if not meta:
                 meta = _migrate_song_to_meta(xml)
 
-            # 3. Prepend new verse (Verse 0 = newest)
-            new_verse = {"text": verse, "counterpoints": []}
-            meta_verses = meta.get("verses", [])
-            meta_verses = [new_verse] + meta_verses
+            if mode == "verse":
+                # Prepend new verse (Verse 0 = newest)
+                new_verse = {"text": verse, "counterpoints": []}
+                meta_verses = meta.get("verses", [])
+                meta_verses = [new_verse] + meta_verses
 
-            # 4. If more than 3 verses, archive the excess (oldest = last in list)
-            if len(meta_verses) > 3:
-                to_archive = meta_verses[3:]
-                meta_verses = meta_verses[:3]
-                ejected_count = len(to_archive)
+                # If more than 3 verses, archive the excess (oldest = last in list)
+                if len(meta_verses) > 3:
+                    to_archive = meta_verses[3:]
+                    meta_verses = meta_verses[:3]
+                    ejected_count = len(to_archive)
 
-                now_label = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                archive_parts = []
-                for ejected in to_archive:
-                    ejected_xml = _interleave_verse_xml(
-                        ejected.get("text", ""),
-                        ejected.get("counterpoints", []),
+                    now_label = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+                    # Append to archive block-by-block (not replace_all_content —
+                    # the archive grows large and full replacement creates a
+                    # massive CRDT diff that gets dropped)
+                    await hp_client.connect_document(graph_id, PAST_SONGS_DOC_ID, user_id=auth.user_id)
+
+                    archive_blocks: list[str] = []
+                    for ejected in to_archive:
+                        archive_blocks.append(
+                            f'<heading level="3">Archived {html_mod.escape(now_label)}</heading>'
+                        )
+                        ejected_xml = _interleave_verse_xml(
+                            ejected.get("text", ""),
+                            ejected.get("counterpoints", []),
+                        )
+                        # Parse multi-block XML into individual elements
+                        root = ET.fromstring(f"<root>{ejected_xml}</root>")
+                        for child in root:
+                            archive_blocks.append(ET.tostring(child, encoding="unicode"))
+                        archive_blocks.append("<horizontalRule/>")
+
+                    def _append_archive(doc: pycrdt.Doc, blocks: list[str] = archive_blocks) -> None:
+                        writer = DocumentWriter(doc)
+                        for block_xml in blocks:
+                            writer.append_block(block_xml)
+
+                    await hp_client.transact_document(
+                        graph_id,
+                        PAST_SONGS_DOC_ID,
+                        _append_archive,
+                        user_id=auth.user_id,
                     )
-                    archive_parts.append(
-                        f'<heading level="3">Archived {html_mod.escape(now_label)}</heading>'
-                        f"{ejected_xml}"
-                        "<horizontalRule/>"
+                    # Durability check for archive write
+                    await _await_song_durable(graph_id, PAST_SONGS_DOC_ID, auth)
+
+                    # Decrement coda ejections
+                    coda = meta.get("coda")
+                    if coda:
+                        coda["ejections_remaining"] -= ejected_count
+                        if coda["ejections_remaining"] <= 0:
+                            meta["coda"] = None
+
+                meta["verses"] = meta_verses
+                result["verse_count"] = len(meta_verses)
+                if ejected_count:
+                    result["ejected"] = ejected_count
+
+            elif mode == "counterpoint":
+                meta_verses = meta.get("verses", [])
+
+                # Convert verse_index label (0, -1, -2) to list index (0, 1, 2)
+                if verse_index == 0:
+                    idx = 0
+                elif verse_index < 0:
+                    idx = abs(verse_index)
+                else:
+                    raise ValueError(
+                        f"verse_index must be 0, -1, or -2 (got {verse_index})"
                     )
 
-                await hp_client.connect_document(graph_id, PAST_SONGS_DOC_ID, user_id=auth.user_id)
-                archive_channel = hp_client.get_document_channel(
-                    graph_id, PAST_SONGS_DOC_ID, user_id=auth.user_id
-                )
-                existing_archive = DocumentReader(archive_channel.doc).to_xml()
-                new_archive = existing_archive + "".join(archive_parts)
+                if idx >= len(meta_verses):
+                    raise ValueError(
+                        f"Verse {verse_index} does not exist "
+                        f"(Song has {len(meta_verses)} verses)"
+                    )
 
-                await hp_client.transact_document(
-                    graph_id,
-                    PAST_SONGS_DOC_ID,
-                    lambda doc, na=new_archive: DocumentWriter(doc).replace_all_content(na),
-                    user_id=auth.user_id,
-                )
+                verse_data = meta_verses[idx]
+                total_voices = 1 + len(verse_data.get("counterpoints", []))
+                if total_voices >= MAX_SONG_VOICES:
+                    raise ValueError(
+                        f"Verse {verse_index} already has {total_voices} parts "
+                        f"(max {MAX_SONG_VOICES}). Cannot add another counterpoint."
+                    )
 
-                # Decrement coda ejections
-                coda = meta.get("coda")
-                if coda:
-                    coda["ejections_remaining"] -= ejected_count
-                    if coda["ejections_remaining"] <= 0:
-                        meta["coda"] = None
+                if "counterpoints" not in verse_data:
+                    verse_data["counterpoints"] = []
+                verse_data["counterpoints"].append(verse)
+                meta["verses"] = meta_verses
 
-            meta["verses"] = meta_verses
+                new_total = 1 + len(verse_data["counterpoints"])
+                result["verse_index"] = verse_index
+                result["voice_number"] = new_total
+                result["total_voices"] = new_total
 
-            # 5. Render and write
+            elif mode == "coda":
+                meta["coda"] = {
+                    "text": verse,
+                    "ejections_remaining": CODA_EJECTION_LIFETIME,
+                }
+                result["coda_set"] = True
+                result["ejections_remaining"] = CODA_EJECTION_LIFETIME
+
+            # Render and write Song
             new_song = _render_song_from_meta(meta)
             await hp_client.transact_document(
                 graph_id,
@@ -1184,156 +1320,14 @@ def register_geist_tools(server: FastMCP) -> None:
                 user_id=auth.user_id,
             )
 
-        result: dict[str, Any] = {"verse_count": len(meta_verses)}
-        if ejected_count:
-            result["ejected"] = ejected_count
+        # Durability check for Song write (outside file lock to avoid holding it)
+        await _await_song_durable(graph_id, SONG_DOC_ID, auth)
+
         coda = meta.get("coda")
-        if coda:
+        if coda and "coda_set" not in result:
             result["coda_ejections_remaining"] = coda["ejections_remaining"]
+        result["mode"] = mode
         return _render_json(result)
-
-    @server.tool(
-        name="counterpoint",
-        title="Add Counterpoint to a Verse",
-        description=(
-            "Add a counterpoint voice to an existing verse of the Song. Up to 3 total "
-            "voices per verse (the original + 2 counterpoints). Each counterpoint interleaves "
-            "with the original verse line-by-line, creating a polyphonic texture.\n\n"
-            "verse_index: which verse to counterpoint (0, -1, or -2).\n"
-            "verse: the counterpoint text (same format as sing — lines separated by newlines, "
-            "/ at end of line for stanza breaks).\n\n"
-            "Counterpoint is always additive — the later voice adds as it pleases. "
-            "Returns an error if the verse already has 3 voices.\n\n"
-            "In the rendered Song, the original voice appears as plain text, the first "
-            "counterpoint as italic, and the second as bold italic."
-        ),
-    )
-    async def counterpoint_tool(
-        graph_id: str,
-        verse_index: int,
-        verse: str,
-        context: Context | None = None,
-    ) -> str:
-        auth = MCPAuthContext.from_context(context)
-        auth.require_auth()
-
-        graph_id = graph_id.strip()
-        await _ensure_scratchpad(hp_client, graph_id, auth)
-
-        async with _geist_file_lock(graph_id):
-            await hp_client.connect_document(graph_id, SONG_DOC_ID, user_id=auth.user_id)
-            channel = hp_client.get_document_channel(graph_id, SONG_DOC_ID, user_id=auth.user_id)
-            reader = DocumentReader(channel.doc)
-            xml = reader.to_xml()
-
-            # Read or migrate metadata
-            meta, _ = _read_song_meta(reader)
-            if not meta:
-                meta = _migrate_song_to_meta(xml)
-
-            meta_verses = meta.get("verses", [])
-
-            # Convert verse_index label (0, -1, -2) to list index (0, 1, 2)
-            if verse_index == 0:
-                idx = 0
-            elif verse_index < 0:
-                idx = abs(verse_index)
-            else:
-                raise ValueError(
-                    f"verse_index must be 0, -1, or -2 (got {verse_index})"
-                )
-
-            if idx >= len(meta_verses):
-                raise ValueError(
-                    f"Verse {verse_index} does not exist "
-                    f"(Song has {len(meta_verses)} verses)"
-                )
-
-            verse_data = meta_verses[idx]
-            total_voices = 1 + len(verse_data.get("counterpoints", []))
-            if total_voices >= MAX_SONG_VOICES:
-                raise ValueError(
-                    f"Verse {verse_index} already has {total_voices} parts "
-                    f"(max {MAX_SONG_VOICES}). Cannot add another counterpoint."
-                )
-
-            # Add the counterpoint
-            if "counterpoints" not in verse_data:
-                verse_data["counterpoints"] = []
-            verse_data["counterpoints"].append(verse)
-            meta["verses"] = meta_verses
-
-            # Render and write
-            new_song = _render_song_from_meta(meta)
-            await hp_client.transact_document(
-                graph_id,
-                SONG_DOC_ID,
-                lambda doc, ns=new_song: DocumentWriter(doc).replace_all_content(ns),
-                user_id=auth.user_id,
-            )
-
-        new_total = 1 + len(verse_data["counterpoints"])
-        return _render_json({
-            "verse_index": verse_index,
-            "voice_number": new_total,
-            "total_voices": new_total,
-        })
-
-    @server.tool(
-        name="coda",
-        title="Write a Coda",
-        description=(
-            "Write a coda to the Song. The coda is a concluding passage that persists "
-            "through verse ejections — it lasts for 8 ejection events before expiring. "
-            "Can be replaced with a new coda at any time.\n\n"
-            "The coda appears after the final verse in italic and represents a theme "
-            "or resolution that outlasts individual verses. When you sing a new verse "
-            "and the oldest verse is ejected, the coda's remaining count decrements. "
-            "When it reaches 0, the coda is removed.\n\n"
-            "Use / at end of a line for stanza breaks, same as sing."
-        ),
-    )
-    async def coda_tool(
-        graph_id: str,
-        text: str,
-        context: Context | None = None,
-    ) -> str:
-        auth = MCPAuthContext.from_context(context)
-        auth.require_auth()
-
-        graph_id = graph_id.strip()
-        await _ensure_scratchpad(hp_client, graph_id, auth)
-
-        async with _geist_file_lock(graph_id):
-            await hp_client.connect_document(graph_id, SONG_DOC_ID, user_id=auth.user_id)
-            channel = hp_client.get_document_channel(graph_id, SONG_DOC_ID, user_id=auth.user_id)
-            reader = DocumentReader(channel.doc)
-            xml = reader.to_xml()
-
-            # Read or migrate metadata
-            meta, _ = _read_song_meta(reader)
-            if not meta:
-                meta = _migrate_song_to_meta(xml)
-
-            # Set/replace coda
-            meta["coda"] = {
-                "text": text,
-                "ejections_remaining": CODA_EJECTION_LIFETIME,
-            }
-
-            # Render and write
-            new_song = _render_song_from_meta(meta)
-            await hp_client.transact_document(
-                graph_id,
-                SONG_DOC_ID,
-                lambda doc, ns=new_song: DocumentWriter(doc).replace_all_content(ns),
-                user_id=auth.user_id,
-            )
-
-        return _render_json({
-            "coda_set": True,
-            "ejections_remaining": CODA_EJECTION_LIFETIME,
-        })
 
     # ================================================================
     # VALUATION TOOLS
@@ -1709,7 +1703,7 @@ WHERE {{
   OPTIONAL {{ ?val doc:lastValuatedAt ?lastVal }}
   {filter_clause}
 }}
-ORDER BY DESC(xsd:float(?cumImp))
+ORDER BY DESC(xsd:float(?cumImp) + ABS(xsd:float(?cumVal)))
 LIMIT {min(limit * 3, 200)}
 """
         # Run SPARQL query, weights load, and wire index build concurrently
@@ -1913,7 +1907,7 @@ WHERE {{
   OPTIONAL {{ ?val doc:lastValuatedAt ?lastVal }}
   {filter_clause}
 }}
-ORDER BY DESC(xsd:float(?cumImp))
+ORDER BY DESC(xsd:float(?cumImp) + ABS(xsd:float(?cumVal)))
 LIMIT {min(limit * 3, 60)}
 """
         # Run SPARQL query, weights load, and wire index build concurrently
