@@ -12,6 +12,7 @@ import html as html_mod
 import json
 import math
 import mimetypes
+import os
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import httpx
+import pycrdt
 from mcp.server.fastmcp import Context, FastMCP
 
 from neem.hocuspocus import HocuspocusClient, DocumentReader, DocumentWriter, WorkspaceWriter, WorkspaceReader
@@ -112,6 +114,200 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
                     "ensure your token contains a 'sub' claim."
                 )
         return user_id
+
+    # ------------------------------------------------------------------
+    # Direct read path (Platform HTTP blob endpoint -> WebSocket fallback)
+    # ------------------------------------------------------------------
+    raw_read_path_mode = (os.getenv("MNEMOSYNE_READ_PATH", "websocket").strip().lower() or "websocket")
+    mode_aliases = {
+        "redis": "http_blob",  # deprecated alias
+        "blob": "http_blob",
+    }
+    read_path_mode = mode_aliases.get(raw_read_path_mode, raw_read_path_mode)
+    if read_path_mode not in {"websocket", "http_blob", "hybrid"}:
+        logger.warning(
+            "Invalid MNEMOSYNE_READ_PATH value; falling back to websocket",
+            extra_context={"mode": raw_read_path_mode},
+        )
+        read_path_mode = "websocket"
+    elif raw_read_path_mode in mode_aliases:
+        logger.warning(
+            "Deprecated MNEMOSYNE_READ_PATH alias in use",
+            extra_context={"provided": raw_read_path_mode, "resolved": read_path_mode},
+        )
+
+    read_path_counters: Dict[str, int] = getattr(server, "_read_path_counters", None) or {}
+    server._read_path_counters = read_path_counters  # type: ignore[attr-defined]
+
+    def _bump_read_counter(name: str) -> None:
+        read_path_counters[name] = read_path_counters.get(name, 0) + 1
+
+    def _parse_float_env(name: str, default: float) -> float:
+        raw = (os.getenv(name) or "").strip()
+        if not raw:
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            logger.warning(
+                "Invalid float env var; using default",
+                extra_context={"name": name, "value": raw, "default": default},
+            )
+            return default
+
+    def _ymap_to_dict(ymap: pycrdt.Map) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for key in ymap.keys():
+            value = ymap.get(key)
+            if isinstance(value, pycrdt.Map):
+                result[key] = _ymap_to_dict(value)
+            elif isinstance(value, pycrdt.Array):
+                result[key] = list(value)
+            else:
+                result[key] = value
+        return result
+
+    def _workspace_snapshot_from_doc(doc: pycrdt.Doc) -> Dict[str, Any]:
+        folders_map: pycrdt.Map = doc.get("folders", type=pycrdt.Map)
+        artifacts_map: pycrdt.Map = doc.get("artifacts", type=pycrdt.Map)
+        documents_map: pycrdt.Map = doc.get("documents", type=pycrdt.Map)
+        ui_map: pycrdt.Map = doc.get("ui", type=pycrdt.Map)
+        return {
+            "folders": _ymap_to_dict(folders_map),
+            "artifacts": _ymap_to_dict(artifacts_map),
+            "documents": _ymap_to_dict(documents_map),
+            "ui": _ymap_to_dict(ui_map),
+        }
+
+    def _decode_ydoc(raw: bytes, *, label: str) -> pycrdt.Doc:
+        try:
+            doc = pycrdt.Doc()
+            doc.apply_update(raw)
+            return doc
+        except Exception as exc:
+            _bump_read_counter("decode_fail")
+            raise RuntimeError(f"Failed to decode Y.Doc from {label}: {exc}") from exc
+
+    _blob_timeout_seconds = _parse_float_env("MNEMOSYNE_READ_BLOB_TIMEOUT_SECONDS", 8.0)
+
+    async def _http_get_blob(path: str, auth: MCPAuthContext) -> tuple[bytes | None, int, str | None]:
+        url = f"{backend_config.base_url}{path}"
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(_blob_timeout_seconds)) as client:
+                response = await client.get(url, headers=auth.http_headers())
+            if response.status_code == 200:
+                blob_source = response.headers.get("X-Blob-Source")
+                return response.content, 200, blob_source
+            if response.status_code == 410:
+                return None, 410, None
+            _bump_read_counter("blob_http_error")
+            logger.debug(
+                "http_blob_read_non_200",
+                extra_context={"url": path, "status": response.status_code},
+            )
+            return None, response.status_code, None
+        except Exception as exc:
+            logger.warning(
+                "http_blob_read_failed",
+                extra_context={"url": path, "error": str(exc)},
+            )
+            return None, 0, None
+
+    def _record_read_source(tool_name: str, source: str) -> None:
+        if source.startswith("http_blob"):
+            _bump_read_counter("blob_hit")
+            if source.endswith(":redis"):
+                _bump_read_counter("redis_hit")
+            elif source.endswith(":s3"):
+                _bump_read_counter("s3_fallback")
+        elif source == "websocket" and read_path_mode == "hybrid":
+            _bump_read_counter("ws_fallback")
+        logger.debug(
+            "direct_read_source_selected",
+            extra_context={
+                "tool": tool_name,
+                "source": source,
+                "mode": read_path_mode,
+                "counters": dict(read_path_counters),
+            },
+        )
+
+    async def _load_workspace_doc_for_read(
+        graph_id: str,
+        user_id: str,
+        *,
+        auth: MCPAuthContext,
+        tool_name: str,
+    ) -> tuple[pycrdt.Doc, str]:
+        if read_path_mode in {"http_blob", "hybrid"}:
+            raw, status_code, blob_source = await _http_get_blob(
+                f"/documents/{graph_id}/workspace/blob",
+                auth,
+            )
+            if raw:
+                doc = _decode_ydoc(raw, label=f"http blob workspace {graph_id}")
+                source = f"http_blob:{blob_source}" if blob_source else "http_blob"
+                _record_read_source(tool_name, source)
+                return doc, source
+
+            if read_path_mode == "http_blob":
+                raise RuntimeError(
+                    f"Workspace '{graph_id}' blob read failed (status={status_code}). "
+                    "Set MNEMOSYNE_READ_PATH=hybrid or websocket to allow fallback."
+                )
+
+        await hp_client.connect_workspace(graph_id, user_id=user_id)
+        channel = hp_client.get_workspace_channel(graph_id, user_id=user_id)
+        if channel is None:
+            raise RuntimeError(f"Could not connect to workspace for graph '{graph_id}'")
+        _record_read_source(tool_name, "websocket")
+        return channel.doc, "websocket"
+
+    async def _load_document_doc_for_read(
+        graph_id: str,
+        document_id: str,
+        user_id: str,
+        *,
+        auth: MCPAuthContext,
+        tool_name: str,
+    ) -> tuple[pycrdt.Doc, str]:
+        if read_path_mode in {"http_blob", "hybrid"}:
+            raw, status_code, blob_source = await _http_get_blob(
+                f"/documents/{graph_id}/{document_id}/blob",
+                auth,
+            )
+            if raw:
+                doc = _decode_ydoc(raw, label=f"http blob document {document_id}")
+                source = f"http_blob:{blob_source}" if blob_source else "http_blob"
+                _record_read_source(tool_name, source)
+                return doc, source
+
+            if status_code == 410:
+                raise RuntimeError(
+                    f"Document '{document_id}' is tombstoned in graph '{graph_id}'."
+                )
+
+            if read_path_mode == "http_blob":
+                raise RuntimeError(
+                    f"Document '{document_id}' blob read failed (status={status_code}). "
+                    "Set MNEMOSYNE_READ_PATH=hybrid or websocket to allow fallback."
+                )
+
+        await _connect_for_read(graph_id, document_id, user_id)
+        channel = hp_client.get_document_channel(graph_id, document_id, user_id=user_id)
+        if channel is None:
+            raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
+        _record_read_source(tool_name, "websocket")
+        return channel.doc, "websocket"
+
+    logger.info(
+        "direct_read_path_configured",
+        extra_context={
+            "mode": read_path_mode,
+            "backend_base_url": backend_config.base_url,
+            "blob_timeout_seconds": _blob_timeout_seconds,
+        },
+    )
 
     # ------------------------------------------------------------------
     # Helper: get document-level scores for workspace filtering
@@ -264,13 +460,51 @@ GROUP BY ?docId
     # Validation helpers
     # ------------------------------------------------------------------
     async def _validate_document_in_workspace(
-        graph_id: str, document_id: str, user_id: str,
+        graph_id: str,
+        document_id: str,
+        user_id: str,
+        auth: Optional[MCPAuthContext] = None,
     ) -> None:
         """Verify a document exists in the workspace metadata.
 
         Raises RuntimeError with a helpful message listing available
         documents when the requested document is not found.
         """
+        if read_path_mode != "websocket" and auth is not None:
+            workspace_doc, _ = await _load_workspace_doc_for_read(
+                graph_id,
+                user_id,
+                auth=auth,
+                tool_name="validate_document",
+            )
+            snapshot = _workspace_snapshot_from_doc(workspace_doc)
+            docs = snapshot.get("documents") or {}
+            if document_id in docs:
+                return
+
+            available = []
+            for doc_id, doc_info in docs.items():
+                title = doc_info.get("title", doc_id) if isinstance(doc_info, dict) else doc_id
+                available.append(f"  - {title} ({doc_id})")
+
+            msg = (
+                f"Document '{document_id}' not found in graph '{graph_id}'. "
+                "It may have been deleted — if so, use a different document ID "
+                "(deleted document IDs are tombstoned and cannot be reused)."
+            )
+            if available:
+                shown = available[:15]
+                msg += "\n\nAvailable documents:\n" + "\n".join(shown)
+                if len(available) > 15:
+                    msg += f"\n  ... and {len(available) - 15} more"
+            else:
+                msg += (
+                    " The graph workspace is empty — this may mean the graph "
+                    "doesn't exist or you're connected to the wrong backend."
+                )
+            msg += "\n\nUse get_workspace to see the full graph structure."
+            raise RuntimeError(msg)
+
         def _exists_in_snapshot() -> tuple[bool, list[str]]:
             snapshot = hp_client.get_workspace_snapshot(graph_id, user_id=user_id)
             docs = snapshot.get("documents") or {}
@@ -301,7 +535,7 @@ GROUP BY ?docId
             if reader.get_document(document_id) is not None:
                 return
 
-        exists_in_snapshot, doc_ids = _exists_in_snapshot()
+        exists_in_snapshot, _ = _exists_in_snapshot()
         if exists_in_snapshot:
             # Snapshot says it exists, but reader path is inconsistent.
             # Surface explicit transient guidance instead of tombstone wording.
@@ -666,16 +900,16 @@ Always returns fresh content — automatically reconnects if the cached channel 
 
         try:
             # Validate document exists in workspace before connecting
-            await _validate_document_in_workspace(graph_id, document_id, auth.user_id)
+            await _validate_document_in_workspace(graph_id, document_id, auth.user_id, auth=auth)
 
-            await _connect_for_read(graph_id, document_id, auth.user_id)
-
-            # Get the channel and read content
-            channel = hp_client.get_document_channel(graph_id, document_id, user_id=auth.user_id)
-            if channel is None:
-                raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
-
-            reader = DocumentReader(channel.doc)
+            document_doc, _ = await _load_document_doc_for_read(
+                graph_id,
+                document_id,
+                auth.user_id,
+                auth=auth,
+                tool_name="read_document",
+            )
+            reader = DocumentReader(document_doc)
             xml_content = reader.to_xml()
             comments = reader.get_all_comments()
 
@@ -715,30 +949,33 @@ Always returns fresh content — automatically reconnects if the cached channel 
 
             # Add wire counts — overall totals + per-block breakdown
             try:
-                await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
-                ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
-                if ws_channel and ws_channel.doc:
-                    outgoing = _get_wires_for_document(ws_channel.doc, document_id, "outgoing")
-                    incoming = _get_wires_for_document(ws_channel.doc, document_id, "incoming")
-                    total = len(outgoing) + len(incoming)
-                    if total > 0:
-                        block_counts: Dict[str, int] = {}
-                        for wire in outgoing:
-                            bid = wire.get("sourceBlockId")
-                            if bid:
-                                block_counts[bid] = block_counts.get(bid, 0) + 1
-                        for wire in incoming:
-                            bid = wire.get("targetBlockId")
-                            if bid:
-                                block_counts[bid] = block_counts.get(bid, 0) + 1
-                        wires_info: Dict[str, Any] = {
-                            "outgoing": len(outgoing),
-                            "incoming": len(incoming),
-                            "total": total,
-                        }
-                        if block_counts:
-                            wires_info["by_block"] = block_counts
-                        result["wires"] = wires_info
+                workspace_doc, _ = await _load_workspace_doc_for_read(
+                    graph_id,
+                    auth.user_id,
+                    auth=auth,
+                    tool_name="read_document",
+                )
+                outgoing = _get_wires_for_document(workspace_doc, document_id, "outgoing")
+                incoming = _get_wires_for_document(workspace_doc, document_id, "incoming")
+                total = len(outgoing) + len(incoming)
+                if total > 0:
+                    block_counts: Dict[str, int] = {}
+                    for wire in outgoing:
+                        bid = wire.get("sourceBlockId")
+                        if bid:
+                            block_counts[bid] = block_counts.get(bid, 0) + 1
+                    for wire in incoming:
+                        bid = wire.get("targetBlockId")
+                        if bid:
+                            block_counts[bid] = block_counts.get(bid, 0) + 1
+                    wires_info: Dict[str, Any] = {
+                        "outgoing": len(outgoing),
+                        "incoming": len(incoming),
+                        "total": total,
+                    }
+                    if block_counts:
+                        wires_info["by_block"] = block_counts
+                    result["wires"] = wires_info
             except Exception as e:
                 logger.debug(
                     "Failed to fetch wire counts for read_document (non-fatal)",
@@ -807,15 +1044,16 @@ Always returns fresh content — automatically reconnects if the cached channel 
             raise ValueError("format must be 'markdown', 'text', or 'xml'")
 
         try:
-            await _validate_document_in_workspace(graph_id, document_id, auth.user_id)
+            await _validate_document_in_workspace(graph_id, document_id, auth.user_id, auth=auth)
 
-            await _connect_for_read(graph_id, document_id, auth.user_id)
-
-            channel = hp_client.get_document_channel(graph_id, document_id, user_id=auth.user_id)
-            if channel is None:
-                raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
-
-            reader = DocumentReader(channel.doc)
+            document_doc, _ = await _load_document_doc_for_read(
+                graph_id,
+                document_id,
+                auth.user_id,
+                auth=auth,
+                tool_name="read_blocks",
+            )
+            reader = DocumentReader(document_doc)
             fragment = reader.get_content_fragment()
             all_children = list(fragment.children)
             total_blocks = len(all_children)
@@ -927,13 +1165,14 @@ Always returns fresh content — automatically reconnects if the cached channel 
         auth.require_auth()
 
         try:
-            # 1. Connect workspace and get document metadata
-            await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
-            ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
-            if not ws_channel or not ws_channel.doc:
-                raise RuntimeError(f"Could not connect to workspace for graph '{graph_id}'")
-
-            ws_reader = WorkspaceReader(ws_channel.doc)
+            # 1. Read workspace metadata (direct path with fallback)
+            workspace_doc, _ = await _load_workspace_doc_for_read(
+                graph_id,
+                auth.user_id,
+                auth=auth,
+                tool_name="document_digest",
+            )
+            ws_reader = WorkspaceReader(workspace_doc)
             doc_meta = ws_reader.get_document(document_id)
             if doc_meta is None:
                 raise RuntimeError(
@@ -968,14 +1207,15 @@ Always returns fresh content — automatically reconnects if the cached channel 
             if doc_meta.get("fileType"):
                 metadata["fileType"] = doc_meta["fileType"]
 
-            # 2. Connect document and extract size + headings
-            await _connect_for_read(graph_id, document_id, auth.user_id)
-
-            channel = hp_client.get_document_channel(graph_id, document_id, user_id=auth.user_id)
-            if not channel:
-                raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
-
-            reader = DocumentReader(channel.doc)
+            # 2. Read document and extract size + headings
+            document_doc, _ = await _load_document_doc_for_read(
+                graph_id,
+                document_id,
+                auth.user_id,
+                auth=auth,
+                tool_name="document_digest",
+            )
+            reader = DocumentReader(document_doc)
             fragment = reader.get_content_fragment()
 
             block_count = 0
@@ -985,7 +1225,6 @@ Always returns fresh content — automatically reconnects if the cached channel 
 
             def _count_text(elem: Any) -> str:
                 """Recursively extract plain text from a Y.js element."""
-                import pycrdt
                 if isinstance(elem, pycrdt.XmlText):
                     return str(elem)
                 elif isinstance(elem, pycrdt.XmlElement):
@@ -995,7 +1234,6 @@ Always returns fresh content — automatically reconnects if the cached channel 
                     return "".join(parts)
                 return ""
 
-            import pycrdt
             for child in fragment.children:
                 if isinstance(child, pycrdt.XmlElement):
                     block_count += 1
@@ -1024,8 +1262,8 @@ Always returns fresh content — automatically reconnects if the cached channel 
             # 3. Wire summary from workspace
             wire_summary = None
             try:
-                outgoing = _get_wires_for_document(ws_channel.doc, document_id, "outgoing")
-                incoming = _get_wires_for_document(ws_channel.doc, document_id, "incoming")
+                outgoing = _get_wires_for_document(workspace_doc, document_id, "outgoing")
+                incoming = _get_wires_for_document(workspace_doc, document_id, "incoming")
                 total = len(outgoing) + len(incoming)
                 if total > 0:
                     # Predicate distribution
@@ -1348,7 +1586,7 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
 
         try:
             # Validate document exists in workspace before appending
-            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id)
+            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id, auth=auth)
 
             # Connect to the document channel with user context
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
@@ -1612,8 +1850,13 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
         auth.require_auth()
 
         try:
-            await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
-            snapshot = hp_client.get_workspace_snapshot(graph_id, user_id=auth.user_id)
+            workspace_doc, _ = await _load_workspace_doc_for_read(
+                graph_id,
+                auth.user_id,
+                auth=auth,
+                tool_name="get_workspace",
+            )
+            snapshot = _workspace_snapshot_from_doc(workspace_doc)
 
             has_docs = bool(snapshot.get("documents"))
             has_folders = bool(snapshot.get("folders"))
@@ -2611,15 +2854,16 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
 
         try:
             # Validate document exists in workspace
-            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id)
+            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id, auth=auth)
 
-            await _connect_for_read(graph_id.strip(), document_id.strip(), auth.user_id)
-
-            channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
-            if channel is None:
-                raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
-
-            reader = DocumentReader(channel.doc)
+            document_doc, _ = await _load_document_doc_for_read(
+                graph_id.strip(),
+                document_id.strip(),
+                auth.user_id,
+                auth=auth,
+                tool_name="get_block",
+            )
+            reader = DocumentReader(document_doc)
             block_info = reader.get_block_info(block_id.strip())
 
             if block_info is None:
@@ -2701,15 +2945,16 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
 
         try:
             # Validate document exists in workspace
-            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id)
+            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id, auth=auth)
 
-            await _connect_for_read(graph_id.strip(), document_id.strip(), auth.user_id)
-
-            channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
-            if channel is None:
-                raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
-
-            reader = DocumentReader(channel.doc)
+            document_doc, _ = await _load_document_doc_for_read(
+                graph_id.strip(),
+                document_id.strip(),
+                auth.user_id,
+                auth=auth,
+                tool_name="query_blocks",
+            )
+            reader = DocumentReader(document_doc)
             matches = reader.query_blocks(
                 block_type=block_type,
                 heading_level=heading_level,
@@ -2786,7 +3031,7 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
         is_single = block_id is not None
 
         try:
-            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id)
+            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id, auth=auth)
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
             results: list[Dict[str, Any]] = []
@@ -2904,7 +3149,7 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
 
         try:
             # Validate document exists in workspace
-            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id)
+            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id, auth=auth)
 
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
@@ -2992,7 +3237,7 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
 
         try:
             # Validate document exists in workspace
-            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id)
+            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id, auth=auth)
 
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
@@ -3068,7 +3313,7 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
 
         try:
             # Validate document exists in workspace
-            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id)
+            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id, auth=auth)
 
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
