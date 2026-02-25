@@ -271,6 +271,11 @@ GROUP BY ?docId
         Raises RuntimeError with a helpful message listing available
         documents when the requested document is not found.
         """
+        def _exists_in_snapshot() -> tuple[bool, list[str]]:
+            snapshot = hp_client.get_workspace_snapshot(graph_id, user_id=user_id)
+            docs = snapshot.get("documents") or {}
+            return (document_id in docs), list(docs.keys())
+
         await hp_client.connect_workspace(graph_id, user_id=user_id)
         ws_channel = hp_client.get_workspace_channel(graph_id, user_id=user_id)
         if ws_channel is None:
@@ -282,6 +287,29 @@ GROUP BY ?docId
         reader = WorkspaceReader(ws_channel.doc)
         if reader.get_document(document_id) is not None:
             return  # Document exists
+
+        # Retry once with force-fresh workspace reconnect before failing.
+        await hp_client.connect_workspace(
+            graph_id,
+            user_id=user_id,
+            force_fresh=True,
+            max_age=0,
+        )
+        ws_channel = hp_client.get_workspace_channel(graph_id, user_id=user_id)
+        if ws_channel is not None:
+            reader = WorkspaceReader(ws_channel.doc)
+            if reader.get_document(document_id) is not None:
+                return
+
+        exists_in_snapshot, doc_ids = _exists_in_snapshot()
+        if exists_in_snapshot:
+            # Snapshot says it exists, but reader path is inconsistent.
+            # Surface explicit transient guidance instead of tombstone wording.
+            raise RuntimeError(
+                f"Document '{document_id}' appears in workspace snapshot for graph '{graph_id}', "
+                "but is not visible through the current channel reader (transient sync divergence). "
+                "Retry in a moment or reconnect MCP."
+            )
 
         # Build a helpful error with available documents
         snapshot = hp_client.get_workspace_snapshot(graph_id, user_id=user_id)
@@ -2641,13 +2669,18 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             "list type, checked state, or text content. Returns a list of matching block summaries. "
             "Use this to find blocks without reading the entire document.\n\n"
             "Always returns fresh content — automatically reconnects if cached state "
-            "is older than 2 seconds, and retries once on sync timeout."
+            "is older than 2 seconds, and retries once on sync timeout.\n\n"
+            "NOTE: This is a single-document structural filter — it queries one document's CRDT state "
+            "directly, with no backend round-trip. Use it for structural navigation within a document "
+            "(e.g., find all headings, find checked tasks, find blocks at indent level 2). "
+            "For cross-document content discovery, use search_blocks instead (hybrid lexical+semantic)."
         ),
     )
     async def query_blocks_tool(
         graph_id: str,
         document_id: str,
         block_type: Optional[str] = None,
+        heading_level: Optional[int] = None,
         indent: Optional[int] = None,
         indent_gte: Optional[int] = None,
         indent_lte: Optional[int] = None,
@@ -2679,6 +2712,7 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             reader = DocumentReader(channel.doc)
             matches = reader.query_blocks(
                 block_type=block_type,
+                heading_level=heading_level,
                 indent=indent,
                 indent_gte=indent_gte,
                 indent_lte=indent_lte,

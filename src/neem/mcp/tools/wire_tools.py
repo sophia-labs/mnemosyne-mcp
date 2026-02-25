@@ -338,16 +338,47 @@ def register_wire_tools(server: FastMCP) -> None:
     # Validation helper
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _validate_document_in_ws(
-        ws_doc: pycrdt.Doc, graph_id: str, document_id: str,
-    ) -> None:
-        """Verify a document exists in workspace. Raises RuntimeError if not."""
-        reader = WorkspaceReader(ws_doc)
-        if reader.get_document(document_id) is None:
+    async def _ensure_document_in_ws(
+        graph_id: str,
+        document_id: str,
+        user_id: str,
+    ) -> Any:
+        """Ensure a document exists in workspace, with one force-fresh retry."""
+        await hp_client.connect_workspace(graph_id, user_id=user_id)
+        channel = hp_client.get_workspace_channel(graph_id, user_id=user_id)
+        if channel is None:
+            raise RuntimeError(f"Workspace not connected: {graph_id}")
+
+        reader = WorkspaceReader(channel.doc)
+        if reader.get_document(document_id) is not None:
+            return channel
+
+        # Retry once with a forced workspace reconnect.
+        await hp_client.connect_workspace(
+            graph_id,
+            user_id=user_id,
+            force_fresh=True,
+            max_age=0,
+        )
+        channel = hp_client.get_workspace_channel(graph_id, user_id=user_id)
+        if channel is None:
+            raise RuntimeError(f"Workspace not connected: {graph_id}")
+        reader = WorkspaceReader(channel.doc)
+        if reader.get_document(document_id) is not None:
+            return channel
+
+        docs = (hp_client.get_workspace_snapshot(graph_id, user_id=user_id).get("documents") or {})
+        if document_id in docs:
             raise RuntimeError(
-                f"Document '{document_id}' not found in graph '{graph_id}'. "
-                f"Use get_workspace to see available documents."
+                f"Document '{document_id}' appears in workspace snapshot for graph '{graph_id}', "
+                "but is not visible via channel reader (transient sync divergence). "
+                "Retry in a moment or reconnect MCP."
             )
+
+        raise RuntimeError(
+            f"Document '{document_id}' not found in graph '{graph_id}'. "
+            f"Use get_workspace to see available documents."
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     # list_wire_predicates
@@ -493,9 +524,9 @@ def register_wire_tools(server: FastMCP) -> None:
                         src_block = (spec.get("source_block_id") or "").strip() or None
                         tgt_block = (spec.get("target_block_id") or "").strip() or None
 
-                        _validate_document_in_ws(channel.doc, graph_id, src_doc)
+                        await _ensure_document_in_ws(graph_id, src_doc, auth.user_id)
                         if eff_tgt_graph == graph_id:
-                            _validate_document_in_ws(channel.doc, graph_id, tgt_doc)
+                            await _ensure_document_in_ws(graph_id, tgt_doc, auth.user_id)
 
                         wid = f"w-{uuid4().hex[:12]}"
                         inv_id = f"{wid}-inv" if bidir else None
@@ -558,9 +589,9 @@ def register_wire_tools(server: FastMCP) -> None:
                 channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
                 if channel is None:
                     raise RuntimeError(f"Workspace not connected: {graph_id}")
-                _validate_document_in_ws(channel.doc, graph_id, source_document_id.strip())
+                await _ensure_document_in_ws(graph_id, source_document_id.strip(), auth.user_id)
                 if effective_target_graph.strip() == graph_id:
-                    _validate_document_in_ws(channel.doc, graph_id, target_document_id.strip())
+                    await _ensure_document_in_ws(graph_id, target_document_id.strip(), auth.user_id)
 
                 def _do_create(doc: pycrdt.Doc) -> None:
                     _create_wire_in_doc(
@@ -638,13 +669,7 @@ def register_wire_tools(server: FastMCP) -> None:
             raise ValueError(f"direction must be 'outgoing', 'incoming', or 'both', got '{direction}'")
 
         try:
-            await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
-            channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
-            if channel is None:
-                raise RuntimeError(f"Workspace not connected: {graph_id}")
-
-            # Validate document exists
-            _validate_document_in_ws(channel.doc, graph_id, document_id)
+            channel = await _ensure_document_in_ws(graph_id, document_id, auth.user_id)
 
             # Reconciliation + sweep: connect to the document to get current
             # block IDs, then in one workspace transaction:
@@ -772,13 +797,7 @@ def register_wire_tools(server: FastMCP) -> None:
             raise ValueError(f"direction must be 'outgoing', 'incoming', or 'both', got '{direction}'")
 
         try:
-            await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
-            channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
-            if channel is None:
-                raise RuntimeError(f"Workspace not connected: {graph_id}")
-
-            # Validate starting document exists
-            _validate_document_in_ws(channel.doc, graph_id, document_id)
+            channel = await _ensure_document_in_ws(graph_id, document_id, auth.user_id)
 
             doc = channel.doc
 
