@@ -822,6 +822,7 @@ GROUP BY ?docId
             "This is the lightest-weight context tool — use it when you just need to know "
             "where the user is. Follow up with get_workspace to see the full graph structure, "
             "or read_document to see the document content."
+            "\n\nAlso returns a UTC ISO timestamp for temporal awareness."
         ),
     )
     async def get_user_location_tool(
@@ -855,6 +856,7 @@ GROUP BY ?docId
                         f"The user may not have a browser tab open, or hasn't navigated "
                         f"to a document yet. Auth source: {auth.source}"
                     )
+                location["timestamp"] = datetime.now(timezone.utc).isoformat()
                 return location
 
             # Fallback: reconnect WebSocket to get fresh session state
@@ -895,7 +897,11 @@ GROUP BY ?docId
                     f"has not synced yet. Auth source: {auth.source}"
                 )
 
-            return {"graph_id": graph_id, "document_id": document_id}
+            return {
+                "graph_id": graph_id,
+                "document_id": document_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
 
         except RuntimeError:
             raise
