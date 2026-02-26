@@ -674,38 +674,74 @@ GROUP BY ?docId
 
         return False
 
-    async def _get_location_via_rest(auth: MCPAuthContext) -> Optional[dict]:
+    async def _get_location_via_rest(auth: MCPAuthContext, *, attempts: int = 2) -> Optional[dict]:
         """Fetch user's current location from the backend REST API.
 
         Returns dict with graph_id and document_id, or None if unavailable
         (endpoint not deployed yet — rolling deploy safety).
+        Retries once on transient errors (timeout, 5xx).
         """
         url = f"{backend_config.base_url}/sessions/location"
         headers = auth.http_headers()
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
-                resp = await client.get(url, headers=headers)
-            if resp.status_code == 404:
-                # Endpoint not yet deployed on this pod — fall back to WebSocket path
-                return None
-            if resp.status_code != 200:
+        last_error: Optional[str] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+                    resp = await client.get(url, headers=headers)
+                if resp.status_code == 404:
+                    # Endpoint not yet deployed on this pod — fall back to WebSocket path
+                    return None
+                if resp.status_code >= 500:
+                    last_error = f"HTTP {resp.status_code}"
+                    if attempt < attempts:
+                        logger.warning(
+                            "session_location_retry",
+                            extra_context={"status": resp.status_code, "attempt": attempt},
+                        )
+                        await asyncio.sleep(1.0)
+                        continue
+                    logger.warning(
+                        "session_location_http_error",
+                        extra_context={"status": resp.status_code, "attempts": attempts},
+                    )
+                    return None
+                if resp.status_code != 200:
+                    logger.warning(
+                        "session_location_http_error",
+                        extra_context={"status": resp.status_code},
+                    )
+                    return None
+                payload = resp.json()
+                graph_id = payload.get("graph_id")
+                document_id = payload.get("document_id")
+                source = payload.get("source", "unknown")
+                if graph_id or document_id:
+                    return {"graph_id": graph_id, "document_id": document_id}
+                # REST succeeded but session has no location — return a sentinel
+                # so the caller can report a clear error instead of falling through
+                # to the slower WebSocket path.
+                return {"graph_id": None, "document_id": None, "_empty": True, "_source": source}
+            except (httpx.TimeoutException, httpx.ConnectError) as exc:
+                last_error = str(exc)
+                if attempt < attempts:
+                    logger.warning(
+                        "session_location_retry",
+                        extra_context={"error": last_error, "attempt": attempt},
+                    )
+                    await asyncio.sleep(1.0)
+                    continue
                 logger.warning(
-                    "session_location_http_error",
-                    extra_context={"status": resp.status_code},
+                    "session_location_request_failed",
+                    extra_context={"error": last_error, "attempts": attempts},
                 )
                 return None
-            payload = resp.json()
-            graph_id = payload.get("graph_id")
-            document_id = payload.get("document_id")
-            if graph_id or document_id:
-                return {"graph_id": graph_id, "document_id": document_id}
-            return None
-        except Exception as exc:
-            logger.warning(
-                "session_location_request_failed",
-                extra_context={"error": str(exc)},
-            )
-            return None
+            except Exception as exc:
+                logger.warning(
+                    "session_location_request_failed",
+                    extra_context={"error": str(exc)},
+                )
+                return None
+        return None
 
     async def _await_document_durable(
         graph_id: str,
@@ -802,22 +838,71 @@ GROUP BY ?docId
             # pod, always fresh. Falls back to WebSocket reconnect if not deployed.
             location = await _get_location_via_rest(auth)
             if location is not None:
+                if location.get("_empty"):
+                    # REST succeeded but session has no active location
+                    rest_source = location.get("_source", "unknown")
+                    logger.warning(
+                        "user_location_empty_from_rest",
+                        extra_context={
+                            "user_id": user_id,
+                            "auth_source": auth.source,
+                            "session_source": rest_source,
+                        },
+                    )
+                    raise RuntimeError(
+                        f"No active graph or document found in session for user '{user_id}' "
+                        f"(session loaded from {rest_source}). "
+                        f"The user may not have a browser tab open, or hasn't navigated "
+                        f"to a document yet. Auth source: {auth.source}"
+                    )
                 return location
 
             # Fallback: reconnect WebSocket to get fresh session state
             # (the persistent WebSocket doesn't receive incremental Y.js updates
             # after initial sync, so reconnect gets latest from server memory/Redis)
-            await hp_client.refresh_session(user_id)
+            # Retry once on transient WebSocket/sync timeout.
+            ws_error: Optional[Exception] = None
+            for ws_attempt in range(1, 3):
+                try:
+                    await hp_client.refresh_session(user_id)
+                    ws_error = None
+                    break
+                except Exception as e:
+                    ws_error = e
+                    if ws_attempt < 2:
+                        logger.warning(
+                            "session_refresh_retry",
+                            extra_context={"error": str(e), "attempt": ws_attempt},
+                        )
+                        await asyncio.sleep(1.0)
+            if ws_error is not None:
+                raise ws_error
 
-            return {
-                "graph_id": hp_client.get_active_graph_id(),
-                "document_id": hp_client.get_active_document_id(),
-            }
+            graph_id = hp_client.get_active_graph_id()
+            document_id = hp_client.get_active_document_id()
 
+            if not graph_id and not document_id:
+                logger.warning(
+                    "user_location_empty",
+                    extra_context={
+                        "user_id": user_id,
+                        "auth_source": auth.source,
+                    },
+                )
+                raise RuntimeError(
+                    f"No active session found for user '{user_id}'. "
+                    f"The user may not have a browser tab open, or the session "
+                    f"has not synced yet. Auth source: {auth.source}"
+                )
+
+            return {"graph_id": graph_id, "document_id": document_id}
+
+        except RuntimeError:
+            raise
         except Exception as e:
             logger.error(
                 "Failed to get user location",
-                extra_context={"error": str(e)},
+                extra_context={"error": str(e), "user_id": user_id, "auth_source": auth.source},
             )
             raise RuntimeError(f"Failed to get user location: {e}")
 
