@@ -39,6 +39,7 @@ class ChannelState:
     ws: Optional[aiohttp.ClientWebSocketResponse] = None
     synced: asyncio.Event = field(default_factory=asyncio.Event)
     synced_at: float = 0.0  # monotonic timestamp of last successful sync
+    last_used: float = 0.0  # monotonic timestamp of last tool-level access
     receiver_task: Optional[asyncio.Task] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -80,6 +81,7 @@ class HocuspocusClient:
         sync_timeout: float = 20.0,
         connect_retries: int = 1,
         heartbeat_interval: float = 30.0,
+        doc_idle_timeout: float = 10.0,
     ) -> None:
         """Initialize the Hocuspocus client.
 
@@ -92,6 +94,10 @@ class HocuspocusClient:
             sync_timeout: Max seconds to wait for initial Y.js sync step 2
             connect_retries: Retries on sync timeout (per channel connect)
             heartbeat_interval: Interval between ping messages
+            doc_idle_timeout: Seconds of inactivity before disconnecting a
+                document channel.  Prevents indefinite server-side memory
+                accumulation from long-lived MCP sessions.  Set to 0 to
+                disable idle cleanup.
         """
         self._base_url = base_url.rstrip("/")
         self._token_provider = token_provider
@@ -137,6 +143,13 @@ class HocuspocusClient:
         # causing one caller to read from an unsynced channel.
         self._workspace_connect_locks: Dict[str, asyncio.Lock] = {}
         self._document_connect_locks: Dict[str, asyncio.Lock] = {}
+
+        # Document channel idle cleanup
+        self._doc_idle_timeout = max(
+            0.0,
+            float(os.getenv("MNEMOSYNE_HOCUSPOCUS_DOC_IDLE_TIMEOUT", str(doc_idle_timeout))),
+        )
+        self._idle_cleanup_task: Optional[asyncio.Task] = None
 
         # Shutdown flag
         self._closed = False
@@ -868,6 +881,7 @@ class HocuspocusClient:
         if key in self._document_channels:
             channel = self._document_channels[key]
             if channel.ws and not channel.ws.closed and channel.synced.is_set():
+                channel.last_used = time.monotonic()
                 return
 
         # Slow path: acquire per-key lock to prevent concurrent channel creation
@@ -879,6 +893,7 @@ class HocuspocusClient:
             if key in self._document_channels:
                 channel = self._document_channels[key]
                 if channel.ws and not channel.ws.closed and channel.synced.is_set():
+                    channel.last_used = time.monotonic()
                     return
 
             for attempt in range(self._connect_retries + 1):
@@ -893,6 +908,8 @@ class HocuspocusClient:
                             f"doc:{graph_id}:{doc_id}",
                             user_id=user_id,
                         )
+                    channel.last_used = time.monotonic()
+                    self._ensure_idle_cleanup_running()
                     return
                 except TimeoutError:
                     # Clean up the broken entry so future calls don't see a zombie
@@ -921,7 +938,10 @@ class HocuspocusClient:
         """Get the channel state for a document."""
         effective_user_id = user_id or self._dev_user_id
         key = f"{effective_user_id}:{graph_id}:{doc_id}"
-        return self._document_channels.get(key)
+        channel = self._document_channels.get(key)
+        if channel is not None:
+            channel.last_used = time.monotonic()
+        return channel
 
     async def apply_document_update(
         self,
@@ -993,6 +1013,8 @@ class HocuspocusClient:
         channel = self._document_channels.get(key)
         if channel is None:
             raise ValueError(f"Document channel not connected: {key}")
+
+        channel.last_used = time.monotonic()
 
         # Capture state and content BEFORE changes
         old_state = channel.doc.get_state()
@@ -1105,6 +1127,72 @@ class HocuspocusClient:
         )
 
     # -------------------------------------------------------------------------
+    # Idle document channel cleanup
+    # -------------------------------------------------------------------------
+
+    def _ensure_idle_cleanup_running(self) -> None:
+        """Start the idle cleanup loop if not already running."""
+        if self._doc_idle_timeout <= 0:
+            return
+        if self._idle_cleanup_task is None or self._idle_cleanup_task.done():
+            self._idle_cleanup_task = asyncio.create_task(
+                self._idle_cleanup_loop(),
+                name="hocuspocus-idle-cleanup",
+            )
+
+    async def _idle_cleanup_loop(self) -> None:
+        """Periodically close document channels that have been idle too long.
+
+        Without this, MCP agent sessions hold WebSocket connections open
+        indefinitely, preventing the server-side DocumentManager from ever
+        evicting cached Y.Docs.  This is the root cause of unbounded API
+        pod memory growth during long-lived agent sessions.
+        """
+        sweep_interval = max(self._doc_idle_timeout / 2, 2.0)
+        logger.info(
+            "Idle document cleanup started",
+            extra_context={
+                "idle_timeout_seconds": self._doc_idle_timeout,
+                "sweep_interval_seconds": sweep_interval,
+            },
+        )
+        try:
+            while not self._closed:
+                await asyncio.sleep(sweep_interval)
+                if self._closed:
+                    break
+                now = time.monotonic()
+                stale_keys = [
+                    key for key, ch in self._document_channels.items()
+                    if ch.last_used > 0 and (now - ch.last_used) > self._doc_idle_timeout
+                ]
+                for key in stale_keys:
+                    channel = self._document_channels.pop(key, None)
+                    if channel:
+                        logger.info(
+                            "Closing idle document channel",
+                            extra_context={
+                                "channel_key": key,
+                                "idle_seconds": round(now - channel.last_used, 1),
+                            },
+                        )
+                        await self._close_channel(channel)
+                # Also clean up orphaned connect locks for channels that no longer exist
+                orphaned_locks = [
+                    k for k in self._document_connect_locks
+                    if k not in self._document_channels
+                ]
+                for k in orphaned_locks:
+                    self._document_connect_locks.pop(k, None)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error(
+                "Idle cleanup loop error",
+                extra_context={"error": str(exc)},
+            )
+
+    # -------------------------------------------------------------------------
     # Cleanup
     # -------------------------------------------------------------------------
 
@@ -1158,6 +1246,14 @@ class HocuspocusClient:
         Waits briefly for pending updates to be sent before closing.
         """
         self._closed = True
+
+        # Stop idle cleanup loop
+        if self._idle_cleanup_task and not self._idle_cleanup_task.done():
+            self._idle_cleanup_task.cancel()
+            try:
+                await self._idle_cleanup_task
+            except asyncio.CancelledError:
+                pass
 
         # Flush pending updates before closing
         await self._flush_pending_updates()
