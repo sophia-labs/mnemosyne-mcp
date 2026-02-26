@@ -1177,13 +1177,6 @@ class HocuspocusClient:
                             },
                         )
                         await self._close_channel(channel)
-                # Also clean up orphaned connect locks for channels that no longer exist
-                orphaned_locks = [
-                    k for k in self._document_connect_locks
-                    if k not in self._document_channels
-                ]
-                for k in orphaned_locks:
-                    self._document_connect_locks.pop(k, None)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
