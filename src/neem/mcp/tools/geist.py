@@ -1312,6 +1312,13 @@ def register_geist_tools(server: FastMCP) -> None:
                 result["ejections_remaining"] = CODA_EJECTION_LIFETIME
 
             # Render and write Song
+            # Re-connect immediately before writing: the archive path above has
+            # several async yields (connect_document for past-songs, transact,
+            # _await_song_durable HTTP) during which the idle cleanup loop or a
+            # concurrent _connect_for_read could remove the geist-song channel.
+            # connect_document fast-paths when the channel is still alive, so
+            # this costs nothing in the common case.
+            await hp_client.connect_document(graph_id, SONG_DOC_ID, user_id=auth.user_id)
             new_song = _render_song_from_meta(meta)
             await hp_client.transact_document(
                 graph_id,
