@@ -1102,6 +1102,9 @@ Always returns fresh content — automatically reconnects if the cached channel 
             "- 'xml': Full TipTap XML with attributes and block IDs\n\n"
             "Supports negative offsets: offset=-50 reads the last 50 blocks. "
             "Pass block_id to jump to a specific block by ID (window starts at that block).\n\n"
+            "Set include_ids=false to omit block_id from each block entry — useful when "
+            "reading for comprehension rather than editing. block_type is omitted for "
+            "plain paragraphs (included for headings, codeBlocks, etc.).\n\n"
             "Returns: blocks list, total_blocks count, has_more flag, and "
             "next_offset for easy pagination.\n\n"
             "Always returns fresh content — automatically reconnects if cached state "
@@ -1115,6 +1118,7 @@ Always returns fresh content — automatically reconnects if the cached channel 
         limit: int = 50,
         format: Optional[str] = None,
         block_id: Optional[str] = None,
+        include_ids: bool = True,
         context: Context | None = None,
     ) -> dict:
         """Read blocks sequentially from a document with pagination.
@@ -1128,6 +1132,8 @@ Always returns fresh content — automatically reconnects if the cached channel 
             format: Output format - 'markdown' (default), 'text', or 'xml'
             block_id: If provided, jump to this block's position (offset/limit still apply
                 from that position). Takes precedence over offset.
+            include_ids: If False, omit block_id from each block entry. Default True.
+                Set False when reading for comprehension rather than editing.
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
@@ -1191,13 +1197,12 @@ Always returns fresh content — automatically reconnects if the cached channel 
                 else:  # markdown
                     content = tiptap_xml_to_markdown(xml_str).strip()
 
-                block_entry: Dict[str, Any] = {
-                    "index": idx,
-                    "block_id": blk_id,
-                    "type": tag,
-                    "content": content,
-                }
-
+                block_entry: Dict[str, Any] = {"index": idx, "content": content}
+                if include_ids:
+                    block_entry["block_id"] = blk_id
+                # Omit type for plain paragraphs — it's the default and adds no signal
+                if tag != "paragraph":
+                    block_entry["type"] = tag
                 # Include heading level for headings
                 if tag == "heading":
                     level = attrs.get("level", 1)
