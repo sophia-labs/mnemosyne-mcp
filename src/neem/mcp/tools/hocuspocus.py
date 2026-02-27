@@ -3306,7 +3306,13 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             "auto-wrapping applied as fallback, but prefer explicit: <blockquote><paragraph>text</paragraph></blockquote> "
             "Markdown is also accepted and auto-converted.\n\n"
             "Always read the document first (read_document or get_block) before inserting — "
-            "write tools use a cached channel and need a preceding read to sync latest state from the server."
+            "write tools use a cached channel and need a preceding read to sync latest state from the server. "
+            "Never call insert_block in parallel with other write operations on the same document. "
+            "For inserting multiple blocks sequentially, use the new_block_id returned from each call "
+            "as the reference_block_id for the next — document state changes after each insert and "
+            "parallel calls with stale block IDs produce unpredictable ordering. "
+            "To add multiple blocks at once without chaining, prefer append_to_document instead "
+            "(handles multiple blocks in a single atomic call)."
         ),
     )
     async def insert_block_tool(
