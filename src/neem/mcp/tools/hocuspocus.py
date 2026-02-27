@@ -1100,6 +1100,8 @@ Always returns fresh content — automatically reconnects if the cached channel 
             "- 'markdown' (default): Clean markdown rendering of each block\n"
             "- 'text': Plain text only (most compact)\n"
             "- 'xml': Full TipTap XML with attributes and block IDs\n\n"
+            "Supports negative offsets: offset=-50 reads the last 50 blocks. "
+            "Pass block_id to jump to a specific block by ID (window starts at that block).\n\n"
             "Returns: blocks list, total_blocks count, has_more flag, and "
             "next_offset for easy pagination.\n\n"
             "Always returns fresh content — automatically reconnects if cached state "
@@ -1112,6 +1114,7 @@ Always returns fresh content — automatically reconnects if the cached channel 
         offset: int = 0,
         limit: int = 50,
         format: Optional[str] = None,
+        block_id: Optional[str] = None,
         context: Context | None = None,
     ) -> dict:
         """Read blocks sequentially from a document with pagination.
@@ -1119,17 +1122,18 @@ Always returns fresh content — automatically reconnects if the cached channel 
         Args:
             graph_id: The graph containing the document
             document_id: The document to read
-            offset: Block index to start from (0-based, default 0)
+            offset: Block index to start from (0-based, default 0). Negative values
+                count from the end (e.g. -50 starts 50 blocks from the end).
             limit: Maximum number of blocks to return (default 50, max 200)
             format: Output format - 'markdown' (default), 'text', or 'xml'
+            block_id: If provided, jump to this block's position (offset/limit still apply
+                from that position). Takes precedence over offset.
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
         if limit > 200:
             limit = 200
-        if offset < 0:
-            offset = 0
         fmt = format or "markdown"
         if fmt not in ("markdown", "text", "xml"):
             raise ValueError("format must be 'markdown', 'text', or 'xml'")
@@ -1149,6 +1153,19 @@ Always returns fresh content — automatically reconnects if the cached channel 
             all_children = list(fragment.children)
             total_blocks = len(all_children)
 
+            # Resolve block_id to offset (takes precedence over offset param)
+            if block_id is not None:
+                for i, child in enumerate(all_children):
+                    if hasattr(child, "attributes") and dict(child.attributes).get("data-block-id") == block_id:
+                        offset = i
+                        break
+                else:
+                    raise ValueError(f"Block '{block_id}' not found in document '{document_id}'")
+
+            # Resolve negative offset (count from end)
+            if offset < 0:
+                offset = max(0, total_blocks + offset)
+
             # Slice to requested range
             end = min(offset + limit, total_blocks)
             slice_children = all_children[offset:end]
@@ -1160,7 +1177,7 @@ Always returns fresh content — automatically reconnects if the cached channel 
                     continue
 
                 attrs = dict(child.attributes)
-                block_id = attrs.get("data-block-id", "")
+                blk_id = attrs.get("data-block-id", "")
                 tag = child.tag if hasattr(child, "tag") else "unknown"
 
                 # Get content in requested format
@@ -1176,7 +1193,7 @@ Always returns fresh content — automatically reconnects if the cached channel 
 
                 block_entry: Dict[str, Any] = {
                     "index": idx,
-                    "block_id": block_id,
+                    "block_id": blk_id,
                     "type": tag,
                     "content": content,
                 }
@@ -1192,13 +1209,8 @@ Always returns fresh content — automatically reconnects if the cached channel 
 
             has_more = end < total_blocks
             result: Dict[str, Any] = {
-                "graph_id": graph_id,
-                "document_id": document_id,
                 "blocks": blocks,
                 "total_blocks": total_blocks,
-                "offset": offset,
-                "limit": limit,
-                "returned": len(blocks),
                 "has_more": has_more,
             }
             if has_more:

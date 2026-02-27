@@ -30,7 +30,7 @@ JsonDict = Dict[str, Any]
 
 
 def _render_json(data: Any) -> str:
-    return json.dumps(data, indent=2, default=str)
+    return json.dumps(data, default=str)
 
 
 # ---------------------------------------------------------------------------
