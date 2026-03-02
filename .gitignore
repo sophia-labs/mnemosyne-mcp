@@ -139,7 +139,6 @@ cython_debug/
 
 # uv package manager
 .uv/
-uv.lock
 
 # hatchling build backend
 .hatch/
