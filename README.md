@@ -1,4 +1,3 @@
-
 # Mnemosyne MCP
 ## THIS IS A WORK IN PROGRESS AND THE DOCUMENTATION IS AI-GENERATED AND WILL BE REWRITTEN BY HUMAN BEFORE PEOPLE ARE WIDELY ENCOURAGED TO READ IT AND USE THIS CODE. THANK YOU FOR YOUR ATTENTION TO THIS MATTER XOXO VERA
 
@@ -7,6 +6,10 @@
 The Mnemosyne MCP (`neem`) historically exposed a full suite of graph management tools. We are currently rebuilding those tools from scratch against a new FastAPI backend that runs inside our local kubectl context.
 
 > **Status:** The MCP server provides 23+ tools for knowledge graph management, SPARQL queries, real-time document editing, and workspace organization via Hocuspocus/Y.js.
+
+<a href="https://glama.ai/mcp/servers/@sophia-labs/mnemosyne-mcp">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/@sophia-labs/mnemosyne-mcp/badge" alt="Mnemosyne MCP server" />
+</a>
 
 **Features:**
 - 🔌 Reliable connectivity to a local FastAPI backend (via env vars or kubectl port-forward)
