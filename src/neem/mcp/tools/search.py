@@ -204,7 +204,7 @@ def register_search_tools(server: FastMCP) -> None:
         name="search_documents",
         title="Search Documents",
         description=(
-            "Fast title and path search across all documents in a graph's workspace. "
+            "Fast title and path search across all documents and folders in a graph's workspace. "
             "Returns document IDs, titles, and folder paths. No SPARQL needed.\n\n"
             "**Modes:**\n"
             "- `auto` (default): Cascades through exact ID match → exact title → "
@@ -223,6 +223,7 @@ def register_search_tools(server: FastMCP) -> None:
         mode: str = "auto",
         limit: int = 20,
         folder_id: Optional[str] = None,
+        include_folders: bool = True,
         context: Context | None = None,
     ) -> str:
         """Search documents by title and path."""
@@ -250,7 +251,7 @@ def register_search_tools(server: FastMCP) -> None:
         documents = snapshot.get("documents", {})
         folders = snapshot.get("folders", {})
 
-        if not documents:
+        if not documents and not (include_folders and folders):
             return _render_json({"results": [], "total": 0, "query": query, "mode": mode})
 
         # Build folder path lookup
@@ -287,6 +288,7 @@ def register_search_tools(server: FastMCP) -> None:
                 "folder_path": fpath,
                 "folder_id": parent_id,
                 "read_only": bool(ddata.get("readOnly")),
+                "type": "document",
                 "_title_lower": title.lower(),
                 "_path_lower": fpath.lower(),
                 "_searchable": f"{title} {fpath}".lower(),
@@ -294,6 +296,30 @@ def register_search_tools(server: FastMCP) -> None:
                 "_path_norm": _normalize(fpath),
                 "_searchable_norm": _normalize(f"{title} {fpath}"),
             })
+
+        # Include folders as searchable entries
+        if include_folders:
+            for fid, fdata in folders.items():
+                if allowed_folders is not None and fid not in allowed_folders:
+                    continue
+                name = fdata.get("name") or "Untitled"
+                parent_id = fdata.get("parentId")
+                fpath = folder_paths.get(parent_id, "") if parent_id else ""
+
+                entries.append({
+                    "document_id": fid,
+                    "title": name,
+                    "folder_path": fpath,
+                    "folder_id": parent_id,
+                    "read_only": False,
+                    "type": "folder",
+                    "_title_lower": name.lower(),
+                    "_path_lower": fpath.lower(),
+                    "_searchable": f"{name} {fpath}".lower(),
+                    "_title_norm": _normalize(name),
+                    "_path_norm": _normalize(fpath),
+                    "_searchable_norm": _normalize(f"{name} {fpath}"),
+                })
 
         # Search based on mode
         def _search_exact_id() -> list[dict]:
@@ -310,36 +336,32 @@ def register_search_tools(server: FastMCP) -> None:
         def _search_substring() -> list[dict]:
             q = query.lower()
             q_norm = _normalize(query)
-            results = []
+            title_hits = []
+            path_hits = []
             for e in entries:
                 if q in e["_title_lower"]:
-                    e = {**e, "match_type": "title_substring"}
-                    results.append(e)
-                elif q in e["_path_lower"]:
-                    e = {**e, "match_type": "path_substring"}
-                    results.append(e)
+                    title_hits.append({**e, "match_type": "title_substring"})
                 elif q_norm and q_norm in e["_title_norm"]:
-                    e = {**e, "match_type": "title_substring"}
-                    results.append(e)
+                    title_hits.append({**e, "match_type": "title_substring"})
+                elif q in e["_path_lower"]:
+                    path_hits.append({**e, "match_type": "path_substring"})
                 elif q_norm and q_norm in e["_path_norm"]:
-                    e = {**e, "match_type": "path_substring"}
-                    results.append(e)
-            return results
+                    path_hits.append({**e, "match_type": "path_substring"})
+            return title_hits + path_hits
 
         def _search_regex() -> list[dict]:
             try:
                 pattern = re_mod.compile(query, re_mod.IGNORECASE)
             except re_mod.error as exc:
                 raise ValueError(f"Invalid regex pattern: {exc}")
-            results = []
+            title_hits = []
+            path_hits = []
             for e in entries:
                 if pattern.search(e["title"]):
-                    e = {**e, "match_type": "regex_title"}
-                    results.append(e)
+                    title_hits.append({**e, "match_type": "regex_title"})
                 elif pattern.search(e["folder_path"]):
-                    e = {**e, "match_type": "regex_path"}
-                    results.append(e)
-            return results
+                    path_hits.append({**e, "match_type": "regex_path"})
+            return title_hits + path_hits
 
         def _search_fuzzy() -> list[dict]:
             q_tokens = _tokenize(query)
@@ -385,14 +407,17 @@ def register_search_tools(server: FastMCP) -> None:
         # Clean internal keys and apply limit
         clean_results = []
         for r in results[:limit]:
-            clean_results.append({
+            entry: dict[str, Any] = {
                 "document_id": r["document_id"],
                 "title": r["title"],
                 "folder_path": r["folder_path"],
                 "folder_id": r["folder_id"],
                 "read_only": r["read_only"],
                 "match_type": r.get("match_type", effective_mode),
-            })
+            }
+            if r.get("type") == "folder":
+                entry["type"] = "folder"
+            clean_results.append(entry)
 
         return _render_json({
             "results": clean_results,
@@ -707,8 +732,7 @@ def register_search_tools(server: FastMCP) -> None:
         if post_filter_removed > 0:
             logger.info(
                 "search_blocks_deleted_docs_filtered",
-                removed=post_filter_removed,
-                query=query[:50],
+                extra_context={"removed": post_filter_removed, "query": query[:50]},
             )
 
         lexical_count = sum(1 for r in final_results if r.get("match_source") in ("lexical", "both"))
