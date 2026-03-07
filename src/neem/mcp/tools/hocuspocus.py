@@ -1526,6 +1526,8 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}
 
 Markdown is also accepted and auto-converted to TipTap XML.
 
+Indentation: Use tab characters at the start of a line to set paragraph indent level (1 tab = indent 1, 2 tabs = indent 2, etc.). Indentation creates visual hierarchy in the document — use it for sub-points, supporting details, or outline structure. Tabs inside code fences and on list items are not affected.
+
 Returns block_ids: an ordered list of all block IDs in the written document, enabling immediate block-level wiring without a separate read call.
 
 `await_durable` (default true) forces post-write verification through a fresh document channel rather than the same cached channel.
@@ -1657,6 +1659,9 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             "Supports multiple blocks in a single call: pass markdown with multiple paragraphs, "
             "or XML with multiple top-level elements. Each block is appended in order within a "
             "single transaction. Plain text without XML tags is auto-wrapped in a <paragraph>.\n\n"
+            "Indentation: Use tab characters at the start of a line to set paragraph indent level "
+            "(1 tab = indent 1, 2 tabs = indent 2). Creates visual hierarchy for sub-points and "
+            "supporting details. Tabs inside code fences and on list items are not affected.\n\n"
             "Container blocks (blockquote, tableCell, tableHeader) require paragraph children. "
             "Auto-wrapping is applied as a fallback, but prefer: <blockquote><paragraph>text</paragraph></blockquote>\n\n"
             "For appending to documents written by other agents, call read_document first to sync "
