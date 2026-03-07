@@ -122,15 +122,34 @@ INLINE_NODE_ATTR_TO_XML: dict[str, dict[str, str]] = {
 BLOCK_ATTR_MAP: dict[str, dict[str, str]] = {
     "paragraph": {
         "data-indent": "indent",  # XML attr → TipTap attr
+        "collapsed": "collapsed", # Pass through
     },
     "heading": {
         "data-indent": "indent",  # XML attr → TipTap attr
         "level": "level",         # Pass through (same name)
+        "collapsed": "collapsed", # Pass through
     },
     "listItem": {
         "data-indent": "indent",  # XML attr → TipTap attr
         "listType": "listType",   # Pass through (bullet/ordered/task)
         "checked": "checked",     # Pass through (for task items)
+        "collapsed": "collapsed", # Pass through
+    },
+}
+
+# Default attributes that TipTap/y-prosemirror expects on block elements.
+# Missing defaults cause y-prosemirror to normalize (reconstruct) blocks when
+# the browser opens the document, which can nuke MCP-written content via CRDT
+# merge conflicts. Values must be Python types (bool, int) — not strings.
+BLOCK_DEFAULTS: dict[str, dict[str, Any]] = {
+    "paragraph": {
+        "collapsed": False,
+        "indent": 0,
+    },
+    "listItem": {
+        "collapsed": False,
+        "indent": 0,
+        "checked": False,
     },
 }
 
@@ -332,6 +351,13 @@ def _map_block_attrs(tag: str, attrs: dict[str, Any]) -> dict[str, Any]:
                 value = int(value)
             except (ValueError, TypeError):
                 value = 0
+        # Convert boolean attributes from XML strings to Python bools.
+        # y-prosemirror expects actual booleans, not "true"/"false" strings.
+        elif mapped_key in ("checked", "collapsed"):
+            if isinstance(value, str):
+                value = value.lower() == "true"
+            else:
+                value = bool(value)
         result[mapped_key] = value
     return result
 
@@ -1697,16 +1723,16 @@ class DocumentWriter:
                 attrs: dict[str, Any] = {
                     "listType": list_type,
                     "data-block-id": block_id,
+                    "indent": base_indent,   # Always set, even at 0
+                    "collapsed": False,      # TipTap requires this
+                    "checked": False,        # TipTap requires this on all listItems
                 }
-                if base_indent > 0:
-                    attrs["indent"] = base_indent
 
                 # For task items, handle checked state
                 if list_type == "task" or child.tag == "taskItem":
                     attrs["listType"] = "task"
                     checked = child.get("data-checked") == "true" or child.get("checked") == "true"
-                    if checked:
-                        attrs["checked"] = True
+                    attrs["checked"] = checked
 
                 items.append(pycrdt.XmlElement(
                     "listItem",
@@ -1779,6 +1805,14 @@ class DocumentWriter:
 
         # Build attributes, mapping XML names to TipTap internal names
         attrs = _map_block_attrs(elem.tag, dict(elem.attrib))
+
+        # Inject TipTap-required defaults for attributes that must always be present.
+        # y-prosemirror expects all ProseMirror schema-defined attrs in Y.js elements;
+        # missing attrs trigger normalization that can nuke MCP-written content.
+        defaults = BLOCK_DEFAULTS.get(elem.tag, {})
+        for key, default_value in defaults.items():
+            if key not in attrs:
+                attrs[key] = default_value
 
         # Ensure valid unique data-block-id for block types
         if elem.tag in BLOCK_TYPES:
