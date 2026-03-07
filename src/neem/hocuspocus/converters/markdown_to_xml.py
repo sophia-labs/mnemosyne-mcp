@@ -14,9 +14,14 @@ self-closing <footnote/> elements.
 from __future__ import annotations
 
 import html
+import re
 from typing import Any, Dict, List, Optional
 
 import mistune
+
+# Placeholder injected by _preprocess_tab_indents, removed by _postprocess_tab_indents.
+# Uses a string unlikely to appear in normal content.
+_INDENT_PLACEHOLDER = "\x02INDENT:"  # STX control char prefix
 
 
 # Singleton parser with plugins enabled
@@ -26,8 +31,66 @@ _md_parser = mistune.create_markdown(
 )
 
 
+_LIST_ITEM_RE = re.compile(r"^[-*+]\s|^\d+\.\s|^[-*+]\s+\[[ xX]\]")
+_INDENT_POST_RE = re.compile(
+    r"<paragraph>" + re.escape(_INDENT_PLACEHOLDER) + r"(\d+)\x02"
+)
+
+
+def _preprocess_tab_indents(text: str) -> str:
+    """Replace leading tab characters with placeholders before markdown parsing.
+
+    Lines starting with tabs (outside code fences, not list items) get their
+    tabs replaced with an inline marker. After markdown parsing, the marker
+    is converted to a data-indent attribute on the resulting paragraph.
+    """
+    lines = text.split("\n")
+    result: list[str] = []
+    in_code_fence = False
+
+    for line in lines:
+        stripped = line.lstrip()
+
+        # Track code fences
+        if stripped.startswith("```"):
+            in_code_fence = not in_code_fence
+            result.append(line)
+            continue
+
+        if in_code_fence:
+            result.append(line)
+            continue
+
+        # Count leading tabs
+        tab_count = 0
+        for ch in line:
+            if ch == "\t":
+                tab_count += 1
+            else:
+                break
+
+        if tab_count > 0:
+            content_after_tabs = line[tab_count:]
+            # Don't process list items — their indentation is handled by markdown
+            if not _LIST_ITEM_RE.match(content_after_tabs):
+                result.append(f"{_INDENT_PLACEHOLDER}{tab_count}\x02{content_after_tabs}")
+                continue
+
+        result.append(line)
+
+    return "\n".join(result)
+
+
+def _postprocess_tab_indents(xml: str) -> str:
+    """Convert indent placeholders in paragraph XML to data-indent attributes."""
+    return _INDENT_POST_RE.sub(r'<paragraph data-indent="\1">', xml)
+
+
 def markdown_to_tiptap_xml(md_str: str) -> str:
     """Convert a Markdown string to TipTap XML.
+
+    Supports tab-indented paragraphs: leading tab characters on a line
+    set the paragraph's data-indent level (1 tab = indent 1, etc.).
 
     Args:
         md_str: Markdown content.
@@ -37,6 +100,9 @@ def markdown_to_tiptap_xml(md_str: str) -> str:
     """
     if not md_str or not md_str.strip():
         return ""
+
+    # Pre-process: convert leading tabs to placeholders
+    md_str = _preprocess_tab_indents(md_str)
 
     ast = _md_parser(md_str)
     if not ast:
@@ -51,7 +117,10 @@ def markdown_to_tiptap_xml(md_str: str) -> str:
         if xml:
             parts.append(xml)
 
-    return "".join(parts)
+    xml_result = "".join(parts)
+
+    # Post-process: convert placeholders to data-indent attributes
+    return _postprocess_tab_indents(xml_result)
 
 
 # ---------------------------------------------------------------------------

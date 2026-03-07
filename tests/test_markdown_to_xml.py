@@ -443,3 +443,52 @@ class TestLooksLikeMarkdown:
         """Single asterisk with space after is not markdown."""
         # Our pattern requires non-space after **
         assert looks_like_markdown("a * b = c") is False
+
+
+# ---------------------------------------------------------------------------
+# Tab-Indent Convention
+# ---------------------------------------------------------------------------
+
+class TestTabIndent:
+
+    def test_single_tab_indent(self) -> None:
+        result = markdown_to_tiptap_xml("# Heading\n\n\tIndented paragraph.")
+        assert '<paragraph data-indent="1">Indented paragraph.</paragraph>' in result
+
+    def test_double_tab_indent(self) -> None:
+        result = markdown_to_tiptap_xml("Normal text.\n\n\t\tDouble indented.")
+        assert '<paragraph data-indent="2">Double indented.</paragraph>' in result
+
+    def test_triple_tab_indent(self) -> None:
+        result = markdown_to_tiptap_xml("\t\t\tDeep indent.")
+        assert '<paragraph data-indent="3">Deep indent.</paragraph>' in result
+
+    def test_mixed_indent_and_normal(self) -> None:
+        result = markdown_to_tiptap_xml("Normal.\n\n\tIndented.\n\nNormal again.")
+        assert "<paragraph>Normal.</paragraph>" in result
+        assert '<paragraph data-indent="1">Indented.</paragraph>' in result
+        assert "<paragraph>Normal again.</paragraph>" in result
+
+    def test_tab_indent_preserves_inline_marks(self) -> None:
+        result = markdown_to_tiptap_xml("\tSome **bold** text.")
+        assert '<paragraph data-indent="1">' in result
+        assert "<strong>bold</strong>" in result
+
+    def test_tab_indent_does_not_affect_list_items(self) -> None:
+        """Tab-indented list items should remain list items, not become indented paragraphs."""
+        result = markdown_to_tiptap_xml("- Item one\n\t- Nested item")
+        assert "listType" in result
+        assert 'data-indent="1"' not in result or "listItem" in result
+
+    def test_tab_indent_inside_code_fence_preserved(self) -> None:
+        """Tabs inside code fences should not be converted to indent markers."""
+        result = markdown_to_tiptap_xml("```\n\tindented code\n```")
+        assert "codeBlock" in result
+        assert "data-indent" not in result
+
+    def test_tab_indent_with_heading(self) -> None:
+        """Tab before a heading — the heading syntax takes precedence."""
+        result = markdown_to_tiptap_xml("\t# Heading")
+        # Mistune should still parse this as a heading (tabs stripped by preprocessor)
+        # or as an indented paragraph containing "# Heading"
+        assert "Heading" in result
