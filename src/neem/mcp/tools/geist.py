@@ -471,7 +471,7 @@ async def _sparql_query(
         base_url=backend_config.base_url,
         auth=auth,
         task_type="run_query",
-        payload={"sparql": sparql, "result_format": "json"},
+        payload={"sparql": sparql, "result_format": "json", "graph_id": graph_id},
     )
 
     result = await _wait_for_job_result(job_stream, metadata, auth)
@@ -563,7 +563,7 @@ async def _sparql_update(
         base_url=backend_config.base_url,
         auth=auth,
         task_type="apply_update",
-        payload={"sparql": sparql_stripped},
+        payload={"sparql": sparql_stripped, "graph_id": graph_id},
     )
 
     result = await _wait_for_job_result(job_stream, metadata, auth)

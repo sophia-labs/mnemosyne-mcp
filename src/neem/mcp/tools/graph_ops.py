@@ -221,6 +221,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             payload={
                 "sparql": sparql,
                 "result_format": result_format,
+                "graph_id": graph_id,
             },
         )
 
@@ -345,7 +346,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             base_url=backend_config.base_url,
             auth=auth,
             task_type="apply_update",
-            payload={"sparql": sparql},
+            payload={"sparql": sparql, "graph_id": graph_id},
         )
 
         if context:

@@ -364,7 +364,7 @@ GROUP BY ?docId
                 base_url=backend_config.base_url,
                 auth=auth,
                 task_type="run_query",
-                payload={"sparql": sparql, "result_format": "json"},
+                payload={"sparql": sparql, "result_format": "json", "graph_id": graph_id},
             )
 
             ws_events, poll_payload = await await_job_completion(
