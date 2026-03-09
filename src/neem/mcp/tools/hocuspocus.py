@@ -76,6 +76,25 @@ def _ensure_xml_multiblock(text: str) -> str:
     )
 
 
+def _get_document_timestamps(doc_meta: Dict[str, Any]) -> tuple[Any | None, Any | None]:
+    """Extract created/updated timestamps from workspace document metadata.
+
+    Returns:
+        (created_at, updated_at) where either value may be None.
+    """
+    if not isinstance(doc_meta, dict):
+        return None, None
+
+    created_at = doc_meta.get("createdAt") or doc_meta.get("created_at")
+    updated_at = (
+        doc_meta.get("updatedAt")
+        or doc_meta.get("updated_at")
+        or doc_meta.get("lastModified")
+        or doc_meta.get("last_modified")
+    )
+    return created_at, updated_at
+
+
 def register_hocuspocus_tools(server: FastMCP) -> None:
     """Register document tools that use the Hocuspocus WebSocket client."""
 
@@ -961,10 +980,8 @@ Formats (set via 'format' parameter):
 - 'markdown': Clean Markdown. Use this when you just need to read/understand a document's content without editing it. Much more compact than XML.
 - 'ids_only': Returns just the ordered list of block IDs and count, no content. Use this when you already know the content but need block IDs for wiring or editing.
 
-XML block types: paragraph, heading (level="1-3"), bulletList, orderedList, blockquote, codeBlock (language="..."), taskList (taskItem checked="true"), horizontalRule, image (src="...", alt="...")
-XML marks (nestable): strong, em, strike, code, mark (highlight), a (href="..."), footnote (data-footnote-content="..."), commentMark (data-comment-id="...")
-
 Also returns wire counts: document-level (outgoing, incoming, total) and block-level (which blocks have wires attached). Use get_wires for full wire details.
+Also returns `updated_at` (last-modified timestamp). If unavailable, it falls back to `created_at`.
 
 Works for all documents including uploaded files (which are documents with readOnly=true).
 
@@ -1038,7 +1055,7 @@ Always returns fresh content — automatically reconnects if the cached channel 
                 "comments": comments,
             }
 
-            # Add wire counts — overall totals + per-block breakdown
+            # Add timestamp metadata + wire counts (both non-fatal if unavailable).
             try:
                 workspace_doc, _ = await _load_workspace_doc_for_read(
                     graph_id,
@@ -1046,6 +1063,21 @@ Always returns fresh content — automatically reconnects if the cached channel 
                     auth=auth,
                     tool_name="read_document",
                 )
+                ws_reader = WorkspaceReader(workspace_doc)
+                doc_meta = ws_reader.get_document(document_id) or {}
+
+                # Return last-modified only; if missing, fall back to created timestamp.
+                try:
+                    created_at, updated_at = _get_document_timestamps(doc_meta)
+                    last_modified = updated_at or created_at
+                    if last_modified is not None:
+                        result["updated_at"] = last_modified
+                except Exception as ts_err:
+                    logger.debug(
+                        "Failed to extract document timestamp for read_document (non-fatal)",
+                        extra_context={"document_id": document_id, "error": str(ts_err)},
+                    )
+
                 outgoing = _get_wires_for_document(workspace_doc, document_id, "outgoing")
                 incoming = _get_wires_for_document(workspace_doc, document_id, "incoming")
                 total = len(outgoing) + len(incoming)
@@ -1106,9 +1138,7 @@ Always returns fresh content — automatically reconnects if the cached channel 
             "reading for comprehension rather than editing. block_type is omitted for "
             "plain paragraphs (included for headings, codeBlocks, etc.).\n\n"
             "Returns: blocks list, total_blocks count, has_more flag, and "
-            "next_offset for easy pagination.\n\n"
-            "Always returns fresh content — automatically reconnects if cached state "
-            "is older than 2 seconds, and retries once on sync timeout."
+            "next_offset for easy pagination."
         ),
     )
     async def read_blocks_tool(
@@ -1244,16 +1274,14 @@ Always returns fresh content — automatically reconnects if the cached channel 
             "without fetching full content. Includes:\n\n"
             "- **metadata**: title, folder path, readOnly status\n"
             "- **size**: block count, character count, word count\n"
-            "- **freshness**: created_at timestamp\n"
+            "- **freshness**: created_at and updated_at timestamps\n"
             "- **headings**: section headings extracted from document structure\n"
             "- **wire_summary**: incoming/outgoing counts, predicate distribution, "
             "top connected documents\n"
             "- **valuation_summary**: top valued blocks with scores and excerpts\n\n"
             "Use this to decide whether a full read_document is needed. Much cheaper "
             "than reading the full document when you only need to understand what it "
-            "contains and how it connects.\n\n"
-            "Always returns fresh content — automatically reconnects if cached state "
-            "is older than 2 seconds, and retries once on sync timeout."
+            "contains and how it connects."
         ),
     )
     async def document_digest_tool(
@@ -1484,8 +1512,21 @@ LIMIT {top_valued}
                 "metadata": metadata,
                 "size": size,
             }
-            if doc_meta.get("createdAt"):
-                result["freshness"] = {"created_at": doc_meta["createdAt"]}
+            try:
+                created_at, updated_at = _get_document_timestamps(doc_meta)
+                last_modified = updated_at or created_at
+                freshness: Dict[str, Any] = {}
+                if created_at is not None:
+                    freshness["created_at"] = created_at
+                if last_modified is not None:
+                    freshness["updated_at"] = last_modified
+                if freshness:
+                    result["freshness"] = freshness
+            except Exception as ts_err:
+                logger.debug(
+                    "Failed to extract document timestamps for digest (non-fatal)",
+                    extra_context={"document_id": document_id, "error": str(ts_err)},
+                )
             if headings:
                 result["headings"] = headings
             if wire_summary:
@@ -1513,28 +1554,20 @@ LIMIT {top_valued}
 
 WARNING: This REPLACES all content. For collaborative editing, prefer append_to_document.
 
-Plain text is accepted: if the content doesn't start with '<', each paragraph (separated by blank lines) is auto-wrapped in <paragraph> tags. Use XML when you need formatting or specific block types.
-
-Blocks: paragraph, heading (level="1-3"), bulletList, orderedList, blockquote, codeBlock (language="..."), taskList (taskItem checked="true"), horizontalRule, image (src="...", alt="...")
-Marks (nestable): strong, em, strike, code, mark (highlight), a (href="..."), footnote (data-footnote-content="..."), commentMark (data-comment-id="...")
-Example: <paragraph>Text with <mark>highlight</mark> and a note<footnote data-footnote-content="This is a footnote"/></paragraph>
-
-IMPORTANT: Container blocks (blockquote, tableCell, tableHeader) require paragraph children — they cannot contain inline text directly. Auto-wrapping is applied as a fallback, but prefer explicit wrapping: <blockquote><paragraph>text</paragraph></blockquote>
+Accepts plain text (auto-wrapped in <paragraph> tags), markdown (auto-converted), or TipTap XML. See server instructions for XML block types and marks reference.
 
 Comments: Pass a dict mapping comment IDs to metadata. Comment IDs must match data-comment-id attributes in the content.
 Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}
 
-Markdown is also accepted and auto-converted to TipTap XML.
-
-Indentation: Use tab characters at the start of a line to set paragraph indent level (1 tab = indent 1, 2 tabs = indent 2, etc.). Indentation creates visual hierarchy in the document — use it for sub-points, supporting details, or outline structure. Tabs inside code fences and on list items are not affected.
+Indentation: Use tab characters at the start of a line to set paragraph indent level (1 tab = indent 1, 2 tabs = indent 2, etc.). Creates visual hierarchy. Tabs inside code fences and on list items are not affected.
 
 Returns block_ids: an ordered list of all block IDs in the written document, enabling immediate block-level wiring without a separate read call.
 
 `await_durable` (default true) forces post-write verification through a fresh document channel rather than the same cached channel.
 
-NOT for: editing existing documents (use edit_block_text, update_blocks, or insert_block instead). Only use write_document for brand-new documents or when the user explicitly asks for a full rewrite.
+For modifying parts of an existing document, prefer surgical block tools (edit_block_text, update_blocks, insert_block). Use write_document when replacing the full content of a document.
 
-Write tools use a persistent cached channel (no automatic reconnect like read tools). In multi-agent environments, always call read_document first to get current content before writing — this ensures your channel has the latest state from the server. CRDT merge prevents data corruption, but writing without reading first may silently overwrite another agent's recent changes.""",
+Read the document first in multi-agent environments (see Write Tool Guidance in server instructions).""",
     )
     async def write_document_tool(
         graph_id: str,
@@ -1662,8 +1695,6 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             "Indentation: Use tab characters at the start of a line to set paragraph indent level "
             "(1 tab = indent 1, 2 tabs = indent 2). Creates visual hierarchy for sub-points and "
             "supporting details. Tabs inside code fences and on list items are not affected.\n\n"
-            "Container blocks (blockquote, tableCell, tableHeader) require paragraph children. "
-            "Auto-wrapping is applied as a fallback, but prefer: <blockquote><paragraph>text</paragraph></blockquote>\n\n"
             "For appending to documents written by other agents, call read_document first to sync "
             "the channel — otherwise the append may conflict with content you haven't seen yet."
         ),
@@ -2168,68 +2199,131 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             raise RuntimeError(f"Failed to move folder: {e}")
 
     @server.tool(
-        name="rename_folder",
-        title="Rename Folder",
-        description="Rename a folder's display label.",
+        name="rename",
+        title="Rename Entity",
+        description=(
+            "Rename a document, folder, or graph. Sets the user-facing display name "
+            "without changing the entity's ID.\n\n"
+            "entity_type: 'document', 'folder', or 'graph'.\n"
+            "entity_id: required for document and folder (the ID within the graph). "
+            "For graph, the graph_id itself is renamed — entity_id is not needed."
+        ),
     )
-    async def rename_folder_tool(
+    async def rename_tool(
         graph_id: str,
-        folder_id: str,
-        new_label: str,
+        new_name: str,
+        entity_type: str,
+        entity_id: str | None = None,
         context: Context | None = None,
     ) -> dict:
-        """Rename a folder via Y.js."""
+        """Rename a document, folder, or graph via Y.js or job queue."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required and cannot be empty")
-        if not folder_id or not folder_id.strip():
-            raise ValueError("folder_id is required and cannot be empty")
-        if not new_label or not new_label.strip():
-            raise ValueError("new_label is required and cannot be empty")
+        if not new_name or not new_name.strip():
+            raise ValueError("new_name is required and cannot be empty")
+
+        graph_id = graph_id.strip()
+        new_name = new_name.strip()
+        entity_type = entity_type.strip().lower()
+
+        if entity_type not in ("document", "folder", "graph"):
+            raise ValueError(f"entity_type must be 'document', 'folder', or 'graph', got '{entity_type}'")
+
+        if entity_type in ("document", "folder"):
+            if not entity_id or not entity_id.strip():
+                raise ValueError(f"entity_id is required for entity_type '{entity_type}'")
+            entity_id = entity_id.strip()
 
         try:
-            await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
+            if entity_type == "graph":
+                # Graph rename via job queue
+                if job_stream:
+                    try:
+                        await job_stream.ensure_ready()
+                    except Exception:
+                        pass
 
-            # Verify folder exists
-            channel = hp_client.get_workspace_channel(graph_id.strip(), user_id=auth.user_id)
+                metadata = await submit_job(
+                    base_url=backend_config.base_url,
+                    auth=auth,
+                    task_type="update_graph_metadata",
+                    payload={
+                        "graph_id": graph_id,
+                        "title": new_name,
+                        "title_set": True,
+                    },
+                )
+
+                await await_job_completion(
+                    job_stream, metadata, auth, timeout=30.0,
+                )
+
+                return {
+                    "success": True,
+                    "entity_type": "graph",
+                    "graph_id": graph_id,
+                    "new_name": new_name,
+                }
+
+            # Document or folder rename via workspace CRDT
+            await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
+
+            channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
             if channel is None:
                 raise RuntimeError(f"Workspace not connected: {graph_id}")
 
             reader = WorkspaceReader(channel.doc)
-            current = reader.get_folder(folder_id.strip())
 
-            if not current:
-                raise RuntimeError(f"Folder '{folder_id}' not found in graph '{graph_id}'")
+            if entity_type == "folder":
+                current = reader.get_folder(entity_id)
+                if not current:
+                    raise RuntimeError(f"Folder '{entity_id}' not found in graph '{graph_id}'")
 
-            # Update folder name via Y.js
-            await hp_client.transact_workspace(
-                graph_id.strip(),
-                lambda doc: WorkspaceWriter(doc).update_folder(
-                    folder_id.strip(),
-                    name=new_label.strip(),
-                ),
-                user_id=auth.user_id,
-            )
+                await hp_client.transact_workspace(
+                    graph_id,
+                    lambda doc: WorkspaceWriter(doc).update_folder(
+                        entity_id,
+                        name=new_name,
+                    ),
+                    user_id=auth.user_id,
+                )
+            else:
+                # entity_type == "document"
+                current = reader.get_document(entity_id)
+                if not current:
+                    raise RuntimeError(f"Document '{entity_id}' not found in graph '{graph_id}'")
+
+                await hp_client.transact_workspace(
+                    graph_id,
+                    lambda doc: WorkspaceWriter(doc).update_document(
+                        entity_id,
+                        title=new_name,
+                    ),
+                    user_id=auth.user_id,
+                )
 
             return {
                 "success": True,
-                "folder_id": folder_id.strip(),
-                "graph_id": graph_id.strip(),
-                "new_label": new_label.strip(),
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "graph_id": graph_id,
+                "new_name": new_name,
             }
 
         except Exception as e:
             logger.error(
-                "Failed to rename folder",
+                "Failed to rename entity",
                 extra_context={
                     "graph_id": graph_id,
-                    "folder_id": folder_id,
+                    "entity_type": entity_type,
+                    "entity_id": entity_id,
                     "error": str(e),
                 },
             )
-            raise RuntimeError(f"Failed to rename folder: {e}")
+            raise RuntimeError(f"Failed to rename {entity_type}: {e}")
 
     # ------------------------------------------------------------------
     # Helper: hard-delete a document via backend REST API
@@ -2940,9 +3034,7 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             "Use when you need raw markup or precise formatting details.\n"
             "- 'markdown': Compact markdown rendering of the block. Recommended for agent workflows "
             "that just need to read content.\n"
-            "- 'text': Plain text only. Most compact — use when you only need the text, not structure.\n\n"
-            "Always returns fresh content — automatically reconnects if cached state "
-            "is older than 2 seconds, and retries once on sync timeout."
+            "- 'text': Plain text only. Most compact — use when you only need the text, not structure."
         ),
     )
     async def get_block_tool(
@@ -3025,8 +3117,6 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             "Search for blocks matching specific criteria. Filter by block type, indent level, "
             "list type, checked state, or text content. Returns a list of matching block summaries. "
             "Use this to find blocks without reading the entire document.\n\n"
-            "Always returns fresh content — automatically reconnects if cached state "
-            "is older than 2 seconds, and retries once on sync timeout.\n\n"
             "NOTE: This is a single-document structural filter — it queries one document's CRDT state "
             "directly, with no backend round-trip. Use it for structural navigation within a document "
             "(e.g., find all headings, find checked tasks, find blocks at indent level 2). "
@@ -3103,10 +3193,8 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             "Can update attributes (indent, checked, listType) without changing content, "
             "or replace entire block content. Plain text in xml_content is auto-wrapped "
             "in a <paragraph>. Markdown is also accepted and auto-converted.\n\n"
-            "Container blocks (blockquote, tableCell, tableHeader) require paragraph children — "
-            "auto-wrapping applied as fallback, but prefer explicit: <blockquote><paragraph>text</paragraph></blockquote>\n\n"
             "Always read the document or block first (read_document or get_block) before updating — "
-            "write tools use a cached channel and need a preceding read to sync latest state from the server."
+            "write tools use a cached channel and need a preceding read to sync latest state."
         ),
     )
     async def update_blocks_tool(
@@ -3307,17 +3395,13 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
             "to specify where to insert. Returns the new block's generated ID. "
             "For appending to the end, use append_to_document instead. "
             "Plain text in xml_content is auto-wrapped in a <paragraph>. "
-            "Container blocks (blockquote, tableCell, tableHeader) require paragraph children — "
-            "auto-wrapping applied as fallback, but prefer explicit: <blockquote><paragraph>text</paragraph></blockquote> "
             "Markdown is also accepted and auto-converted.\n\n"
-            "Always read the document first (read_document or get_block) before inserting — "
-            "write tools use a cached channel and need a preceding read to sync latest state from the server. "
+            "Read the document first (read_document or get_block) before inserting — "
+            "write tools need a preceding read to sync latest state. "
             "Never call insert_block in parallel with other write operations on the same document. "
             "For inserting multiple blocks sequentially, use the new_block_id returned from each call "
-            "as the reference_block_id for the next — document state changes after each insert and "
-            "parallel calls with stale block IDs produce unpredictable ordering. "
-            "To add multiple blocks at once without chaining, prefer append_to_document instead "
-            "(handles multiple blocks in a single atomic call)."
+            "as the reference_block_id for the next — document state changes after each insert. "
+            "To add multiple blocks at once without chaining, prefer append_to_document instead."
         ),
     )
     async def insert_block_tool(
@@ -3401,8 +3485,8 @@ Write tools use a persistent cached channel (no automatic reconnect like read to
         description=(
             "Delete a block by its ID. Use cascade=true to also delete all subsequent blocks "
             "with higher indent (indent-based children). Returns the list of deleted block IDs.\n\n"
-            "Always read the document first (read_document) before deleting — "
-            "write tools use a cached channel and need a preceding read to sync latest state from the server."
+            "Read the document first (read_document) before deleting — "
+            "write tools need a preceding read to sync latest state."
         ),
     )
     async def delete_block_tool(
