@@ -278,6 +278,17 @@ LITE_TOOLS: frozenset[str] = frozenset({
     "recall",
 })
 
+# Tools excluded from the "hivemind" profile — Sophia agent sessions.
+# These are browser-only, operator-only, or unused by agents.
+HIVEMIND_EXCLUDED: frozenset[str] = frozenset({
+    "get_session_state",    # browser UI state — irrelevant to agents
+    "upload_artifact",      # file upload — not used by hivemind
+    "ingest_artifact",      # artifact ingestion — not used by hivemind
+    "dump_chat",            # browser chat log dump — not used by agents
+    "quick_orient",         # deprecated lightweight orient — unused
+    "reindex_graph",        # admin maintenance — agents shouldn't trigger re-indexing
+})
+
 
 def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
     """
@@ -324,46 +335,21 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
             "deeper folders show document counts). Use folder_id to drill into a subtree, "
             "min_score to filter by document-level valuation scores\n"
             "- get_session_state: Full UI state including tabs and preferences (large payload, rarely needed)\n\n"
-            "**SPARQL Namespace Reference (IMPORTANT):**\n"
-            "When writing SPARQL queries, use these exact prefixes:\n"
-            "  PREFIX doc: <http://mnemosyne.dev/doc#>\n"
-            "  PREFIX dcterms: <http://purl.org/dc/terms/>\n"
-            "  PREFIX nfo: <http://www.semanticdesktop.org/ontologies/2007/03/22/nfo#>\n"
-            "  PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n"
-            "  PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n"
-            "  PREFIX nie: <http://www.semanticdesktop.org/ontologies/2007/01/19/nie#>\n"
-            "  PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n"
-            "WARNING: Do NOT use 'urn:mnemosyne:schema:doc:' as the doc namespace - "
-            "it will match nothing. The correct namespace is 'http://mnemosyne.dev/doc#'.\n\n"
-            "**Common RDF Types and Predicates:**\n"
-            "- doc:TipTapDocument - Document entity type\n"
-            "- doc:Folder - Folder entity type\n"
-            "- doc:Artifact - Uploaded file entity type\n"
-            "- doc:XmlFragment - Document content root\n"
-            "- doc:Paragraph, doc:Heading, doc:TextNode - Block/node types\n"
-            "- dcterms:title - Document/entity title\n"
-            "- nfo:fileName - Artifact/folder display name\n"
-            "- nfo:belongsToContainer - Parent folder relationship\n"
-            "- doc:order - Sort order (float timestamp)\n"
-            "- doc:section - Sidebar section ('documents' or 'artifacts')\n"
-            "- doc:content - Text content of a node\n"
-            "- doc:childNode - Parent-to-child block relationship\n"
-            "- doc:siblingOrder - Order among sibling blocks\n\n"
-            "**Entity URI Pattern:**\n"
-            "  urn:mnemosyne:user:{user_id}:graph:{graph_id}:{type}:{entity_id}\n"
-            "  Content fragments use # suffixes: ...doc:{id}#frag, ...doc:{id}#block-{block_id}\n\n"
+            "**SPARQL:** Use `PREFIX doc: <http://mnemosyne.dev/doc#>` (NEVER `urn:mnemosyne:schema:doc:`). "
+            "Document type is `doc:TipTapDocument`. Wires use `PREFIX mnemo: <http://mnemosyne.ai/vocab#>`. "
+            "Load the `sparql` skill for full namespace reference, predicates, and query patterns.\n\n"
             "Documents are synced in real-time via Y.js CRDT, so changes appear "
             "immediately in the Mnemosyne web UI.\n\n"
             "**Geist (Sophia Memory Tools):**\n"
             "Memory, valuation, and self-narrative tools for agent continuity.\n"
             "- Orientation flow: get_user_location → music() → recall() → get_workspace()\n"
             "- music/sing: Read/write the Song (narrative orientation before structural orientation)\n"
-            "- store_memory/recall/care: Working memory queue (FIFO, numbered, append-only)\n"
+            "- remember/recall/care: Working memory queue (FIFO, numbered, append-only)\n"
             "- valuate/get_block_values: Block-level importance (0-5) and valence (-5 to +5) scoring\n"
             "- get_values/revaluate: Read/update scoring configuration\n"
-            "- recall only searches the memory queue — use get_block_values for graph-wide retrieval\n"
+            "- recall only searches the memory queue — use search_blocks for cross-document content discovery\n"
             "- valuate works on any block in any document, not just the queue\n"
-            "- store_memory is for the agent's own working memory; append_to_document is for user-facing content\n"
+            "- remember is for the agent's own working memory; append_to_document is for user-facing content\n"
             "- Wires express relationships between things; valuation expresses judgment about a single thing\n\n"
             "**Search:**\n"
             "- search_documents: Fast title/path search against workspace (no SPARQL needed). Modes: auto (default), exact, substring, regex\n"
@@ -372,6 +358,20 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
             "CRDT-native, instant, no backend round-trip. Use for structural navigation within one document; use search_blocks for cross-document discovery\n"
             "- reindex_graph: Re-embed all documents (admin/maintenance, auto-indexes on save)\n"
             "- recall with query param uses hybrid search: memory queue + vector similarity merged via RRF\n\n"
+            "**TipTap XML Reference:**\n"
+            "Block types: paragraph, heading (level=\"1-3\"), bulletList, orderedList, blockquote, "
+            "codeBlock (language=\"...\"), taskList (taskItem checked=\"true\"), horizontalRule, "
+            "image (src=\"...\", alt=\"...\")\n"
+            "Inline marks (nestable): strong, em, strike, code, mark (highlight), a (href=\"...\"), "
+            "footnote (data-footnote-content=\"...\"), commentMark (data-comment-id=\"...\")\n"
+            "Container blocks (blockquote, tableCell, tableHeader) require <paragraph> children — "
+            "they cannot contain inline text directly.\n\n"
+            "**Write Tool Guidance:**\n"
+            "Read tools auto-reconnect for freshness (2s staleness threshold, 1 retry on sync timeout). "
+            "Write tools use a persistent cached channel — always call a read tool first "
+            "(read_document or get_block) to sync the channel before writing. "
+            "CRDT merge prevents corruption, but writing without reading first may silently "
+            "overwrite another agent's recent changes.\n\n"
             "When making function calls using tools that accept array or object parameters "
             "ensure those are structured using JSON."
         ),
@@ -431,6 +431,17 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
                 "kept": len(all_names - to_remove),
                 "removed": len(to_remove),
             },
+        )
+
+    elif active_profile == "hivemind":
+        for name in HIVEMIND_EXCLUDED:
+            try:
+                mcp_server.remove_tool(name)
+            except (KeyError, ToolError):
+                pass
+        logger.info(
+            "Hivemind profile applied",
+            extra_context={"excluded": len(HIVEMIND_EXCLUDED)},
         )
 
     # LOCAL STOPGAP: throttle on every tool call to reduce backend pressure

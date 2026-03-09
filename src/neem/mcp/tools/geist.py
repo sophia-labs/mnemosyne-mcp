@@ -936,8 +936,8 @@ def register_geist_tools(server: FastMCP) -> None:
         description=(
             "Read from the memory queue. Default: return the 5 most-recently-active memories. "
             "Optionally recall a specific memory by number, or search by text query.\n\n"
-            "recall only searches the memory queue — use get_block_values for graph-wide "
-            "block retrieval by importance/valence score."
+            "recall only searches the memory queue — use search_blocks for cross-document "
+            "content discovery, or get_block_values for graph-wide valuation scores."
         ),
     )
     async def recall_tool(
@@ -1350,8 +1350,8 @@ def register_geist_tools(server: FastMCP) -> None:
             "document_id, block_id, and at least one of importance or valence.\n\n"
             "Uses logarithmic accumulation: each valuation adds to a cumulative sum, so "
             "repeated attention builds durable scores. Valuating at 0 = active forgetting.\n\n"
-            "Call get_values first to understand your scoring criteria — the importance and valence "
-            "prompts define what each score means and can evolve over time.\n\n"
+            "Scoring criteria are defined in the graph's valuation config (see get_values). "
+            "The importance and valence prompts can evolve over time.\n\n"
             "Wires express relationships between things; valuation expresses the agent's "
             "judgment about a single thing. Use both."
         ),
@@ -1869,8 +1869,8 @@ LIMIT {min(limit * 3, 200)}
         title="Get Important Blocks",
         description=(
             "Orientation tool: returns the highest-scored blocks in the graph with their "
-            "actual text content and document titles. Use at session start to understand "
-            "what matters most. Optional document_id to scope to one document."
+            "actual text content and document titles. Use during attunement and when entering "
+            "unfamiliar areas of the graph. Optional document_id to scope to one document."
         ),
     )
     async def get_important_blocks_tool(

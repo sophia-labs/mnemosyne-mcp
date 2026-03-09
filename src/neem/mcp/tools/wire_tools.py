@@ -466,8 +466,8 @@ def register_wire_tools(server: FastMCP) -> None:
             "Use list_wire_predicates to see available predicates. "
             "Accepts short predicate names (e.g. 'supports', 'intensifiesWith').\n\n"
             "Always read both documents before wiring — choose predicates based on actual content, not just titles. "
-            "Prefer block-level wires for precise links. Don't default to 'relatedTo' when a more specific "
-            "predicate fits (supports, exemplifies, flowsInto, etc.)."
+            "Prefer block-level wires for precise links. Prefer specific predicates when they capture the "
+            "actual relationship — relatedTo is valid when no specific predicate fits."
         ),
     )
     async def create_wires_tool(
@@ -769,12 +769,10 @@ def register_wire_tools(server: FastMCP) -> None:
         name="traverse_wires",
         title="Traverse Wire Graph",
         description=(
-            "Traverse the wire graph starting from a document, following connections "
+            "BFS traversal of the wire graph starting from a document, following connections "
             "up to a specified depth. Returns all reachable documents and the paths "
-            "connecting them. Useful for discovering related content, understanding "
-            "document clusters, and exploring knowledge structure. "
-            "Results include document titles and wire metadata, making this useful for "
-            "quickly mapping the conceptual neighborhood of a document. "
+            "connecting them, with document titles and wire metadata. "
+            "Use for mapping a document's conceptual neighborhood. "
             "Optionally filter by predicate to follow only specific relationship types."
         ),
     )
