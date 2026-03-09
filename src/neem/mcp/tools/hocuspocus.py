@@ -76,8 +76,51 @@ def _ensure_xml_multiblock(text: str) -> str:
     )
 
 
-def _get_document_timestamps(doc_meta: Dict[str, Any]) -> tuple[Any | None, Any | None]:
-    """Extract created/updated timestamps from workspace document metadata.
+def _normalize_timestamp_to_iso(value: Any) -> str | None:
+    """Normalize timestamp-like values to ISO-8601 UTC.
+
+    Accepts:
+    - epoch seconds (int/float)
+    - epoch milliseconds (int/float or numeric string)
+    - ISO-8601 strings
+    Returns None when value is missing or cannot be parsed.
+    """
+    if value is None:
+        return None
+
+    # Numeric timestamps (or numeric strings): detect seconds vs milliseconds.
+    numeric: float | None = None
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            numeric = float(raw)
+        except ValueError:
+            # Try ISO-8601 parsing path
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc).isoformat()
+            except Exception:
+                return None
+
+    if numeric is None:
+        return None
+
+    try:
+        # Heuristic: > 1e11 is effectively always milliseconds for our data.
+        ts_seconds = numeric / 1000.0 if abs(numeric) > 1e11 else numeric
+        return datetime.fromtimestamp(ts_seconds, tz=timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def _get_document_timestamps(doc_meta: Dict[str, Any]) -> tuple[str | None, str | None]:
+    """Extract and normalize created/updated timestamps from document metadata.
 
     Returns:
         (created_at, updated_at) where either value may be None.
@@ -85,14 +128,14 @@ def _get_document_timestamps(doc_meta: Dict[str, Any]) -> tuple[Any | None, Any 
     if not isinstance(doc_meta, dict):
         return None, None
 
-    created_at = doc_meta.get("createdAt") or doc_meta.get("created_at")
-    updated_at = (
+    created_raw = doc_meta.get("createdAt") or doc_meta.get("created_at")
+    updated_raw = (
         doc_meta.get("updatedAt")
         or doc_meta.get("updated_at")
         or doc_meta.get("lastModified")
         or doc_meta.get("last_modified")
     )
-    return created_at, updated_at
+    return _normalize_timestamp_to_iso(created_raw), _normalize_timestamp_to_iso(updated_raw)
 
 
 def register_hocuspocus_tools(server: FastMCP) -> None:
