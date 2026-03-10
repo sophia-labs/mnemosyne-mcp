@@ -3615,6 +3615,93 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             )
             raise RuntimeError(f"Failed to delete block: {e}")
 
+    @server.tool(
+        name="edit_comment",
+        title="Edit Comment",
+        description=(
+            "Create, update, or delete a comment on a document. Three operations via the 'action' parameter:\n\n"
+            "- **set**: Create a new comment or update an existing one. Requires comment_id and text. "
+            "The comment_id must match a data-comment-id attribute on a <commentMark> span in the document content "
+            "(add the mark via write_document or insert_block first). author defaults to 'Sophia'.\n"
+            "- **resolve**: Mark a comment as resolved (or pass resolved=False to unresolve). Only requires comment_id.\n"
+            "- **delete**: Remove a comment entirely. Only requires comment_id.\n\n"
+            "Always read the document first — write tools use a cached channel and need a preceding read to sync latest state."
+        ),
+    )
+    async def edit_comment_tool(
+        graph_id: str,
+        document_id: str,
+        action: str,
+        comment_id: str,
+        text: Optional[str] = None,
+        author: Optional[str] = None,
+        resolved: Optional[bool] = None,
+        quoted_text: Optional[str] = None,
+        context: Context | None = None,
+    ) -> dict:
+        """Create, update, resolve, or delete a comment."""
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        if action not in ("set", "resolve", "delete"):
+            raise ValueError("action must be one of: set, resolve, delete")
+        if not comment_id:
+            raise ValueError("comment_id is required")
+        if action == "set" and not text:
+            raise ValueError("text is required for action='set'")
+
+        try:
+            await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
+
+            def perform_edit(doc: Any) -> None:
+                writer = DocumentWriter(doc)
+                if action == "delete":
+                    writer.delete_comment(comment_id)
+                elif action == "resolve":
+                    # Read existing comment, flip resolved flag
+                    existing = dict(writer.get_comments_map().get(comment_id) or {})
+                    if not existing:
+                        raise ValueError(f"Comment '{comment_id}' not found")
+                    writer.set_comment(
+                        comment_id=comment_id,
+                        text=existing.get("text", ""),
+                        author=existing.get("author", "Sophia"),
+                        author_id=existing.get("authorId", "mcp-agent"),
+                        resolved=resolved if resolved is not None else True,
+                        quoted_text=existing.get("quotedText"),
+                    )
+                else:  # set
+                    writer.set_comment(
+                        comment_id=comment_id,
+                        text=text,
+                        author=author or "Sophia",
+                        author_id="mcp-agent",
+                        resolved=resolved or False,
+                        quoted_text=quoted_text,
+                    )
+
+            await hp_client.transact_document(
+                graph_id.strip(),
+                document_id.strip(),
+                perform_edit,
+                user_id=auth.user_id,
+            )
+
+            return {"success": True, "comment_id": comment_id, "action": action}
+
+        except Exception as e:
+            logger.error(
+                "Failed to edit comment",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "comment_id": comment_id,
+                    "action": action,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to edit comment: {e}")
+
     # -------------------------------------------------------------------------
     # Batch Operations
     # -------------------------------------------------------------------------
