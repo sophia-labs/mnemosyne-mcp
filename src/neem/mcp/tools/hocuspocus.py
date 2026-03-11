@@ -1250,6 +1250,7 @@ Always returns fresh content — automatically reconnects if the cached channel 
             slice_children = all_children[offset:end]
 
             blocks = []
+            visible_comment_ids: set[str] = set()
             for i, child in enumerate(slice_children):
                 idx = offset + i
                 if not hasattr(child, "attributes"):
@@ -1261,6 +1262,7 @@ Always returns fresh content — automatically reconnects if the cached channel 
 
                 # Get content in requested format
                 xml_str = reader._serialize_element(child)
+                visible_comment_ids.update(re.findall(r'data-comment-id="([^"]+)"', xml_str))
 
                 if fmt == "xml":
                     content = xml_str
@@ -1293,6 +1295,11 @@ Always returns fresh content — automatically reconnects if the cached channel 
             }
             if has_more:
                 result["next_offset"] = end
+            if visible_comment_ids:
+                all_comments = reader.get_all_comments()
+                visible_comments = {cid: all_comments[cid] for cid in visible_comment_ids if cid in all_comments}
+                if visible_comments:
+                    result["comments"] = visible_comments
 
             return result
 
@@ -3139,7 +3146,18 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             else:
                 block = block_info
 
-            return {"block": block}
+            result = {"block": block}
+            block_elem_result = reader.find_block_by_id(block_id.strip())
+            if block_elem_result is not None:
+                _, elem = block_elem_result
+                serialized = reader._serialize_element(elem)
+                comment_ids = re.findall(r'data-comment-id="([^"]+)"', serialized)
+                if comment_ids:
+                    all_comments = reader.get_all_comments()
+                    block_comments = {cid: all_comments[cid] for cid in comment_ids if cid in all_comments}
+                    if block_comments:
+                        result["comments"] = block_comments
+            return result
 
         except Exception as e:
             logger.error(
@@ -3213,7 +3231,22 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 limit=limit,
             )
 
-            return {"count": len(matches), "blocks": matches}
+            result: Dict[str, Any] = {"count": len(matches), "blocks": matches}
+            if matches:
+                matched_ids = {m["block_id"] for m in matches if m.get("block_id")}
+                query_comment_ids: set[str] = set()
+                for child in reader.get_content_fragment().children:
+                    if not hasattr(child, "attributes"):
+                        continue
+                    if dict(child.attributes).get("data-block-id") not in matched_ids:
+                        continue
+                    query_comment_ids.update(re.findall(r'data-comment-id="([^"]+)"', reader._serialize_element(child)))
+                if query_comment_ids:
+                    all_comments = reader.get_all_comments()
+                    query_comments = {cid: all_comments[cid] for cid in query_comment_ids if cid in all_comments}
+                    if query_comments:
+                        result["comments"] = query_comments
+            return result
 
         except Exception as e:
             logger.error(
