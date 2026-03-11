@@ -1870,7 +1870,9 @@ LIMIT {min(limit * 3, 200)}
         description=(
             "Orientation tool: returns the highest-scored blocks in the graph with their "
             "actual text content and document titles. Use during attunement and when entering "
-            "unfamiliar areas of the graph. Optional document_id to scope to one document."
+            "unfamiliar areas of the graph. Optional document_id to scope to a folder "
+            "(e.g. 'folder-xyz') — recursively includes subfolders. For single-document "
+            "valuations, use document_digest instead."
         ),
     )
     async def get_important_blocks_tool(
@@ -1886,14 +1888,49 @@ LIMIT {min(limit * 3, 200)}
 
         graph_id = graph_id.strip()
 
+        # Resolve folder scoping: collect all document IDs under the folder
+        # (recursively) for the SPARQL filter. Non-folder document_id is ignored
+        # — use document_digest for single-document valuations.
+        folder_doc_ids: Optional[list[str]] = None
+        if document_id:
+            document_id = document_id.strip()
+            if document_id.startswith("folder-"):
+                try:
+                    await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
+                    ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
+                    if ws_channel:
+                        ws_reader = WorkspaceReader(ws_channel.doc)
+
+                        def _collect_doc_ids(parent_id: str) -> list[str]:
+                            doc_ids: list[str] = []
+                            for entity_type, entity_id, _ in ws_reader.get_children_of(parent_id):
+                                if entity_type == "document":
+                                    doc_ids.append(entity_id)
+                                elif entity_type == "folder":
+                                    doc_ids.extend(_collect_doc_ids(entity_id))
+                            return doc_ids
+
+                        folder_doc_ids = _collect_doc_ids(document_id)
+                except Exception:
+                    logger.warning("get_important_blocks_folder_resolve_failed", folder_id=document_id)
+                if not folder_doc_ids:
+                    return _render_json({"blocks": [], "count": 0})
+
         # Build SPARQL filter
         filters = []
-        if document_id:
-            doc_prefix = (
-                f"urn:mnemosyne:user:{user_id}:graph:{graph_id}"
-                f":valuation:{document_id.strip()}:"
-            )
-            filters.append(f'FILTER(STRSTARTS(STR(?val), "{doc_prefix}"))')
+        _folder_filter_in_python = False
+        if folder_doc_ids is not None:
+            if len(folder_doc_ids) <= 30:
+                # Small folder: SPARQL-level filtering
+                val_prefix = f"urn:mnemosyne:user:{user_id}:graph:{graph_id}:valuation:"
+                strstarts_clauses = " || ".join(
+                    f'STRSTARTS(STR(?val), "{val_prefix}{did}:")'
+                    for did in folder_doc_ids
+                )
+                filters.append(f"FILTER({strstarts_clauses})")
+            else:
+                # Large folder: fetch all valuations, filter in Python after
+                _folder_filter_in_python = True
 
         if valence == "positive":
             filters.append("FILTER(xsd:float(?cumVal) > 0)")
@@ -1952,6 +1989,20 @@ LIMIT {min(limit * 3, 60)}
             await asyncio.gather(_fetch_rows(), _fetch_weights(), _fetch_wires())
         )
 
+        # Python-side folder filtering for large folders
+        if _folder_filter_in_python and folder_doc_ids is not None:
+            folder_doc_set = set(folder_doc_ids)
+            filtered_rows = []
+            for row in rows:
+                block_ref = row.get("blockRef", "")
+                if "#block-" in block_ref:
+                    pre = block_ref.rpartition("#block-")[0]
+                    if ":doc:" in pre:
+                        did = pre.rpartition(":doc:")[2]
+                        if did in folder_doc_set:
+                            filtered_rows.append(row)
+            rows = filtered_rows
+
         now = datetime.now(timezone.utc)
 
         # Score and rank
@@ -2009,12 +2060,19 @@ LIMIT {min(limit * 3, 60)}
                 "doc_wires": dwc,
             })
 
+        # Build scope set for wire injection filtering
+        _scoped_doc_ids: Optional[set[str]] = None
+        if folder_doc_ids is not None:
+            _scoped_doc_ids = set(folder_doc_ids)
+
         # Inject unvaluated blocks that have wires
         for blk_id, bwc in block_wire_counts.items():
             if blk_id in valuated_block_ids:
                 continue
             doc_id = block_to_doc.get(blk_id, "")
             if not doc_id:
+                continue
+            if _scoped_doc_ids is not None and doc_id not in _scoped_doc_ids:
                 continue
             dwc = doc_wire_counts.get(doc_id, 0)
             wire_age_days = 0.0
