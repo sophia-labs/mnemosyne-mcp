@@ -287,6 +287,41 @@ HIVEMIND_EXCLUDED: frozenset[str] = frozenset({
     "dump_chat",            # browser chat log dump — not used by agents
     "quick_orient",         # deprecated lightweight orient — unused
     "reindex_graph",        # admin maintenance — agents shouldn't trigger re-indexing
+    "list_wire_predicates", # predicate taxonomy is in CLAUDE.md — no need for a tool call
+    "archive_memories",     # rare maintenance op — switch to full profile when needed
+})
+
+# Tools available in the "angel" profile — haiku-class subagents with
+# inherited parent context. Can read, search, wire, append, comment,
+# and valuate — but cannot edit/delete existing content or use
+# continuity tools (sing, remember, care) that imply persistent identity.
+ANGEL_TOOLS: frozenset[str] = frozenset({
+    # Read & search (same as lite)
+    "get_workspace",
+    "read_document",
+    "read_blocks",
+    "document_digest",
+    "get_block",
+    "query_blocks",
+    "search_documents",
+    "search_blocks",
+    # Wires (read + write)
+    "get_wires",
+    "traverse_wires",
+    "create_wires",
+    "list_wire_predicates",  # Angels don't have CLAUDE.md predicate reference
+    # Write (additive only — no edit/delete)
+    "append_to_document",
+    "write_document",
+    "insert_block",
+    "edit_comment",
+    # Geist (attunement + valuation, no continuity)
+    "music",
+    "get_important_blocks",
+    "recall",
+    "valuate",
+    "get_block_values",
+    "get_values",
 })
 
 
@@ -427,6 +462,22 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
                 pass
         logger.info(
             "Lite profile applied",
+            extra_context={
+                "kept": len(all_names - to_remove),
+                "removed": len(to_remove),
+            },
+        )
+
+    elif active_profile == "angel":
+        all_names = set(mcp_server._tool_manager._tools.keys())
+        to_remove = all_names - ANGEL_TOOLS
+        for name in to_remove:
+            try:
+                mcp_server.remove_tool(name)
+            except (KeyError, ToolError):
+                pass
+        logger.info(
+            "Angel profile applied",
             extra_context={
                 "kept": len(all_names - to_remove),
                 "removed": len(to_remove),

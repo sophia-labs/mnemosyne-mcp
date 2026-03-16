@@ -33,32 +33,35 @@ logger = LoggerFactory.get_logger("mcp.tools.wire_tools")
 MNEMO_NS = "http://mnemosyne.ai/vocab#"
 
 BUILTIN_PREDICATES: Dict[str, Dict[str, str]] = {
-    f"{MNEMO_NS}isWiredTo": {"label": "is wired to", "category": "Default"},
-    # Quantity (Kant)
-    f"{MNEMO_NS}partOf": {"label": "is part of", "category": "Quantity"},
-    f"{MNEMO_NS}contains": {"label": "contains", "category": "Quantity"},
-    f"{MNEMO_NS}exemplifies": {"label": "is an example of", "category": "Quantity"},
-    # Quality (Kant)
-    f"{MNEMO_NS}supports": {"label": "supports", "category": "Quality"},
-    f"{MNEMO_NS}contradicts": {"label": "contradicts", "category": "Quality"},
-    f"{MNEMO_NS}qualifies": {"label": "qualifies", "category": "Quality"},
-    # Relation (Kant)
-    f"{MNEMO_NS}causeOf": {"label": "causes", "category": "Relation"},
-    f"{MNEMO_NS}consequenceOf": {"label": "is consequence of", "category": "Relation"},
-    f"{MNEMO_NS}relatedTo": {"label": "is related to", "category": "Relation"},
-    # Modality (Kant)
-    f"{MNEMO_NS}requires": {"label": "requires", "category": "Modality"},
-    f"{MNEMO_NS}enables": {"label": "enables", "category": "Modality"},
-    f"{MNEMO_NS}precedes": {"label": "precedes", "category": "Modality"},
-    # Connective Synthesis (Deleuze/Guattari)
-    f"{MNEMO_NS}flowsInto": {"label": "flows into", "category": "Synthesis"},
-    f"{MNEMO_NS}produces": {"label": "produces", "category": "Synthesis"},
-    # Disjunctive Synthesis
-    f"{MNEMO_NS}divergesFrom": {"label": "diverges from", "category": "Synthesis"},
-    f"{MNEMO_NS}branchesTo": {"label": "branches to", "category": "Synthesis"},
-    # Conjunctive Synthesis
-    f"{MNEMO_NS}consumesWith": {"label": "consumes with", "category": "Synthesis"},
-    f"{MNEMO_NS}intensifiesWith": {"label": "intensifies with", "category": "Synthesis"},
+    # ── Ungrouped ────────────────────────────────────────────────────────────
+    f"{MNEMO_NS}relatedTo": {"label": "is related to", "category": "Ungrouped"},
+    # ── Critique — what does A say about B? ──────────────────────────────────
+    f"{MNEMO_NS}supports": {"label": "supports", "category": "Critique"},
+    f"{MNEMO_NS}contradicts": {"label": "contradicts", "category": "Critique"},
+    f"{MNEMO_NS}qualifies": {"label": "qualifies", "category": "Critique"},
+    f"{MNEMO_NS}exemplifies": {"label": "is an example of", "category": "Critique"},
+    # ── Genesis — how does A give rise to B? ─────────────────────────────────
+    f"{MNEMO_NS}flowsInto": {"label": "flows into", "category": "Genesis"},
+    f"{MNEMO_NS}produces": {"label": "produces", "category": "Genesis"},
+    f"{MNEMO_NS}consequenceOf": {"label": "is consequence of", "category": "Genesis"},
+    f"{MNEMO_NS}intensifiesWith": {"label": "intensifies with", "category": "Genesis"},
+    # ── Foundation — how does A condition B? ──────────────────────────────────
+    f"{MNEMO_NS}grounds": {"label": "grounds", "category": "Foundation"},
+    f"{MNEMO_NS}requires": {"label": "requires", "category": "Foundation"},
+    f"{MNEMO_NS}enables": {"label": "enables", "category": "Foundation"},
+    f"{MNEMO_NS}contains": {"label": "contains", "category": "Foundation"},
+    f"{MNEMO_NS}precedes": {"label": "precedes", "category": "Foundation"},
+}
+
+# Legacy predicates — labels for existing wires using removed predicates.
+LEGACY_PREDICATES: Dict[str, str] = {
+    f"{MNEMO_NS}isWiredTo": "is wired to",
+    f"{MNEMO_NS}causeOf": "causes",
+    f"{MNEMO_NS}partOf": "is part of",
+    f"{MNEMO_NS}divergesFrom": "diverges from",
+    f"{MNEMO_NS}branchesTo": "branches to",
+    f"{MNEMO_NS}consumesWith": "consumes with",
+    f"{MNEMO_NS}synthesizes": "synthesizes",
 }
 
 
@@ -80,6 +83,9 @@ def _get_predicate_label(uri: str) -> str:
     info = BUILTIN_PREDICATES.get(uri)
     if info:
         return info["label"]
+    legacy = LEGACY_PREDICATES.get(uri)
+    if legacy:
+        return legacy
     return uri.split("#")[-1] if "#" in uri else uri.split("/")[-1]
 
 
@@ -389,11 +395,10 @@ def register_wire_tools(server: FastMCP) -> None:
         title="List Wire Predicates",
         description=(
             "Returns the taxonomy of semantic predicates available for wires. "
-            "Predicates are organized by philosophical category "
-            "(Quantity, Quality, Relation, Modality from Kant; Synthesis from Deleuze & Guattari). "
-            "Categories: Quantity (partOf, contains, exemplifies), Quality (supports, contradicts, qualifies), "
-            "Relation (causeOf, consequenceOf, relatedTo), Modality (requires, enables, precedes), "
-            "Synthesis (flowsInto, produces, divergesFrom, branchesTo, consumesWith, intensifiesWith). "
+            "Predicates are organized by semantic function: "
+            "Critique (supports, contradicts, qualifies, exemplifies), "
+            "Genesis (flowsInto, produces, consequenceOf, intensifiesWith), "
+            "Foundation (grounds, requires, enables, contains, precedes). "
             "Also includes any custom predicates found in the graph's wires. "
             "The returned short names can be passed directly to create_wires's predicate parameter."
         ),
@@ -518,7 +523,7 @@ def register_wire_tools(server: FastMCP) -> None:
                             continue
 
                         pred_input = spec.get("predicate")
-                        eff_pred = _resolve_predicate(pred_input) if pred_input else f"{MNEMO_NS}isWiredTo"
+                        eff_pred = _resolve_predicate(pred_input) if pred_input else f"{MNEMO_NS}relatedTo"
                         eff_tgt_graph = (spec.get("target_graph_id") or graph_id).strip()
                         bidir = bool(spec.get("bidirectional", False))
                         src_block = (spec.get("source_block_id") or "").strip() or None
@@ -579,7 +584,7 @@ def register_wire_tools(server: FastMCP) -> None:
             if not target_document_id or not target_document_id.strip():
                 raise ValueError("target_document_id is required")
 
-            effective_predicate = _resolve_predicate(predicate) if predicate else f"{MNEMO_NS}isWiredTo"
+            effective_predicate = _resolve_predicate(predicate) if predicate else f"{MNEMO_NS}relatedTo"
             effective_target_graph = target_graph_id or graph_id
             wire_id = f"w-{uuid4().hex[:12]}"
             inverse_wire_id = f"{wire_id}-inv" if bidirectional else None
