@@ -3493,7 +3493,8 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "- Both: error (mutually exclusive)\n\n"
             "**Limitation:** Inserting before the very first block (index=0 or position='before' "
             "on the first block) is not supported due to CRDT sync ordering. To prepend content, "
-            "use write_document to rewrite the full document.\n\n"
+            "use update_blocks to replace the first block with your new content, then insert_blocks "
+            "after it with the old first block's text.\n\n"
             "Read the document first (read_document or get_block) before inserting — "
             "write tools need a preceding read to sync latest state. "
             "Never call insert_blocks in parallel with other write operations on the same document."
@@ -3588,8 +3589,9 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                     raise ValueError(
                         "Inserting before the first block is not supported — "
                         "pycrdt inserts at position 0 lose ordering through "
-                        "CRDT sync. Use write_document to rewrite the full "
-                        "document with new content prepended."
+                        "CRDT sync. Workaround: use update_blocks to replace "
+                        "the first block with your new content, then insert_blocks "
+                        "after it with the old first block's text."
                     )
 
                 new_block_ids = writer.insert_blocks_at(insert_at, blocks_xml)
