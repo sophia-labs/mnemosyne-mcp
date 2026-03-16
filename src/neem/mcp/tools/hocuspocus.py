@@ -3584,14 +3584,12 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                     # Default: append to end
                     insert_at = block_count
 
-                # CRDT limitation: insert at position 0 in a non-empty fragment
-                # loses position through Y.js sync (new items with null origin
-                # are placed after existing items during CRDT merge).
                 if insert_at == 0 and block_count > 0:
                     raise ValueError(
-                        "Cannot insert before the first block — CRDT sync does not "
-                        "preserve position at index 0. To prepend content, use "
-                        "write_document to rewrite the full document with new content first."
+                        "Inserting before the first block is not supported — "
+                        "pycrdt inserts at position 0 lose ordering through "
+                        "CRDT sync. Use write_document to rewrite the full "
+                        "document with new content prepended."
                     )
 
                 new_block_ids = writer.insert_blocks_at(insert_at, blocks_xml)

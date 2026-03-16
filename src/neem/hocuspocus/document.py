@@ -1559,9 +1559,13 @@ class DocumentWriter:
     def insert_blocks_at(self, index: int, xml_strings: list[str]) -> list[str]:
         """Insert multiple blocks at a specific position in the document.
 
-        All blocks are inserted in a single CRDT transaction, so they appear
-        atomically. List containers (bulletList, orderedList, taskList) are
+        Delegates to proven single-block methods (append_block, insert_block_after_id)
+        for reliable CRDT sync. List containers (bulletList, orderedList, taskList) are
         automatically flattened to individual listItem blocks.
+
+        NOTE: index=0 on non-empty documents is NOT supported — pycrdt inserts at
+        position 0 lose ordering through CRDT sync (null left-origin merge issue).
+        The caller must guard against this case.
 
         Args:
             index: Position to insert at (0-based, within fragment.children).
@@ -1572,33 +1576,24 @@ class DocumentWriter:
             List of new block IDs in insertion order.
         """
         fragment = self.get_content_fragment()
-        total_inserted = 0
-
-        with self._doc.transaction():
-            for xml_str in xml_strings:
-                elem = ET.fromstring(xml_str)
-
-                # Ensure block ID on non-list XML elements before processing
-                # (_process_element generates IDs for list items internally)
-                if elem.tag not in LIST_CONTAINER_TYPES:
-                    if not elem.get("data-block-id"):
-                        elem.set("data-block-id", _generate_block_id())
-
-                blocks = self._process_element(elem)
-                for block in blocks:
-                    fragment.children.insert(index + total_inserted, block)
-                    total_inserted += 1
-
-            self._apply_pending_formats()
-
-        # Collect IDs after integration (attributes readable only once integrated)
+        children = list(fragment.children)
+        block_count = len(children)
         new_ids: list[str] = []
-        for i in range(total_inserted):
-            child = fragment.children[index + i]
-            if hasattr(child, "attributes"):
-                bid = child.attributes.get("data-block-id")
-                if bid:
-                    new_ids.append(bid)
+
+        if index >= block_count:
+            # Append mode
+            for xml_str in xml_strings:
+                bid = self.append_block(xml_str)
+                new_ids.append(bid)
+        else:
+            # Insert after block at (index - 1) using proven insert_block_after_id
+            prev_id = children[index - 1].attributes.get("data-block-id")
+            if not prev_id:
+                raise ValueError(f"Block at index {index - 1} has no ID — cannot insert after it")
+            for xml_str in xml_strings:
+                bid = self.insert_block_after_id(prev_id, xml_str)
+                new_ids.append(bid)
+                prev_id = bid
 
         return new_ids
 
