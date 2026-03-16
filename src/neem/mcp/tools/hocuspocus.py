@@ -3491,6 +3491,9 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "Supports negative indexing.\n"
             "- Neither: appends to end (most common case)\n"
             "- Both: error (mutually exclusive)\n\n"
+            "**Limitation:** Inserting before the very first block (index=0 or position='before' "
+            "on the first block) is unreliable due to CRDT sync ordering. The block may appear "
+            "at the end instead. Use write_document for full content reordering.\n\n"
             "Read the document first (read_document or get_block) before inserting — "
             "write tools need a preceding read to sync latest state. "
             "Never call insert_blocks in parallel with other write operations on the same document."
@@ -3552,9 +3555,10 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 raise ValueError("No blocks could be parsed from content")
 
             new_block_ids: list[str] = []
+            insert_at_zero_warning = False
 
             def perform_insert(doc: Any) -> None:
-                nonlocal new_block_ids
+                nonlocal new_block_ids, insert_at_zero_warning
                 writer = DocumentWriter(doc)
                 reader = DocumentReader(doc)
                 fragment = reader.get_content_fragment()
@@ -3581,6 +3585,13 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                     # Default: append to end
                     insert_at = block_count
 
+                # CRDT limitation: insert at position 0 in a non-empty fragment
+                # loses position through Y.js sync (new items with null origin
+                # are placed after existing items during CRDT merge). Use
+                # write_document for full reordering.
+                if insert_at == 0 and block_count > 0:
+                    insert_at_zero_warning = True
+
                 new_block_ids = writer.insert_blocks_at(insert_at, blocks_xml)
 
             await hp_client.transact_document(
@@ -3590,11 +3601,18 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 user_id=auth.user_id,
             )
 
-            return {
+            result: Dict[str, Any] = {
                 "success": True,
                 "block_ids": new_block_ids,
                 "blocks_inserted": len(new_block_ids),
             }
+            if insert_at_zero_warning:
+                result["warning"] = (
+                    "Inserting before the first block is unreliable through CRDT sync — "
+                    "the block may appear at the end instead. Use write_document to "
+                    "rewrite content if ordering is critical."
+                )
+            return result
 
         except ValueError as ve:
             raise RuntimeError(str(ve))

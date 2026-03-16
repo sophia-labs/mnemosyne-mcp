@@ -1572,27 +1572,33 @@ class DocumentWriter:
             List of new block IDs in insertion order.
         """
         fragment = self.get_content_fragment()
-        new_ids: list[str] = []
-        offset = 0
+        total_inserted = 0
 
         with self._doc.transaction():
             for xml_str in xml_strings:
                 elem = ET.fromstring(xml_str)
 
+                # Ensure block ID on non-list XML elements before processing
+                # (_process_element generates IDs for list items internally)
+                if elem.tag not in LIST_CONTAINER_TYPES:
+                    if not elem.get("data-block-id"):
+                        elem.set("data-block-id", _generate_block_id())
+
                 blocks = self._process_element(elem)
                 for block in blocks:
-                    # Ensure each block has an ID
-                    if hasattr(block, "attributes"):
-                        bid = block.attributes.get("data-block-id")
-                        if not bid:
-                            bid = _generate_block_id()
-                            block.attributes["data-block-id"] = bid
-                        new_ids.append(bid)
-
-                    fragment.children.insert(index + offset, block)
-                    offset += 1
+                    fragment.children.insert(index + total_inserted, block)
+                    total_inserted += 1
 
             self._apply_pending_formats()
+
+        # Collect IDs after integration (attributes readable only once integrated)
+        new_ids: list[str] = []
+        for i in range(total_inserted):
+            child = fragment.children[index + i]
+            if hasattr(child, "attributes"):
+                bid = child.attributes.get("data-block-id")
+                if bid:
+                    new_ids.append(bid)
 
         return new_ids
 
