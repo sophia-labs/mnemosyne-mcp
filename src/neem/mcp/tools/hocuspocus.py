@@ -635,6 +635,35 @@ GROUP BY ?docId
         raise RuntimeError(msg)
 
     # ------------------------------------------------------------------
+    # Helper: assert a document is writable (not readOnly)
+    # ------------------------------------------------------------------
+    async def _assert_document_writable(
+        graph_id: str,
+        document_id: str,
+        user_id: str,
+    ) -> None:
+        """Raise RuntimeError if the document is marked readOnly in workspace.
+
+        Call this in write tools *after* _validate_document_in_workspace
+        (which ensures the workspace channel is already connected).
+        """
+        ws_channel = hp_client.get_workspace_channel(graph_id, user_id=user_id)
+        if ws_channel is None:
+            # Workspace not connected — try connecting
+            await hp_client.connect_workspace(graph_id, user_id=user_id)
+            ws_channel = hp_client.get_workspace_channel(graph_id, user_id=user_id)
+        if ws_channel is None:
+            return  # Can't check — let downstream handle missing workspace
+        reader = WorkspaceReader(ws_channel.doc)
+        doc_info = reader.get_document(document_id)
+        if doc_info and doc_info.get("readOnly"):
+            title = doc_info.get("title", document_id)
+            raise RuntimeError(
+                f"Document '{title}' ({document_id}) is read-only. "
+                f"Use make_document_editable to remove the read-only flag before editing."
+            )
+
+    # ------------------------------------------------------------------
     # Helper: connect a document for reading (with TTL + retry)
     # ------------------------------------------------------------------
     _READ_MAX_AGE = 2.0  # seconds — reconnect if last sync is older than this
@@ -1632,6 +1661,9 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         auth.require_auth()
 
         try:
+            # Check readOnly before writing
+            await _assert_document_writable(graph_id, document_id, auth.user_id)
+
             # 1. Write document content and comments (with user context)
             await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
 
@@ -2258,6 +2290,81 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 },
             )
             raise RuntimeError(f"Failed to rename {entity_type}: {e}")
+
+    # ------------------------------------------------------------------
+    # make_document_editable
+    # ------------------------------------------------------------------
+
+    @server.tool(
+        name="make_document_editable",
+        title="Make Document Editable",
+        description=(
+            "Removes the read-only flag from a document, allowing it to be edited. "
+            "Use this on imported or ingested documents that are currently in reader mode."
+        ),
+    )
+    async def make_document_editable_tool(
+        graph_id: str,
+        document_id: str,
+        context: Context | None = None,
+    ) -> dict:
+        """Remove the readOnly flag from a document."""
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required")
+        if not document_id or not document_id.strip():
+            raise ValueError("document_id is required")
+
+        graph_id = graph_id.strip()
+        document_id = document_id.strip()
+
+        try:
+            await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
+            channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
+            if channel is None:
+                raise RuntimeError(f"Workspace not connected: {graph_id}")
+
+            reader = WorkspaceReader(channel.doc)
+            doc_info = reader.get_document(document_id)
+            if doc_info is None:
+                raise RuntimeError(f"Document '{document_id}' not found in graph '{graph_id}'")
+
+            if not doc_info.get("readOnly"):
+                return {
+                    "success": True,
+                    "document_id": document_id,
+                    "message": "Document is already editable",
+                }
+
+            def clear_read_only(doc: Any) -> None:
+                ws_writer = WorkspaceWriter(doc)
+                doc_map = ws_writer._documents.get(document_id)
+                if isinstance(doc_map, pycrdt.Map):
+                    doc_map["readOnly"] = False
+
+            await hp_client.transact_workspace(
+                graph_id, clear_read_only, user_id=auth.user_id,
+            )
+
+            return {
+                "success": True,
+                "document_id": document_id,
+                "title": doc_info.get("title", document_id),
+                "message": "Document is now editable",
+            }
+
+        except Exception as e:
+            logger.error(
+                "Failed to make document editable",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to make document editable: {e}")
 
     # ------------------------------------------------------------------
     # Helper: hard-delete a document via backend REST API
@@ -3144,6 +3251,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
 
         try:
             await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id, auth=auth)
+            await _assert_document_writable(graph_id.strip(), document_id.strip(), auth.user_id)
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
             results: list[Dict[str, Any]] = []
@@ -3276,6 +3384,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         try:
             # Validate document exists in workspace
             await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id, auth=auth)
+            await _assert_document_writable(graph_id.strip(), document_id.strip(), auth.user_id)
 
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
@@ -3423,6 +3532,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         try:
             # Validate document exists in workspace
             await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id, auth=auth)
+            await _assert_document_writable(graph_id.strip(), document_id.strip(), auth.user_id)
 
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
@@ -3537,6 +3647,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         try:
             # Validate document exists in workspace
             await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id, auth=auth)
+            await _assert_document_writable(graph_id.strip(), document_id.strip(), auth.user_id)
 
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
