@@ -1898,29 +1898,30 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                     val_count += sub_vals
             return doc_count, val_count
 
-        tree = _sort_and_clean(root)
+        def _find_folder(items: list[dict[str, Any]], target_id: str) -> dict[str, Any] | None:
+            for item in items:
+                if item.get("id") == target_id:
+                    return item
+                if "children" in item:
+                    found = _find_folder(item["children"], target_id)
+                    if found:
+                        return found
+            return None
 
-        # If folder_id is specified, extract just that subtree
+        # Resolve folder-scoped subtree BEFORE depth truncation.
+        # Otherwise nested folder targets can disappear when ancestors are
+        # collapsed at max_depth, incorrectly returning an empty tree.
+        render_items = root
         if folder_id:
-            def _find_folder(items: list[dict[str, Any]], target_id: str) -> dict[str, Any] | None:
-                for item in items:
-                    if item.get("id") == target_id:
-                        return item
-                    if "children" in item:
-                        found = _find_folder(item["children"], target_id)
-                        if found:
-                            return found
-                return None
-
-            folder_node = _find_folder(tree, folder_id)
+            folder_node = _find_folder(root, folder_id)
             if folder_node and "children" in folder_node:
-                tree = folder_node["children"]
+                render_items = folder_node["children"]
             elif folder_node:
-                tree = [folder_node]
+                render_items = [folder_node]
             else:
-                tree = []
+                render_items = []
 
-        return tree
+        return _sort_and_clean(render_items)
 
     @server.tool(
         name="get_workspace",
