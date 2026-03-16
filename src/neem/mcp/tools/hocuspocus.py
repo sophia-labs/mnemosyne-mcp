@@ -1019,7 +1019,7 @@ GROUP BY ?docId
         description="""Reads document content with wire counts. Supports multiple output formats.
 
 Formats (set via 'format' parameter):
-- default (None): TipTap XML with full formatting and data-block-id attributes on every block. Use this when you need block IDs for surgical editing (edit_block_text, update_blocks, insert_block, delete_block) or block-level wire connections.
+- default (None): TipTap XML with full formatting and data-block-id attributes on every block. Use this when you need block IDs for surgical editing (edit_block_text, update_blocks, insert_blocks, delete_block) or block-level wire connections.
 - 'markdown': Clean Markdown. Use this when you just need to read/understand a document's content without editing it. Much more compact than XML.
 - 'ids_only': Returns just the ordered list of block IDs and count, no content. Use this when you already know the content but need block IDs for wiring or editing.
 
@@ -1602,7 +1602,7 @@ LIMIT {top_valued}
         title="Write Document Content",
         description="""Replaces document content with TipTap XML. Syncs to UI in real-time.
 
-WARNING: This REPLACES all content. For collaborative editing, prefer append_to_document.
+WARNING: This REPLACES all content. For collaborative editing, prefer insert_blocks.
 
 Accepts plain text (auto-wrapped in <paragraph> tags), markdown (auto-converted), or TipTap XML. See server instructions for XML block types and marks reference.
 
@@ -1615,7 +1615,7 @@ Returns block_ids: an ordered list of all block IDs in the written document, ena
 
 `await_durable` (default true) forces post-write verification through a fresh document channel rather than the same cached channel.
 
-For modifying parts of an existing document, prefer surgical block tools (edit_block_text, update_blocks, insert_block). Use write_document when replacing the full content of a document.
+For modifying parts of an existing document, prefer surgical block tools (edit_block_text, update_blocks, insert_blocks). Use write_document when replacing the full content of a document.
 
 Read the document first in multi-agent environments (see Write Tool Guidance in server instructions).""",
     )
@@ -1732,122 +1732,6 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 },
             )
             raise RuntimeError(f"Failed to write document: {e}")
-
-    @server.tool(
-        name="append_to_document",
-        title="Append Block to Document",
-        description=(
-            "Appends one or more blocks to the end of a document. Accepts TipTap XML, markdown, "
-            "or plain text. Use this for incremental additions without replacing existing content.\n\n"
-            "Supports multiple blocks in a single call: pass markdown with multiple paragraphs, "
-            "or XML with multiple top-level elements. Each block is appended in order within a "
-            "single transaction. Plain text without XML tags is auto-wrapped in a <paragraph>.\n\n"
-            "Indentation: Use tab characters at the start of a line to set paragraph indent level "
-            "(1 tab = indent 1, 2 tabs = indent 2). Creates visual hierarchy for sub-points and "
-            "supporting details. Tabs inside code fences and on list items are not affected.\n\n"
-            "For appending to documents written by other agents, call read_document first to sync "
-            "the channel — otherwise the append may conflict with content you haven't seen yet."
-        ),
-    )
-    async def append_to_document_tool(
-        graph_id: str,
-        document_id: str,
-        text: str,
-        context: Context | None = None,
-    ) -> dict:
-        """Append one or more blocks to a document.
-
-        Accepts markdown or TipTap XML with multiple blocks and automatically
-        breaks them into individual append operations within a single transaction.
-
-        Args:
-            graph_id: The graph containing the document
-            document_id: The document to append to
-            text: Content to append. Can be:
-                - Plain text (wrapped in <paragraph>)
-                - Markdown (converted to TipTap XML)
-                - TipTap XML (single or multiple blocks)
-        """
-        auth = MCPAuthContext.from_context(context)
-        auth.require_auth()
-
-        if not graph_id or not graph_id.strip():
-            raise ValueError("graph_id is required")
-        if not document_id or not document_id.strip():
-            raise ValueError("document_id is required")
-        if not text:
-            raise ValueError("text is required")
-
-        try:
-            # Validate document exists in workspace before appending
-            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id, auth=auth)
-
-            # Connect to the document channel with user context
-            await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
-
-            # Convert to XML, handling multiple blocks
-            content = _ensure_xml_multiblock(text)
-
-            # Parse to extract individual block elements
-            # Wrap in a root element to handle multiple top-level blocks
-            blocks_xml: list[str] = []
-            try:
-                wrapped = f"<root>{content}</root>"
-                root = ET.fromstring(wrapped)
-                blocks = list(root)  # Extract all child elements
-            except ET.ParseError:
-                # If parsing fails, treat as single block (fallback to old behavior)
-                blocks_xml = [content]
-            else:
-                # Convert each element back to XML string
-                blocks_xml = [ET.tostring(block, encoding='unicode') for block in blocks]
-
-            new_block_ids: list[str] = []
-
-            def perform_append(doc: Any) -> None:
-                nonlocal new_block_ids
-                writer = DocumentWriter(doc)
-                reader = DocumentReader(doc)
-
-                for block_xml in blocks_xml:
-                    writer.append_block(block_xml)
-                    # Get the last block's ID after each append
-                    count = reader.get_block_count()
-                    if count > 0:
-                        block = reader.get_block_at(count - 1)
-                        if block and hasattr(block, "attributes"):
-                            attrs = block.attributes
-                            block_id = attrs.get("data-block-id") if "data-block-id" in attrs else ""
-                            if block_id:
-                                new_block_ids.append(block_id)
-
-            await hp_client.transact_document(
-                graph_id.strip(),
-                document_id.strip(),
-                perform_append,
-                user_id=auth.user_id,
-            )
-
-            result = {
-                "success": True,
-                "graph_id": graph_id.strip(),
-                "document_id": document_id.strip(),
-                "new_block_id": new_block_ids[-1] if new_block_ids else "",
-                "block_ids": new_block_ids,  # Return all appended block IDs
-                "blocks_appended": len(new_block_ids),
-            }
-            return result
-
-        except Exception as e:
-            logger.error(
-                "Failed to append to document",
-                extra_context={
-                    "graph_id": graph_id,
-                    "document_id": document_id,
-                    "error": str(e),
-                },
-            )
-            raise RuntimeError(f"Failed to append to document: {e}")
 
     def _build_workspace_tree(
         snapshot: dict[str, Any],
@@ -2489,89 +2373,6 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
     # -------------------------------------------------------------------------
 
     @server.tool(
-        name="read_artifact",
-        title="Read Artifact Content",
-        description=(
-            "Read an artifact's metadata and, if the artifact has been ingested, its document content. "
-            "Returns metadata (name, fileType, mimeType, status, ingestedDocId, etc.) always. "
-            "If the artifact has been ingested into a document (ingestedDocId is set), also returns "
-            "the ingested document's TipTap XML content and comments.\n\n"
-            "If the artifact has not been ingested yet, the response will not include 'ingested_document'. "
-            "Use ingest_artifact to convert the artifact into a readable document first."
-        ),
-    )
-    async def read_artifact_tool(
-        graph_id: str,
-        artifact_id: str,
-        context: Context | None = None,
-    ) -> dict:
-        """Read artifact metadata and document content.
-
-        Artifacts are documents with readOnly=true and sf_* metadata.
-        The artifact_id IS the document_id.
-        """
-        auth = MCPAuthContext.from_context(context)
-        auth.require_auth()
-
-        if not graph_id or not graph_id.strip():
-            raise ValueError("graph_id is required and cannot be empty")
-        if not artifact_id or not artifact_id.strip():
-            raise ValueError("artifact_id is required and cannot be empty")
-
-        try:
-            await hp_client.connect_workspace(graph_id.strip(), user_id=auth.user_id)
-
-            channel = hp_client.get_workspace_channel(graph_id.strip(), user_id=auth.user_id)
-            if channel is None:
-                raise RuntimeError(f"Workspace not connected: {graph_id}")
-
-            reader = WorkspaceReader(channel.doc)
-            # Artifacts are documents — look in documents map
-            metadata = reader.get_document(artifact_id.strip())
-
-            if not metadata:
-                raise RuntimeError(f"Artifact '{artifact_id}' not found in graph '{graph_id}'")
-
-            result: dict[str, Any] = {
-                "graph_id": graph_id.strip(),
-                "artifact_id": artifact_id.strip(),
-                "metadata": metadata,
-            }
-
-            # Read the document content (artifact_id IS the document_id)
-            try:
-                await _connect_for_read(graph_id.strip(), artifact_id.strip(), auth.user_id)
-                doc_channel = hp_client.get_document_channel(graph_id.strip(), artifact_id.strip(), user_id=auth.user_id)
-                if doc_channel is not None:
-                    doc_reader = DocumentReader(doc_channel.doc)
-                    result["ingested_document"] = {
-                        "document_id": artifact_id.strip(),
-                        "content": doc_reader.to_xml(),
-                        "comments": doc_reader.get_all_comments(),
-                    }
-            except Exception as doc_err:
-                logger.warning(
-                    "Could not read artifact document content",
-                    extra_context={
-                        "artifact_id": artifact_id,
-                        "error": str(doc_err),
-                    },
-                )
-
-            return result
-
-        except Exception as e:
-            logger.error(
-                "Failed to read artifact",
-                extra_context={
-                    "graph_id": graph_id,
-                    "artifact_id": artifact_id,
-                    "error": str(e),
-                },
-            )
-            raise RuntimeError(f"Failed to read artifact: {e}")
-
-    @server.tool(
         name="upload_artifact",
         title="Upload Artifact",
         description=(
@@ -2670,7 +2471,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "Modes:\n"
             "- 'ingest' (default): Creates a read-only e-reader document. Best for reference material.\n"
             "- 'import': Creates a fully editable document. Best when you need to modify the content.\n\n"
-            "After ingestion, use read_artifact or read_document with the returned document_id "
+            "After ingestion, use read_document with the returned document_id "
             "to access the content.\n\n"
             "Note: New uploads are auto-ingested. This tool is only needed for legacy artifacts "
             "that were uploaded before auto-ingestion was enabled."
@@ -3181,7 +2982,11 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "NOTE: This is a single-document structural filter — it queries one document's CRDT state "
             "directly, with no backend round-trip. Use it for structural navigation within a document "
             "(e.g., find all headings, find checked tasks, find blocks at indent level 2). "
-            "For cross-document content discovery, use search_blocks instead (hybrid lexical+semantic)."
+            "For cross-document content discovery, use search_blocks instead (hybrid lexical+semantic).\n\n"
+            "**Batch mode:** Pass a `queries` list to run multiple filters in one call — each entry "
+            "uses the same filter fields (block_type, heading_level, indent, text_contains, etc.). "
+            "Results are grouped by query index. Use this to resolve block IDs for specific blocks "
+            "after reading in markdown format."
         ),
     )
     async def query_blocks_tool(
@@ -3196,9 +3001,10 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         checked: Optional[bool] = None,
         text_contains: Optional[str] = None,
         limit: int = 50,
+        queries: Optional[list[Dict[str, Any]]] = None,
         context: Context | None = None,
     ) -> dict:
-        """Query blocks matching specific criteria."""
+        """Query blocks matching specific criteria, with optional batch mode."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -3219,6 +3025,35 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 tool_name="query_blocks",
             )
             reader = DocumentReader(document_doc)
+
+            # Batch mode: run multiple queries and return grouped results
+            if queries is not None:
+                # Allowed filter keys for each query
+                allowed_keys = {
+                    "block_type", "heading_level", "indent", "indent_gte",
+                    "indent_lte", "list_type", "checked", "text_contains", "limit",
+                }
+                batch_results: list[Dict[str, Any]] = []
+                total_matches = 0
+                for i, q in enumerate(queries):
+                    # Filter to allowed keys only
+                    kwargs = {k: v for k, v in q.items() if k in allowed_keys}
+                    if "limit" not in kwargs:
+                        kwargs["limit"] = limit
+                    matches = reader.query_blocks(**kwargs)
+                    batch_results.append({
+                        "query_index": i,
+                        "count": len(matches),
+                        "blocks": matches,
+                    })
+                    total_matches += len(matches)
+                return {
+                    "mode": "batch",
+                    "results": batch_results,
+                    "total_matches": total_matches,
+                }
+
+            # Single-query mode (existing behavior)
             matches = reader.query_blocks(
                 block_type=block_type,
                 heading_level=heading_level,
@@ -3377,40 +3212,43 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         name="edit_block_text",
         title="Edit Block Text",
         description=(
-            "Insert or delete text at specific character offsets within a block, using "
-            "CRDT-native operations that merge cleanly with concurrent browser edits. "
-            "Unlike update_blocks (which replaces entire content), this enables true "
-            "collaborative editing without data loss.\n\n"
-            "Workflow: 1) Call get_block to read current text and length (this also syncs "
-            "the channel to latest server state), "
-            "2) Determine offset(s) for edits, "
-            "3) Call edit_block_text with operations, "
-            "4) Response includes updated text for verification.\n\n"
-            "IMPORTANT: Always call get_block immediately before editing — the read syncs "
-            "fresh state from the server, and the write reuses that channel. Skipping the "
-            "read risks operating on stale offsets.\n\n"
+            "Edit text within a block using CRDT-native operations that merge cleanly "
+            "with concurrent browser edits. Two modes:\n\n"
+            "**Find-and-replace mode (recommended):** Pass `find` and `replace` strings. "
+            "The tool locates the text and generates precise offset operations internally. "
+            "Use `occurrence` to control which match: 1 (default) = first, -1 = last, "
+            "0 = all. No need to calculate offsets manually.\n\n"
+            "**Offset mode:** Pass `operations` list for direct character-level control. "
             "Each operation has: type ('insert' or 'delete'), offset (0-indexed char position), "
             "text (for insert), length (for delete), attrs (optional formatting like {\"bold\": {}}), "
             "inherit_format (default true - inherit formatting from preceding character).\n\n"
-            "Multiple operations are applied in a single transaction. "
-            "Insert beyond text length appends at end. "
-            "Delete beyond text length raises an error."
+            "Provide either `find`+`replace` OR `operations`, not both.\n\n"
+            "IMPORTANT: Always call get_block immediately before editing — the read syncs "
+            "fresh state from the server, and the write reuses that channel. Skipping the "
+            "read risks operating on stale offsets.\n\n"
+            "Response includes updated text for verification."
         ),
     )
     async def edit_block_text_tool(
         graph_id: str,
         document_id: str,
         block_id: str,
-        operations: list[Dict[str, Any]],
+        operations: Optional[list[Dict[str, Any]]] = None,
+        find: Optional[str] = None,
+        replace: Optional[str] = None,
+        occurrence: int = 1,
         context: Context | None = None,
     ) -> dict:
-        """Edit text within a block at specific character offsets.
+        """Edit text within a block — find/replace or raw offset operations.
 
         Args:
             graph_id: The graph containing the document
             document_id: The document containing the block
             block_id: The block to edit
-            operations: List of insert/delete operations with offsets
+            operations: List of insert/delete operations with offsets (offset mode)
+            find: Text to find within the block (find/replace mode)
+            replace: Text to replace matches with (find/replace mode)
+            occurrence: Which occurrence to replace: 1=first, -1=last, 0=all
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
@@ -3421,8 +3259,19 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             raise ValueError("document_id is required")
         if not block_id or not block_id.strip():
             raise ValueError("block_id is required")
-        if not operations:
-            raise ValueError("operations list is required and cannot be empty")
+
+        # Validate mode: operations XOR find+replace
+        has_operations = operations is not None and len(operations) > 0
+        has_find_replace = find is not None
+        if has_operations and has_find_replace:
+            raise ValueError("Provide either 'operations' or 'find'+'replace', not both")
+        if not has_operations and not has_find_replace:
+            raise ValueError("Provide either 'operations' list or 'find'+'replace' strings")
+        if has_find_replace:
+            if not find:
+                raise ValueError("'find' must be a non-empty string")
+            if replace is None:
+                raise ValueError("'replace' is required when using find/replace mode")
 
         try:
             # Validate document exists in workspace
@@ -3434,10 +3283,66 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
 
             def perform_edit(doc: Any) -> None:
                 nonlocal updated_text_info
+                reader = DocumentReader(doc)
                 writer = DocumentWriter(doc)
-                updated_text_info = writer.edit_block_text(
-                    block_id.strip(), operations
-                )
+                bid = block_id.strip()
+
+                if has_find_replace:
+                    # Find/replace mode: resolve text matches to offset operations
+                    text_info = reader.get_block_text_info(bid)
+                    if text_info is None:
+                        raise ValueError(f"Block not found: {bid}")
+
+                    plain_text = text_info["text"]
+
+                    # Find all occurrences
+                    positions: list[int] = []
+                    start = 0
+                    while True:
+                        idx = plain_text.find(find, start)  # type: ignore[arg-type]
+                        if idx == -1:
+                            break
+                        positions.append(idx)
+                        start = idx + 1
+
+                    if not positions:
+                        raise ValueError(
+                            f"Text {find!r} not found in block {bid}"
+                        )
+
+                    # Select which occurrences to replace
+                    if occurrence == 0:
+                        selected = positions
+                    elif occurrence > 0:
+                        if occurrence > len(positions):
+                            raise ValueError(
+                                f"Occurrence {occurrence} requested but only "
+                                f"{len(positions)} match(es) found"
+                            )
+                        selected = [positions[occurrence - 1]]
+                    else:  # negative
+                        if abs(occurrence) > len(positions):
+                            raise ValueError(
+                                f"Occurrence {occurrence} requested but only "
+                                f"{len(positions)} match(es) found"
+                            )
+                        selected = [positions[occurrence]]
+
+                    # Build offset operations (delete + insert for each match)
+                    # Order: each position gets delete then insert at same offset.
+                    # edit_block_text sorts descending by offset (stable sort
+                    # preserves delete-before-insert for same offset).
+                    find_len = len(find)  # type: ignore[arg-type]
+                    ops: list[dict] = []
+                    for pos in selected:
+                        ops.append({"type": "delete", "offset": pos, "length": find_len})
+                        if replace:  # skip insert for empty replacement (pure deletion)
+                            ops.append({"type": "insert", "offset": pos, "text": replace})
+
+                    updated_text_info = writer.edit_block_text(bid, ops)
+                else:
+                    # Offset mode: pass through directly
+                    updated_text_info = writer.edit_block_text(bid, operations)  # type: ignore[arg-type]
 
             await hp_client.transact_document(
                 graph_id.strip(),
@@ -3464,38 +3369,42 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             raise RuntimeError(f"Failed to edit block text: {e}")
 
     @server.tool(
-        name="insert_block",
-        title="Insert Block",
+        name="insert_blocks",
+        title="Insert Blocks",
         description=(
-            "Insert a new block relative to an existing block. Use position='after' or 'before' "
-            "to specify where to insert. Returns the new block's generated ID. "
-            "For appending to the end, use append_to_document instead. "
-            "Plain text in xml_content is auto-wrapped in a <paragraph>. "
-            "Markdown is also accepted and auto-converted.\n\n"
+            "Inserts content into a document. By default, appends to the end — just pass "
+            "content with no positioning parameters. Accepts plain text, markdown, or TipTap XML. "
+            "Multi-block content (multiple paragraphs, list items, etc.) is inserted as a single "
+            "atomic transaction. Returns all new block IDs.\n\n"
+            "**Positioning (optional):**\n"
+            "- `block_id`: insert relative to this block (use `position` for before/after)\n"
+            "- `index`: insert at numeric position (0 = beginning, -1 = end). "
+            "Supports negative indexing.\n"
+            "- Neither: appends to end (most common case)\n"
+            "- Both: error (mutually exclusive)\n\n"
             "Read the document first (read_document or get_block) before inserting — "
             "write tools need a preceding read to sync latest state. "
-            "Never call insert_block in parallel with other write operations on the same document. "
-            "For inserting multiple blocks sequentially, use the new_block_id returned from each call "
-            "as the reference_block_id for the next — document state changes after each insert. "
-            "To add multiple blocks at once without chaining, prefer append_to_document instead."
+            "Never call insert_blocks in parallel with other write operations on the same document."
         ),
     )
-    async def insert_block_tool(
+    async def insert_blocks_tool(
         graph_id: str,
         document_id: str,
-        reference_block_id: str,
-        xml_content: str,
+        content: str,
+        block_id: Optional[str] = None,
+        index: Optional[int] = None,
         position: str = "after",
         context: Context | None = None,
     ) -> dict:
-        """Insert a new block before or after a reference block.
+        """Insert content into a document, optionally at a specific position.
 
         Args:
             graph_id: The graph containing the document
             document_id: The document to insert into
-            reference_block_id: The block to insert relative to
-            xml_content: TipTap XML for the new block
-            position: 'after' or 'before' the reference block
+            content: Content to insert (plain text, markdown, or TipTap XML)
+            block_id: Insert relative to this block (optional)
+            index: Insert at numeric position, supports negative indexing (optional)
+            position: 'after' or 'before' the reference point (default 'after')
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
@@ -3504,15 +3413,12 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             raise ValueError("graph_id is required")
         if not document_id or not document_id.strip():
             raise ValueError("document_id is required")
-        if not reference_block_id or not reference_block_id.strip():
-            raise ValueError("reference_block_id is required")
-        if not xml_content or not xml_content.strip():
-            raise ValueError("xml_content is required")
+        if not content:
+            raise ValueError("content is required")
+        if block_id is not None and index is not None:
+            raise ValueError("Provide either 'block_id' or 'index', not both")
         if position not in ("after", "before"):
             raise ValueError("position must be 'after' or 'before'")
-
-        # Auto-wrap plain text in a paragraph element
-        resolved_xml = _ensure_xml(xml_content)
 
         try:
             # Validate document exists in workspace
@@ -3520,19 +3426,52 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
 
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
-            new_block_id: str = ""
+            # Convert content to XML, handling multiple blocks
+            xml_content = _ensure_xml_multiblock(content)
+
+            # Parse into individual block XML strings
+            blocks_xml: list[str] = []
+            try:
+                wrapped = f"<root>{xml_content}</root>"
+                root = ET.fromstring(wrapped)
+                blocks_xml = [ET.tostring(block, encoding='unicode') for block in root]
+            except ET.ParseError:
+                blocks_xml = [xml_content]
+
+            if not blocks_xml:
+                raise ValueError("No blocks could be parsed from content")
+
+            new_block_ids: list[str] = []
 
             def perform_insert(doc: Any) -> None:
-                nonlocal new_block_id
+                nonlocal new_block_ids
                 writer = DocumentWriter(doc)
-                if position == "after":
-                    new_block_id = writer.insert_block_after_id(
-                        reference_block_id.strip(), resolved_xml
-                    )
+                reader = DocumentReader(doc)
+                fragment = reader.get_content_fragment()
+                block_count = len(list(fragment.children))
+
+                # Determine insertion index
+                if block_id is not None:
+                    # Relative to a block
+                    result = writer.find_block_by_id(block_id.strip())
+                    if result is None:
+                        raise ValueError(f"Block not found: {block_id}")
+                    ref_index, _ = result
+                    if position == "after":
+                        insert_at = ref_index + 1
+                    else:
+                        insert_at = ref_index
+                elif index is not None:
+                    # Numeric positioning with negative index support
+                    if index < 0:
+                        insert_at = max(0, block_count + 1 + index)
+                    else:
+                        insert_at = min(index, block_count)
                 else:
-                    new_block_id = writer.insert_block_before_id(
-                        reference_block_id.strip(), resolved_xml
-                    )
+                    # Default: append to end
+                    insert_at = block_count
+
+                new_block_ids = writer.insert_blocks_at(insert_at, blocks_xml)
 
             await hp_client.transact_document(
                 graph_id.strip(),
@@ -3541,19 +3480,24 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 user_id=auth.user_id,
             )
 
-            return {"success": True, "new_block_id": new_block_id}
+            return {
+                "success": True,
+                "block_ids": new_block_ids,
+                "blocks_inserted": len(new_block_ids),
+            }
 
+        except ValueError as ve:
+            raise RuntimeError(str(ve))
         except Exception as e:
             logger.error(
-                "Failed to insert block",
+                "Failed to insert blocks",
                 extra_context={
                     "graph_id": graph_id,
                     "document_id": document_id,
-                    "reference_block_id": reference_block_id,
                     "error": str(e),
                 },
             )
-            raise RuntimeError(f"Failed to insert block: {e}")
+            raise RuntimeError(f"Failed to insert blocks: {e}")
 
     @server.tool(
         name="delete_block",
@@ -3655,7 +3599,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "Create, update, or delete a comment on a document. Three operations via the 'action' parameter:\n\n"
             "- **set**: Create a new comment or update an existing one. Requires comment_id and text. "
             "The comment_id must match a data-comment-id attribute on a <commentMark> span in the document content "
-            "(add the mark via write_document or insert_block first). author defaults to 'Sophia'.\n"
+            "(add the mark via write_document or insert_blocks first). author defaults to 'Sophia'.\n"
             "- **resolve**: Mark a comment as resolved (or pass resolved=False to unresolve). Only requires comment_id.\n"
             "- **delete**: Remove a comment entirely. Only requires comment_id.\n\n"
             "Always read the document first — write tools use a cached channel and need a preceding read to sync latest state."

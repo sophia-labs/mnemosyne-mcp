@@ -1556,6 +1556,46 @@ class DocumentWriter:
 
         return new_block_id
 
+    def insert_blocks_at(self, index: int, xml_strings: list[str]) -> list[str]:
+        """Insert multiple blocks at a specific position in the document.
+
+        All blocks are inserted in a single CRDT transaction, so they appear
+        atomically. List containers (bulletList, orderedList, taskList) are
+        automatically flattened to individual listItem blocks.
+
+        Args:
+            index: Position to insert at (0-based, within fragment.children).
+                   Use len(fragment.children) to append at end.
+            xml_strings: List of XML strings, each a single block element.
+
+        Returns:
+            List of new block IDs in insertion order.
+        """
+        fragment = self.get_content_fragment()
+        new_ids: list[str] = []
+        offset = 0
+
+        with self._doc.transaction():
+            for xml_str in xml_strings:
+                elem = ET.fromstring(xml_str)
+
+                blocks = self._process_element(elem)
+                for block in blocks:
+                    # Ensure each block has an ID
+                    if hasattr(block, "attributes"):
+                        bid = block.attributes.get("data-block-id")
+                        if not bid:
+                            bid = _generate_block_id()
+                            block.attributes["data-block-id"] = bid
+                        new_ids.append(bid)
+
+                    fragment.children.insert(index + offset, block)
+                    offset += 1
+
+            self._apply_pending_formats()
+
+        return new_ids
+
     # -------------------------------------------------------------------------
     # Destructive Methods (use with caution in collaborative contexts)
     # -------------------------------------------------------------------------

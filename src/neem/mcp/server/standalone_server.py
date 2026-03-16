@@ -311,9 +311,8 @@ ANGEL_TOOLS: frozenset[str] = frozenset({
     "create_wires",
     "list_wire_predicates",  # Angels don't have CLAUDE.md predicate reference
     # Write (additive only — no edit/delete)
-    "append_to_document",
+    "insert_blocks",
     "write_document",
-    "insert_block",
     "edit_comment",
     # Geist (attunement + valuation, no continuity)
     "music",
