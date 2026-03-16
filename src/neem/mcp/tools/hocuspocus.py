@@ -1048,7 +1048,7 @@ GROUP BY ?docId
         description="""Reads document content with wire counts. Supports multiple output formats.
 
 Formats (set via 'format' parameter):
-- default (None): TipTap XML with full formatting and data-block-id attributes on every block. Use this when you need block IDs for surgical editing (edit_block_text, update_blocks, insert_blocks, delete_block) or block-level wire connections.
+- default (None): TipTap XML with full formatting and data-block-id attributes on every block. Use this when you need block IDs for surgical editing (edit_block_text, update_blocks, insert_blocks, delete_blocks) or block-level wire connections.
 - 'markdown': Clean Markdown. Use this when you just need to read/understand a document's content without editing it. Much more compact than XML.
 - 'ids_only': Returns just the ordered list of block IDs and count, no content. Use this when you already know the content but need block IDs for wiring or editing.
 
@@ -3624,28 +3624,31 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             raise RuntimeError(f"Failed to insert blocks: {e}")
 
     @server.tool(
-        name="delete_block",
-        title="Delete Block",
+        name="delete_blocks",
+        title="Delete Blocks",
         description=(
-            "Delete a block by its ID. Use cascade=true to also delete all subsequent blocks "
-            "with higher indent (indent-based children). Returns the list of deleted block IDs.\n\n"
+            "Delete block(s) by ID. Supports single delete via block_id or batch delete via "
+            "block_ids. Use cascade=true to also delete all subsequent blocks with higher indent "
+            "(indent-based children). Returns deleted and skipped block IDs.\n\n"
             "Read the document first (read_document) before deleting — "
             "write tools need a preceding read to sync latest state."
         ),
     )
-    async def delete_block_tool(
+    async def delete_blocks_tool(
         graph_id: str,
         document_id: str,
-        block_id: str,
+        block_id: Optional[str] = None,
+        block_ids: Optional[list[str]] = None,
         cascade: bool = False,
         context: Context | None = None,
     ) -> dict:
-        """Delete a block and optionally its indent-children.
+        """Delete one or more blocks and optionally indent-children.
 
         Args:
             graph_id: The graph containing the document
             document_id: The document containing the block
-            block_id: The block to delete
+            block_id: Single block to delete
+            block_ids: Multiple blocks to delete
             cascade: If True, also delete indent-children
         """
         auth = MCPAuthContext.from_context(context)
@@ -3655,8 +3658,25 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             raise ValueError("graph_id is required")
         if not document_id or not document_id.strip():
             raise ValueError("document_id is required")
-        if not block_id or not block_id.strip():
-            raise ValueError("block_id is required")
+
+        requested_ids: list[str] = []
+        if block_id and block_id.strip():
+            requested_ids.append(block_id.strip())
+        if block_ids:
+            for raw in block_ids:
+                value = str(raw).strip()
+                if value:
+                    requested_ids.append(value)
+
+        deduped_requested: list[str] = []
+        seen_requested: set[str] = set()
+        for bid in requested_ids:
+            if bid not in seen_requested:
+                seen_requested.add(bid)
+                deduped_requested.append(bid)
+
+        if not deduped_requested:
+            raise ValueError("At least one block ID is required (block_id or block_ids)")
 
         try:
             # Validate document exists in workspace
@@ -3666,13 +3686,24 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
             deleted_ids: list[str] = []
+            skipped_ids: list[str] = []
 
             def perform_delete(doc: Any) -> None:
-                nonlocal deleted_ids
+                nonlocal deleted_ids, skipped_ids
                 writer = DocumentWriter(doc)
-                deleted_ids = writer.delete_block_by_id(
-                    block_id.strip(), cascade_children=cascade
-                )
+                for target_id in deduped_requested:
+                    # If this target was already removed by an earlier cascade, skip it.
+                    if target_id in deleted_ids:
+                        continue
+                    if writer.find_block_by_id(target_id) is None:
+                        skipped_ids.append(target_id)
+                        continue
+                    removed = writer.delete_block_by_id(
+                        target_id, cascade_children=cascade
+                    )
+                    for rid in removed:
+                        if rid not in deleted_ids:
+                            deleted_ids.append(rid)
 
             await hp_client.transact_document(
                 graph_id.strip(),
@@ -3701,21 +3732,24 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
 
             return {
                 "success": True,
+                "requested_block_ids": deduped_requested,
                 "deleted_block_ids": deleted_ids,
+                "skipped_block_ids": skipped_ids,
                 "tombstoned_wire_ids": tombstoned_wires,
             }
 
         except Exception as e:
             logger.error(
-                "Failed to delete block",
+                "Failed to delete blocks",
                 extra_context={
                     "graph_id": graph_id,
                     "document_id": document_id,
                     "block_id": block_id,
+                    "block_ids": block_ids,
                     "error": str(e),
                 },
             )
-            raise RuntimeError(f"Failed to delete block: {e}")
+            raise RuntimeError(f"Failed to delete blocks: {e}")
 
     @server.tool(
         name="edit_comment",
