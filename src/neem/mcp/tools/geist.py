@@ -418,7 +418,9 @@ async def _ensure_scratchpad(
         if doc_channel is not None:
             try:
                 content_frag = doc_channel.doc.get("content", type=pycrdt.XmlFragment)
-                existing_text = str(content_frag).strip()
+                # str(XmlFragment) on empty/prewarmed Y.Docs produces
+                # <unknown></unknown> artifacts — strip them before checking.
+                existing_text = re.sub(r"</?unknown>", "", str(content_frag)).strip()
                 if existing_text:
                     logger.info(
                         "Skipping seed — document already has content",
