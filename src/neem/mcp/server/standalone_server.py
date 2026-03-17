@@ -21,6 +21,7 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
+from neem.mcp.auth import get_current_auth_token
 from neem.mcp.jobs.realtime import RealtimeJobClient
 from neem.mcp.tools.basic import register_basic_tools
 from neem.mcp.tools.graph_ops import register_graph_ops_tools
@@ -30,7 +31,7 @@ from neem.mcp.tools.geist import register_geist_tools
 from neem.mcp.tools.search import register_search_tools
 from neem.mcp.trace import trace, trace_separator
 from neem.utils.logging import LoggerFactory
-from neem.utils.token_storage import get_dev_user_id, get_internal_service_secret, validate_token_and_load
+from neem.utils.token_storage import get_dev_user_id, get_internal_service_secret
 
 logger = LoggerFactory.get_logger("mcp.standalone_server")
 
@@ -414,19 +415,21 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
 
     # Store the resolved config so the eventual tool layer can reuse it.
     mcp_server._backend_config = backend_config  # type: ignore[attr-defined]
+    auth_mode = (os.getenv("MNEMOSYNE_MCP_AUTH_MODE", "").strip().lower() or "auto")
+    hosted_mode = auth_mode in {"hosted", "sidecar"}
 
-    if backend_config.has_websocket:
+    if backend_config.has_websocket and not hosted_mode:
         dev_uid = get_dev_user_id()
         internal_secret = get_internal_service_secret()
         trace("Creating RealtimeJobClient", {
             "websocket_url": backend_config.websocket_url,
             "dev_user_id": dev_uid,
             "has_internal_secret": bool(internal_secret),
-            "token_provider": "validate_token_and_load",
+            "token_provider": "get_current_auth_token",
         })
         job_client = RealtimeJobClient(
             websocket_url=backend_config.websocket_url,  # type: ignore[arg-type]
-            token_provider=validate_token_and_load,
+            token_provider=get_current_auth_token,
             dev_user_id=dev_uid,
             internal_service_secret=internal_secret,
         )
@@ -437,8 +440,15 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
             extra_context={"websocket_url": backend_config.websocket_url},
         )
     else:
-        trace("WebSocket DISABLED — will use HTTP polling only")
-        logger.info("Realtime job streaming disabled (WebSocket URL not configured)")
+        if backend_config.has_websocket and hosted_mode:
+            trace("WebSocket job stream DISABLED in hosted auth mode")
+            logger.info(
+                "Realtime job streaming disabled in hosted auth mode; using HTTP polling",
+                extra_context={"auth_mode": auth_mode},
+            )
+        else:
+            trace("WebSocket DISABLED — will use HTTP polling only")
+            logger.info("Realtime job streaming disabled (WebSocket URL not configured)")
 
     verify_backend_connectivity(backend_config)
 

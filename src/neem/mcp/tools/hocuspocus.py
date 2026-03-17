@@ -26,12 +26,12 @@ from mcp.server.fastmcp import Context, FastMCP
 from neem.hocuspocus import HocuspocusClient, DocumentReader, DocumentWriter, WorkspaceWriter, WorkspaceReader
 from neem.hocuspocus.converters import looks_like_markdown, markdown_to_tiptap_xml, tiptap_xml_to_html, tiptap_xml_to_markdown
 from neem.hocuspocus.document import extract_title_from_xml
-from neem.mcp.auth import MCPAuthContext
+from neem.mcp.auth import MCPAuthContext, get_current_auth_token
 from neem.mcp.jobs import RealtimeJobClient
 from neem.mcp.tools.basic import await_job_completion, submit_job
 from neem.mcp.tools.wire_tools import _get_wires_for_document, _get_predicate_short_name
 from neem.utils.logging import LoggerFactory
-from neem.utils.token_storage import get_dev_user_id, get_internal_service_secret, get_user_id_from_token, validate_token_and_load
+from neem.utils.token_storage import get_dev_user_id, get_internal_service_secret, get_user_id_from_token
 
 logger = LoggerFactory.get_logger("mcp.tools.hocuspocus")
 
@@ -151,7 +151,7 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
     if hp_client is None:
         hp_client = HocuspocusClient(
             base_url=backend_config.base_url,
-            token_provider=validate_token_and_load,
+            token_provider=get_current_auth_token,
             dev_user_id=get_dev_user_id(),
             internal_service_secret=get_internal_service_secret(),
         )
