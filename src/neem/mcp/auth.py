@@ -9,7 +9,9 @@ Handles authentication from multiple sources:
 
 from __future__ import annotations
 
+import contextvars
 from dataclasses import dataclass
+import os
 from typing import TYPE_CHECKING, Callable, Dict, Optional
 
 from neem.utils.logging import LoggerFactory
@@ -24,6 +26,19 @@ if TYPE_CHECKING:
     from mcp.server.fastmcp import Context
 
 logger = LoggerFactory.get_logger("mcp.auth")
+_CURRENT_AUTH_CONTEXT: contextvars.ContextVar[Optional["MCPAuthContext"]] = contextvars.ContextVar(
+    "mcp_current_auth_context",
+    default=None,
+)
+
+
+def _auth_mode() -> str:
+    return (os.getenv("MNEMOSYNE_MCP_AUTH_MODE", "").strip().lower() or "auto")
+
+
+def _allow_local_fallbacks() -> bool:
+    mode = _auth_mode()
+    return mode not in {"hosted", "sidecar"}
 
 
 @dataclass
@@ -92,14 +107,16 @@ class MCPAuthContext:
                             extra_context={"user_id": user_id},
                         )
 
-        # 2. Fall back to local/env token (CLI mode)
-        if not token:
+        # 2. Fall back to local/env token (CLI mode).
+        # In hosted/sidecar mode, avoid global local-token fallback because
+        # requests must be scoped to the caller's forwarded auth context.
+        if not token and _allow_local_fallbacks():
             token = validate_token_and_load()
             if token:
                 source = "local_storage" if source == "none" else source
 
         # 3. Dev mode user override
-        if not user_id:
+        if not user_id and _allow_local_fallbacks():
             user_id = get_dev_user_id()
             if user_id and source == "none":
                 source = "dev_env"
@@ -133,6 +150,7 @@ class MCPAuthContext:
             },
         )
 
+        _CURRENT_AUTH_CONTEXT.set(result)
         return result
 
     def require_auth(self) -> str:
@@ -207,3 +225,23 @@ def create_context_aware_token_provider(
         return auth.token
 
     return provider
+
+
+def get_current_auth_context() -> Optional[MCPAuthContext]:
+    """Return the request-scoped auth context, if one is currently bound."""
+    return _CURRENT_AUTH_CONTEXT.get()
+
+
+def clear_current_auth_context() -> None:
+    """Clear any request-scoped auth context from the current task context."""
+    _CURRENT_AUTH_CONTEXT.set(None)
+
+
+def get_current_auth_token() -> Optional[str]:
+    """Return the active request token, falling back to local token when allowed."""
+    current = _CURRENT_AUTH_CONTEXT.get()
+    if current and current.token:
+        return current.token
+    if _allow_local_fallbacks():
+        return validate_token_and_load()
+    return None

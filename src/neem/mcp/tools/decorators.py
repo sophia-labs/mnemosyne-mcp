@@ -9,7 +9,7 @@ from __future__ import annotations
 from functools import wraps
 from typing import Any, Callable, TypeVar
 
-from neem.utils.token_storage import validate_token_and_load
+from neem.mcp.auth import MCPAuthContext, get_current_auth_token
 
 # Type variables for generic decorator typing
 F = TypeVar("F", bound=Callable[..., Any])
@@ -29,7 +29,12 @@ def require_auth(func: F) -> F:
 
     @wraps(func)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
-        token = validate_token_and_load()
+        context = kwargs.get("context")
+        if context is not None:
+            auth = MCPAuthContext.from_context(context)
+            token = auth.require_auth()
+        else:
+            token = get_current_auth_token()
         if not token:
             raise RuntimeError(
                 "Not authenticated. Run `neem init` to refresh your token."
