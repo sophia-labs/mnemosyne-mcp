@@ -334,18 +334,20 @@ def register_search_tools(server: FastMCP) -> None:
             return results
 
         def _search_substring() -> list[dict]:
-            q = query.lower()
-            q_norm = _normalize(query)
+            terms = query.lower().split()
+            if not terms:
+                return []
+            q_norm_terms = [_normalize(t) for t in terms]
             title_hits = []
             path_hits = []
             for e in entries:
-                if q in e["_title_lower"]:
+                if all(t in e["_title_lower"] for t in terms):
                     title_hits.append({**e, "match_type": "title_substring"})
-                elif q_norm and q_norm in e["_title_norm"]:
+                elif q_norm_terms and all(t in e["_title_norm"] for t in q_norm_terms):
                     title_hits.append({**e, "match_type": "title_substring"})
-                elif q in e["_path_lower"]:
+                elif all(t in e["_path_lower"] for t in terms):
                     path_hits.append({**e, "match_type": "path_substring"})
-                elif q_norm and q_norm in e["_path_norm"]:
+                elif q_norm_terms and all(t in e["_path_norm"] for t in q_norm_terms):
                     path_hits.append({**e, "match_type": "path_substring"})
             return title_hits + path_hits
 
