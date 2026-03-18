@@ -151,7 +151,7 @@ def _convert_list_item(
     elem: ET.Element,
     footnotes: list[str],
 ) -> list[str]:
-    """Convert <listItem listType="bullet|ordered"> to markdown list item."""
+    """Convert <listItem listType="bullet|ordered|task"> to markdown list item."""
     list_type = elem.get("listType", "bullet")
     indent = _get_int_attr(elem, "data-indent", 0)
     indent_str = "  " * indent
@@ -159,7 +159,11 @@ def _convert_list_item(
     # Extract content from child paragraph(s)
     content = _list_item_content(elem, footnotes)
 
-    if list_type == "ordered":
+    if list_type == "task":
+        checked = elem.get("checked", "false") == "true"
+        checkbox = "[x]" if checked else "[ ]"
+        return [f"{indent_str}- {checkbox} {content}"]
+    elif list_type == "ordered":
         return [f"{indent_str}1. {content}"]
     else:
         return [f"{indent_str}- {content}"]

@@ -354,14 +354,20 @@ def _flatten_task_item(
     footnotes: dict[str, str],
     indent: int,
 ) -> list[str]:
-    """Convert a task_list_item to a TipTap taskItem."""
+    """Convert a task_list_item to a flat listItem with listType="task"."""
+    items: list[str] = []
     checked = node.get("attrs", {}).get("checked", False)
     checked_str = "true" if checked else "false"
 
+    # Separate inline content from nested lists
     inline_children: list[dict] = []
+    nested_lists: list[dict] = []
+
     for child in node.get("children", []):
         ctype = child.get("type", "")
-        if ctype == "block_text":
+        if ctype == "list":
+            nested_lists.append(child)
+        elif ctype == "block_text":
             inline_children.extend(child.get("children", []))
         elif ctype == "paragraph":
             inline_children.extend(child.get("children", []))
@@ -370,11 +376,18 @@ def _flatten_task_item(
 
     content = _convert_inline_children(inline_children, footnotes) if inline_children else ""
     indent_attr = f' data-indent="{indent}"' if indent > 0 else ""
-    return [
-        f'<taskItem checked="{checked_str}"{indent_attr}>'
+    items.append(
+        f'<listItem listType="task" checked="{checked_str}"{indent_attr}>'
         f"<paragraph>{content}</paragraph>"
-        f"</taskItem>"
-    ]
+        f"</listItem>"
+    )
+
+    # Recursively flatten nested lists at indent+1
+    for nested in nested_lists:
+        nested_ordered = nested.get("attrs", {}).get("ordered", False)
+        items.extend(_flatten_list(nested, footnotes, indent + 1, nested_ordered))
+
+    return items
 
 
 # ---------------------------------------------------------------------------
