@@ -807,7 +807,11 @@ GROUP BY ?docId
                 document_id = payload.get("document_id")
                 source = payload.get("source", "unknown")
                 if graph_id or document_id:
-                    return {"graph_id": graph_id, "document_id": document_id}
+                    result = {"graph_id": graph_id, "document_id": document_id}
+                    display_name = payload.get("display_name")
+                    if display_name:
+                        result["display_name"] = display_name
+                    return result
                 # REST succeeded but session has no location — return a sentinel
                 # so the caller can report a clear error instead of falling through
                 # to the slower WebSocket path.
@@ -914,6 +918,7 @@ GROUP BY ?docId
             "where the user is. Follow up with get_workspace to see the full graph structure, "
             "or read_document to see the document content."
             "\n\nAlso returns a UTC ISO timestamp for temporal awareness."
+            "\n\nIf the user has set a display name, it is included as `display_name`."
         ),
     )
     async def get_user_location_tool(

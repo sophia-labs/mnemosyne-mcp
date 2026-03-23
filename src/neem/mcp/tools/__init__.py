@@ -6,3 +6,4 @@ from .hocuspocus import register_hocuspocus_tools  # noqa: F401
 from .wire_tools import register_wire_tools  # noqa: F401
 from .geist import register_geist_tools  # noqa: F401
 from .search import register_search_tools  # noqa: F401
+from .surface import register_surface_tools  # noqa: F401
