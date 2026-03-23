@@ -465,7 +465,7 @@ def register_search_tools(server: FastMCP) -> None:
 
         if inline and isinstance(inline, dict):
             if inline.get("error"):
-                logger.warning("semantic_search_error", error=inline["error"])
+                logger.warning("semantic_search_error", extra_context={"error": inline["error"]})
                 return []
             raw_results = inline.get("results", [])
             out = []
@@ -480,7 +480,7 @@ def register_search_tools(server: FastMCP) -> None:
             return out
 
         if result.get("status") == "failed":
-            logger.warning("semantic_search_failed", error=result.get("error"))
+            logger.warning("semantic_search_failed", extra_context={"error": result.get("error")})
         return []
 
     async def _run_lexical_search(
@@ -554,7 +554,7 @@ def register_search_tools(server: FastMCP) -> None:
 
         if not inline:
             if result.get("status") == "failed":
-                logger.warning("lexical_search_failed", error=result.get("error"))
+                logger.warning("lexical_search_failed", extra_context={"error": result.get("error")})
             return []
 
         # Parse SPARQL JSON results
@@ -650,7 +650,7 @@ def register_search_tools(server: FastMCP) -> None:
                 for did, ddata in docs.items():
                     doc_titles[did] = ddata.get("title") or "Untitled"
             except Exception as e:
-                logger.warning("search_blocks_workspace_lookup_failed", error=str(e))
+                logger.warning("search_blocks_workspace_lookup_failed", extra_context={"error": str(e)})
 
         if context:
             await context.report_progress(10, 100)
@@ -676,12 +676,12 @@ def register_search_tools(server: FastMCP) -> None:
             if isinstance(raw[0], list):
                 lexical_results = raw[0]
             else:
-                logger.warning("lexical_search_exception", error=str(raw[0]))
+                logger.warning("lexical_search_exception", extra_context={"error": str(raw[0])})
 
             if isinstance(raw[1], list):
                 semantic_results = raw[1]
             else:
-                logger.warning("semantic_search_exception", error=str(raw[1]))
+                logger.warning("semantic_search_exception", extra_context={"error": str(raw[1])})
 
         elif mode == "lexical":
             lexical_results = await _run_lexical_search(

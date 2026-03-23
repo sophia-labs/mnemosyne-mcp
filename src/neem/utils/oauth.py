@@ -387,7 +387,7 @@ async def exchange_code_for_token(code: str, code_verifier: str) -> Dict[str, An
             raise OAuthError(f"Failed to exchange code for token: {error_detail}") from e
 
         except Exception as e:
-            logger.error("Unexpected error during token exchange", error=str(e))
+            logger.error("Unexpected error during token exchange", extra_context={"error": str(e)})
             raise OAuthError(f"Token exchange failed: {str(e)}") from e
 
 
@@ -450,7 +450,7 @@ async def refresh_access_token(refresh_token: str) -> Optional[Dict[str, Any]]:
             return None
 
         except Exception as e:
-            logger.warning("Token refresh failed", error=str(e))
+            logger.warning("Token refresh failed", extra_context={"error": str(e)})
             return None
 
 
@@ -494,7 +494,7 @@ async def run_oauth_flow() -> Tuple[str, Optional[str]]:
             webbrowser.open(auth_url)
             print("🌐 Browser opened", file=sys.stderr)
         except Exception as e:
-            logger.warning("Failed to open browser", error=str(e))
+            logger.warning("Failed to open browser", extra_context={"error": str(e)})
             print(f"⚠️  Could not open browser automatically", file=sys.stderr)
             print(f"   Please open the URL manually", file=sys.stderr)
 
@@ -535,7 +535,7 @@ async def run_oauth_flow() -> Tuple[str, Optional[str]]:
         raise OAuthCancelledError("Authentication cancelled by user")
 
     except Exception as e:
-        logger.error("OAuth flow failed", error=str(e), error_type=type(e).__name__)
+        logger.error("OAuth flow failed", extra_context={"error": str(e), "error_type": type(e).__name__})
         raise
 
 
@@ -559,5 +559,5 @@ async def get_user_info(access_token: str) -> Dict[str, Any]:
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            logger.warning("Failed to fetch user info", error=str(e))
+            logger.warning("Failed to fetch user info", extra_context={"error": str(e)})
             return {}

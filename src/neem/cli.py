@@ -72,7 +72,7 @@ def init_command(
         rprint("\n\n[yellow]❌ Authentication cancelled by user[/yellow]")
         sys.exit(1)
     except Exception as e:
-        logger.error("Initialization failed", error=str(e))
+        logger.error("Initialization failed", extra_context={"error": str(e)})
         rprint(f"\n[red]❌ Initialization failed: {e}[/red]")
         sys.exit(1)
 

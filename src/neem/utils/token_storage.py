@@ -293,11 +293,11 @@ def is_token_expired(token: str) -> bool:
         return is_expired
 
     except jwt.DecodeError as e:
-        logger.error("Failed to decode token", error=str(e))
+        logger.error("Failed to decode token", extra_context={"error": str(e)})
         return True
 
     except Exception as e:
-        logger.error("Unexpected error checking token expiration", error=str(e))
+        logger.error("Unexpected error checking token expiration", extra_context={"error": str(e)})
         return True
 
 
@@ -349,7 +349,7 @@ def get_token_info(token: str) -> Optional[Dict[str, Any]]:
     try:
         return jwt.decode(token, options={"verify_signature": False})
     except Exception as e:
-        logger.error("Failed to decode token", error=str(e))
+        logger.error("Failed to decode token", extra_context={"error": str(e)})
         return None
 
 
@@ -438,7 +438,7 @@ def _try_refresh_token() -> Optional[str]:
         return new_id_token
 
     except Exception as e:
-        logger.warning("Token refresh failed", error=str(e))
+        logger.warning("Token refresh failed", extra_context={"error": str(e)})
         return None
 
 
