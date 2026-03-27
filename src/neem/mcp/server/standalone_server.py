@@ -290,6 +290,7 @@ HIVEMIND_EXCLUDED: frozenset[str] = frozenset({
     "reindex_graph",        # admin maintenance — agents shouldn't trigger re-indexing
     "list_wire_predicates", # predicate taxonomy is in CLAUDE.md — no need for a tool call
     "archive_memories",     # rare maintenance op — switch to full profile when needed
+    "surface",              # browser chat UI card — irrelevant to agent sessions
 })
 
 # Tools available in the "angel" profile — haiku-class subagents with
