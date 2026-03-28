@@ -17,6 +17,7 @@ import httpx
 from mcp.server.fastmcp import Context, FastMCP
 
 from neem.mcp.auth import MCPAuthContext
+from neem.mcp.http_client import get_http_client
 from neem.mcp.jobs import JobSubmitMetadata, RealtimeJobClient, WebSocketConnectionError
 from neem.mcp.trace import trace, trace_separator
 from neem.utils.logging import LoggerFactory
@@ -193,27 +194,28 @@ async def poll_job_until_terminal(
     trace("  poll: starting (max %d attempts, wait_ms=%d)" % (MAX_POLL_ATTEMPTS, wait_ms))
     attempt = 0
     last_payload: Optional[JsonDict] = None
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        while attempt < MAX_POLL_ATTEMPTS:
-            attempt += 1
-            trace("  poll: attempt %d/%d GET %s" % (attempt, MAX_POLL_ATTEMPTS, status_url))
-            resp = await client.get(
-                status_url,
-                headers=auth.http_headers(),
-                params={"wait_ms": wait_ms},
-            )
-            trace("  poll: HTTP %d" % resp.status_code)
-            resp.raise_for_status()
-            payload = resp.json()
-            last_payload = payload
-            status = (payload.get("status") or "").lower()
-            trace("  poll: status=%s" % status, payload)
-            if status in {"succeeded", "failed"}:
-                trace("  poll: terminal status reached")
-                return payload
-            sleep_time = min(1.0 * attempt, 5.0)
-            trace("  poll: not terminal, sleeping %.1fs" % sleep_time)
-            await asyncio.sleep(sleep_time)
+    client = get_http_client()
+    while attempt < MAX_POLL_ATTEMPTS:
+        attempt += 1
+        trace("  poll: attempt %d/%d GET %s" % (attempt, MAX_POLL_ATTEMPTS, status_url))
+        resp = await client.get(
+            status_url,
+            headers=auth.http_headers(),
+            params={"wait_ms": wait_ms},
+            timeout=HTTP_TIMEOUT,
+        )
+        trace("  poll: HTTP %d" % resp.status_code)
+        resp.raise_for_status()
+        payload = resp.json()
+        last_payload = payload
+        status = (payload.get("status") or "").lower()
+        trace("  poll: status=%s" % status, payload)
+        if status in {"succeeded", "failed"}:
+            trace("  poll: terminal status reached")
+            return payload
+        sleep_time = min(1.0 * attempt, 5.0)
+        trace("  poll: not terminal, sleeping %.1fs" % sleep_time)
+        await asyncio.sleep(sleep_time)
 
     trace("  poll: exhausted all attempts, returning last payload")
     return last_payload
@@ -443,57 +445,58 @@ async def _request_json(
         },
     )
     last_exc: Optional[Exception] = None
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        for attempt in range(MAX_RETRIES + 1):
-            try:
-                response = await client.request(
-                    method,
-                    url,
-                    headers=headers,
-                    json=json_payload,
+    client = get_http_client()
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            response = await client.request(
+                method,
+                url,
+                headers=headers,
+                json=json_payload,
+                timeout=HTTP_TIMEOUT,
+            )
+            if response.status_code >= 500 and attempt < MAX_RETRIES:
+                delay = RETRY_BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    "mcp_api_request_retrying",
+                    extra_context={
+                        "status_code": response.status_code,
+                        "attempt": attempt + 1,
+                        "max_retries": MAX_RETRIES,
+                        "delay_s": delay,
+                        "url": url,
+                    },
                 )
-                if response.status_code >= 500 and attempt < MAX_RETRIES:
-                    delay = RETRY_BACKOFF_BASE * (2 ** attempt)
-                    logger.warning(
-                        "mcp_api_request_retrying",
-                        extra_context={
-                            "status_code": response.status_code,
-                            "attempt": attempt + 1,
-                            "max_retries": MAX_RETRIES,
-                            "delay_s": delay,
-                            "url": url,
-                        },
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                if response.status_code >= 400:
-                    logger.error(
-                        "mcp_api_request_failed",
-                        extra_context={
-                            "status_code": response.status_code,
-                            "response_text": response.text[:500] if response.text else None,
-                        },
-                    )
-                response.raise_for_status()
-                if not response.content:
-                    return {}
-                return response.json()
-            except httpx.TimeoutException as exc:
-                last_exc = exc
-                if attempt < MAX_RETRIES:
-                    delay = RETRY_BACKOFF_BASE * (2 ** attempt)
-                    logger.warning(
-                        "mcp_api_request_timeout_retrying",
-                        extra_context={
-                            "attempt": attempt + 1,
-                            "max_retries": MAX_RETRIES,
-                            "delay_s": delay,
-                            "url": url,
-                        },
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                raise
+                await asyncio.sleep(delay)
+                continue
+            if response.status_code >= 400:
+                logger.error(
+                    "mcp_api_request_failed",
+                    extra_context={
+                        "status_code": response.status_code,
+                        "response_text": response.text[:500] if response.text else None,
+                    },
+                )
+            response.raise_for_status()
+            if not response.content:
+                return {}
+            return response.json()
+        except httpx.TimeoutException as exc:
+            last_exc = exc
+            if attempt < MAX_RETRIES:
+                delay = RETRY_BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    "mcp_api_request_timeout_retrying",
+                    extra_context={
+                        "attempt": attempt + 1,
+                        "max_retries": MAX_RETRIES,
+                        "delay_s": delay,
+                        "url": url,
+                    },
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise
     # Should not reach here, but satisfy type checker
     raise last_exc or RuntimeError("_request_json exhausted retries")
 

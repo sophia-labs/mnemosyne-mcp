@@ -39,6 +39,7 @@ from neem.hocuspocus import (
 )
 from neem.hocuspocus.converters import tiptap_xml_to_markdown
 from neem.mcp.auth import MCPAuthContext, get_current_auth_token
+from neem.mcp.http_client import get_http_client
 from neem.mcp.jobs import RealtimeJobClient
 from neem.mcp.tools.basic import await_job_completion, submit_job
 from neem.mcp.tools.wire_tools import _get_all_wires, _resolve_title_from_workspace
@@ -817,12 +818,12 @@ def register_geist_tools(server: FastMCP) -> None:
         headers = auth.http_headers()
         for attempt in range(1, 4):
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-                    resp = await client.post(
-                        url,
-                        params={"include_materialization": "false"},
-                        headers=headers,
-                    )
+                resp = await get_http_client().post(
+                    url,
+                    params={"include_materialization": "false"},
+                    headers=headers,
+                    timeout=httpx.Timeout(15.0),
+                )
                 if resp.status_code == 200:
                     payload = resp.json() if resp.content else {}
                     if payload.get("activeSession"):

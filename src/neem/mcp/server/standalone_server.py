@@ -22,6 +22,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
 from neem.mcp.auth import get_current_auth_token
+from neem.mcp.http_client import create_http_client, set_http_client
 from neem.mcp.jobs.realtime import RealtimeJobClient
 from neem.mcp.tools.basic import register_basic_tools
 from neem.mcp.tools.graph_ops import register_graph_ops_tools
@@ -417,6 +418,12 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
 
     # Store the resolved config so the eventual tool layer can reuse it.
     mcp_server._backend_config = backend_config  # type: ignore[attr-defined]
+
+    # Shared httpx client with connection pooling — replaces per-request
+    # AsyncClient instantiation across all tool modules.
+    http_client = create_http_client()
+    set_http_client(http_client)
+    mcp_server._http_client = http_client  # type: ignore[attr-defined]
     auth_mode = (os.getenv("MNEMOSYNE_MCP_AUTH_MODE", "").strip().lower() or "auto")
     hosted_mode = auth_mode in {"hosted", "sidecar"}
 
@@ -507,17 +514,6 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
             extra_context={"excluded": len(HIVEMIND_EXCLUDED)},
         )
 
-    # LOCAL STOPGAP: throttle on every tool call to reduce backend pressure
-    # when multiple Sophia instances hit the cluster simultaneously.
-    _original_call_tool = mcp_server.call_tool
-
-    async def _throttled_call_tool(*args, **kwargs):
-        await asyncio.sleep(0.1)
-        return await _original_call_tool(*args, **kwargs)
-
-    mcp_server.call_tool = _throttled_call_tool  # type: ignore[method-assign]
-    logger.info("Tool throttle enabled: 0.1s sleep before every tool call")
-
     # Remove excluded tools based on MCP_EXCLUDED_TOOLS env var.
     # Comma-separated list of tool names, e.g. "export_document,upload_artifact,sparql_update"
     excluded_raw = os.getenv("MCP_EXCLUDED_TOOLS", "")
@@ -567,6 +563,13 @@ def run_standalone_mcp_server_sync():
         logger.error(f"Server error: {exc}")
         raise
     finally:
+        # Best-effort close of the shared httpx client.
+        http_client = getattr(mcp_server, "_http_client", None)
+        if http_client is not None:
+            try:
+                asyncio.run(http_client.aclose())
+            except Exception:
+                pass  # Process is exiting anyway
         logger.info("✅ Standalone MCP server shutdown complete")
 
 

@@ -14,6 +14,7 @@ import httpx
 from mcp.server.fastmcp import Context, FastMCP
 
 from neem.mcp.auth import MCPAuthContext
+from neem.mcp.http_client import get_http_client
 from neem.mcp.jobs import JobSubmitMetadata, RealtimeJobClient
 from neem.mcp.utils.response_filters import (
     extract_result_from_job_detail,
@@ -94,18 +95,18 @@ def register_graph_tools(server: FastMCP) -> None:
 
         # Submit query job
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-                response = await client.post(
-                    f"{backend_config.base_url}/graphs/query",
-                    headers=auth.http_headers(),
-                    json={
-                        "sparql": sparql,
-                        "result_format": result_format,
-                        "max_rows": max_results,
-                    },
-                )
-                response.raise_for_status()
-                job_data = response.json()
+            response = await get_http_client().post(
+                f"{backend_config.base_url}/graphs/query",
+                headers=auth.http_headers(),
+                json={
+                    "sparql": sparql,
+                    "result_format": result_format,
+                    "max_rows": max_results,
+                },
+                timeout=HTTP_TIMEOUT,
+            )
+            response.raise_for_status()
+            job_data = response.json()
         except httpx.HTTPStatusError as e:
             error_detail = e.response.text
             return render_pretty_json({
@@ -213,14 +214,14 @@ def register_graph_tools(server: FastMCP) -> None:
 
         # Submit update job
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-                response = await client.post(
-                    f"{backend_config.base_url}/graphs/update",
-                    headers=auth.http_headers(),
-                    json={"sparql": sparql},
-                )
-                response.raise_for_status()
-                job_data = response.json()
+            response = await get_http_client().post(
+                f"{backend_config.base_url}/graphs/update",
+                headers=auth.http_headers(),
+                json={"sparql": sparql},
+                timeout=HTTP_TIMEOUT,
+            )
+            response.raise_for_status()
+            job_data = response.json()
         except httpx.HTTPStatusError as e:
             return render_pretty_json({
                 "error": "Update submission failed",
@@ -312,15 +313,15 @@ def register_graph_tools(server: FastMCP) -> None:
         method = method_map[action]
 
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-                response = await client.request(
-                    method,
-                    f"{backend_config.base_url}{endpoint}",
-                    headers=auth.http_headers(),
-                    params={"wait_ms": DEFAULT_WAIT_MS} if method == "GET" else None,
-                )
-                response.raise_for_status()
-                job_data = response.json()
+            response = await get_http_client().request(
+                method,
+                f"{backend_config.base_url}{endpoint}",
+                headers=auth.http_headers(),
+                params={"wait_ms": DEFAULT_WAIT_MS} if method == "GET" else None,
+                timeout=HTTP_TIMEOUT,
+            )
+            response.raise_for_status()
+            job_data = response.json()
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
                 return render_pretty_json({
@@ -419,18 +420,18 @@ def register_graph_tools(server: FastMCP) -> None:
 
         # Submit creation job
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-                response = await client.post(
-                    f"{backend_config.base_url}/graphs",
-                    headers=auth.http_headers(),
-                    json={
-                        "graph_id": graph_id,
-                        "title": title,
-                        "description": description,
-                    },
-                )
-                response.raise_for_status()
-                job_data = response.json()
+            response = await get_http_client().post(
+                f"{backend_config.base_url}/graphs",
+                headers=auth.http_headers(),
+                json={
+                    "graph_id": graph_id,
+                    "title": title,
+                    "description": description,
+                },
+                timeout=HTTP_TIMEOUT,
+            )
+            response.raise_for_status()
+            job_data = response.json()
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 409:
                 return render_pretty_json({
@@ -503,13 +504,13 @@ def register_graph_tools(server: FastMCP) -> None:
         auth.require_auth()
 
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-                response = await client.delete(
-                    f"{backend_config.base_url}/graphs/jobs/{job_id}",
-                    headers=auth.http_headers(),
-                )
-                response.raise_for_status()
-                result = response.json()
+            response = await get_http_client().delete(
+                f"{backend_config.base_url}/graphs/jobs/{job_id}",
+                headers=auth.http_headers(),
+                timeout=HTTP_TIMEOUT,
+            )
+            response.raise_for_status()
+            result = response.json()
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
                 return render_pretty_json({
@@ -563,31 +564,32 @@ async def _poll_job_until_terminal(
     """Poll job status endpoint until terminal state."""
     attempt = 0
     last_payload: Optional[JsonDict] = None
+    client = get_http_client()
 
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        while attempt < MAX_POLL_ATTEMPTS:
-            attempt += 1
-            try:
-                resp = await client.get(
-                    status_url,
-                    headers=auth.http_headers(),
-                    params={"wait_ms": wait_ms},
-                )
-                resp.raise_for_status()
-                payload = resp.json()
-                last_payload = payload
+    while attempt < MAX_POLL_ATTEMPTS:
+        attempt += 1
+        try:
+            resp = await client.get(
+                status_url,
+                headers=auth.http_headers(),
+                params={"wait_ms": wait_ms},
+                timeout=HTTP_TIMEOUT,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            last_payload = payload
 
-                status = (payload.get("status") or "").lower()
-                if status in {"succeeded", "failed"}:
-                    return payload
+            status = (payload.get("status") or "").lower()
+            if status in {"succeeded", "failed"}:
+                return payload
 
-                await asyncio.sleep(min(1.0 * attempt, 3.0))
-            except Exception as e:
-                logger.warning(
-                    "Job polling attempt failed",
-                    extra_context={"attempt": attempt, "error": str(e)},
-                )
-                await asyncio.sleep(2.0)
+            await asyncio.sleep(min(1.0 * attempt, 3.0))
+        except Exception as e:
+            logger.warning(
+                "Job polling attempt failed",
+                extra_context={"attempt": attempt, "error": str(e)},
+            )
+            await asyncio.sleep(2.0)
 
     return last_payload
 
@@ -595,12 +597,13 @@ async def _poll_job_until_terminal(
 async def _fetch_result(result_url: str, auth: MCPAuthContext) -> Optional[JsonDict]:
     """Fetch job result payload."""
     try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            response = await client.get(result_url, headers=auth.http_headers())
-            response.raise_for_status()
-            if not response.content:
-                return None
-            return response.json()
+        response = await get_http_client().get(
+            result_url, headers=auth.http_headers(), timeout=HTTP_TIMEOUT,
+        )
+        response.raise_for_status()
+        if not response.content:
+            return None
+        return response.json()
     except Exception as e:
         logger.warning("Failed to fetch job result", extra_context={"error": str(e)})
         return None

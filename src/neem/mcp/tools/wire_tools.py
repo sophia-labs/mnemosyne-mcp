@@ -21,6 +21,7 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from neem.hocuspocus import HocuspocusClient, WorkspaceReader, WorkspaceWriter
 from neem.mcp.auth import MCPAuthContext, get_current_auth_token
+from neem.mcp.http_client import get_http_client
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_dev_user_id, get_internal_service_secret
 
@@ -249,24 +250,25 @@ async def _refresh_wire_snapshot(
     """
     url = f"{base_url}/wires/{graph_id}/{wire_id}/refresh"
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-            resp = await client.post(url, headers=auth.http_headers())
-            if resp.status_code == 200:
-                logger.debug(
-                    "Wire snapshot refreshed",
-                    extra_context={"wire_id": wire_id, "graph_id": graph_id},
-                )
-                return True
-            else:
-                logger.debug(
-                    "Wire snapshot refresh returned non-200",
-                    extra_context={
-                        "wire_id": wire_id,
-                        "status": resp.status_code,
-                        "body": resp.text[:200],
-                    },
-                )
-                return False
+        resp = await get_http_client().post(
+            url, headers=auth.http_headers(), timeout=httpx.Timeout(10.0),
+        )
+        if resp.status_code == 200:
+            logger.debug(
+                "Wire snapshot refreshed",
+                extra_context={"wire_id": wire_id, "graph_id": graph_id},
+            )
+            return True
+        else:
+            logger.debug(
+                "Wire snapshot refresh returned non-200",
+                extra_context={
+                    "wire_id": wire_id,
+                    "status": resp.status_code,
+                    "body": resp.text[:200],
+                },
+            )
+            return False
     except Exception as e:
         logger.debug(
             "Wire snapshot refresh failed (best-effort)",

@@ -27,6 +27,7 @@ from neem.hocuspocus import HocuspocusClient, DocumentReader, DocumentWriter, Wo
 from neem.hocuspocus.converters import looks_like_markdown, markdown_to_tiptap_xml, tiptap_xml_to_html, tiptap_xml_to_markdown
 from neem.hocuspocus.document import extract_title_from_xml
 from neem.mcp.auth import MCPAuthContext, get_current_auth_token
+from neem.mcp.http_client import get_http_client
 from neem.mcp.jobs import RealtimeJobClient
 from neem.mcp.tools.basic import await_job_completion, submit_job
 from neem.mcp.tools.wire_tools import _get_wires_for_document, _get_predicate_short_name
@@ -255,8 +256,10 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
     async def _http_get_blob(path: str, auth: MCPAuthContext) -> tuple[bytes | None, int, str | None]:
         url = f"{backend_config.base_url}{path}"
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(_blob_timeout_seconds)) as client:
-                response = await client.get(url, headers=auth.http_headers())
+            response = await get_http_client().get(
+                url, headers=auth.http_headers(),
+                timeout=httpx.Timeout(_blob_timeout_seconds),
+            )
             if response.status_code == 200:
                 blob_source = response.headers.get("X-Blob-Source")
                 return response.content, 200, blob_source
@@ -718,8 +721,10 @@ GROUP BY ?docId
 
         for attempt in range(1, attempts + 1):
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-                    resp = await client.post(url, params=params, headers=headers)
+                resp = await get_http_client().post(
+                    url, params=params, headers=headers,
+                    timeout=httpx.Timeout(15.0),
+                )
 
                 # Rolling deploy safety: endpoint may not exist yet on some pods.
                 if resp.status_code == 404:
@@ -777,8 +782,9 @@ GROUP BY ?docId
         last_error: Optional[str] = None
         for attempt in range(1, attempts + 1):
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
-                    resp = await client.get(url, headers=headers)
+                resp = await get_http_client().get(
+                    url, headers=headers, timeout=httpx.Timeout(5.0),
+                )
                 if resp.status_code == 404:
                     # Endpoint not yet deployed on this pod — fall back to WebSocket path
                     return None
@@ -2383,19 +2389,18 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         """
         url = f"{backend_config.base_url}/documents/{graph_id}/{doc_id}"
         headers = auth.http_headers()
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.delete(url, headers=headers)
-            # 200 = completed inline, 202 = queued async — both are success
-            if resp.status_code not in (200, 202):
-                logger.warning(
-                    "hard_delete_document_failed",
-                    extra_context={
-                        "graph_id": graph_id,
-                        "doc_id": doc_id,
-                        "status": resp.status_code,
-                        "body": resp.text[:200] if resp.text else None,
-                    },
-                )
+        resp = await get_http_client().delete(url, headers=headers, timeout=30.0)
+        # 200 = completed inline, 202 = queued async — both are success
+        if resp.status_code not in (200, 202):
+            logger.warning(
+                "hard_delete_document_failed",
+                extra_context={
+                    "graph_id": graph_id,
+                    "doc_id": doc_id,
+                    "status": resp.status_code,
+                    "body": resp.text[:200] if resp.text else None,
+                },
+            )
 
     def _collect_document_ids_recursive(reader: WorkspaceReader, folder_id: str) -> list[str]:
         """Recursively collect all document IDs under a folder."""
@@ -2540,18 +2545,18 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             if parent_id is not None and parent_id.strip():
                 data["parent_id"] = parent_id.strip()
 
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-                resp = await client.post(
-                    url,
-                    files={"file": (filename, content, mime_type)},
-                    data=data,
-                    headers=auth.http_headers(),
+            resp = await get_http_client().post(
+                url,
+                files={"file": (filename, content, mime_type)},
+                data=data,
+                headers=auth.http_headers(),
+                timeout=httpx.Timeout(60.0),
+            )
+            if resp.status_code != 201:
+                raise RuntimeError(
+                    f"Backend returned {resp.status_code}: {resp.text[:300]}"
                 )
-                if resp.status_code != 201:
-                    raise RuntimeError(
-                        f"Backend returned {resp.status_code}: {resp.text[:300]}"
-                    )
-                result = resp.json()
+            result = resp.json()
 
             # New upload endpoint returns documentId (auto-ingested).
             # Fall back to artifactId for backward compat with old backend.
@@ -2617,13 +2622,15 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             if title is not None:
                 body["title"] = title
 
-            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
-                resp = await client.post(url, json=body, headers=auth.http_headers())
-                if resp.status_code not in (200, 201):
-                    raise RuntimeError(
-                        f"Backend returned {resp.status_code}: {resp.text[:300]}"
-                    )
-                data = resp.json()
+            resp = await get_http_client().post(
+                url, json=body, headers=auth.http_headers(),
+                timeout=httpx.Timeout(30.0),
+            )
+            if resp.status_code not in (200, 201):
+                raise RuntimeError(
+                    f"Backend returned {resp.status_code}: {resp.text[:300]}"
+                )
+            data = resp.json()
 
             return {
                 "success": True,
