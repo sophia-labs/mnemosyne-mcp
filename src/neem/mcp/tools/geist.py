@@ -352,6 +352,26 @@ def _build_wire_indexes(
     return doc_wire_counts, block_wire_counts, doc_newest_wire, block_to_doc
 
 
+def _build_doc_created_index(ws_doc: pycrdt.Doc) -> Dict[str, str]:
+    """Build {document_id: createdAt_ISO} index from workspace CRDT.
+
+    Used as temporal decay fallback for blocks without a lastValuatedAt timestamp.
+    Creation itself is attention — a document's birth is its first moment of relevance.
+    """
+    result: Dict[str, str] = {}
+    try:
+        reader = WorkspaceReader(ws_doc)
+        for doc_id in reader._documents.keys():
+            entry = reader._documents.get(doc_id)
+            if isinstance(entry, pycrdt.Map):
+                created = entry.get("createdAt")
+                if isinstance(created, str) and created:
+                    result[doc_id] = created
+    except Exception:
+        pass
+    return result
+
+
 # ── Scratchpad initialization ───────────────────────────────────────
 
 
@@ -1713,7 +1733,7 @@ WHERE {{
   {filter_clause}
 }}
 ORDER BY DESC(xsd:float(?cumImp) + ABS(xsd:float(?cumVal)))
-LIMIT {min(limit * 3, 200)}
+LIMIT {min(limit * 10, 500)}
 """
         # Run SPARQL query, weights load, and wire index build concurrently
         async def _fetch_rows() -> list[dict]:
@@ -1732,12 +1752,16 @@ LIMIT {min(limit * 3, 200)}
                 logger.debug("Could not load weights config, using defaults")
             return dict(DEFAULT_WEIGHTS)
 
+        _ws_doc = None
+
         async def _fetch_wires() -> tuple[Dict[str, int], Dict[str, int], Dict[str, str], Dict[str, str]]:
+            nonlocal _ws_doc
             try:
                 await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
                 ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
                 if ws_channel:
-                    all_wires = _get_all_wires(ws_channel.doc)
+                    _ws_doc = ws_channel.doc
+                    all_wires = _get_all_wires(_ws_doc)
                     return _build_wire_indexes(all_wires)
             except Exception:
                 logger.debug("Could not load wire data for composite scoring")
@@ -1748,6 +1772,7 @@ LIMIT {min(limit * 3, 200)}
         )
 
         now = datetime.now(timezone.utc)
+        doc_created_at = _build_doc_created_index(_ws_doc) if _ws_doc else {}
 
         # Parse results and compute composite scores
         valuated_block_ids: set[str] = set()
@@ -1765,13 +1790,15 @@ LIMIT {min(limit * 3, 200)}
                 if ":doc:" in pre:
                     parsed_doc_id = pre.rpartition(":doc:")[2]
 
-            # Temporal decay from last valuation
+            # Temporal decay: prefer lastValuatedAt, fall back to document creation time.
+            # Creation itself is attention — a document's birth is its first moment of relevance.
             last_val_str = row.get("lastVal", "")
+            timestamp_str = last_val_str or doc_created_at.get(parsed_doc_id, "")
             doc_age_days = 0.0
-            if last_val_str:
+            if timestamp_str:
                 try:
-                    last_val_dt = datetime.fromisoformat(last_val_str.replace("Z", "+00:00"))
-                    doc_age_days = max(0.0, (now - last_val_dt).total_seconds() / 86400.0)
+                    ts_dt = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                    doc_age_days = max(0.0, (now - ts_dt).total_seconds() / 86400.0)
                 except (ValueError, TypeError):
                     pass
 
@@ -1821,6 +1848,7 @@ LIMIT {min(limit * 3, 200)}
 
         # Inject unvaluated blocks that have wires — they score via
         # DEFAULT_UNVALUATED_IMPORTANCE + wire/temporal signals.
+        # Temporal decay uses document creation time as fallback.
         for blk_id, bwc in block_wire_counts.items():
             if blk_id in valuated_block_ids:
                 continue
@@ -1836,10 +1864,19 @@ LIMIT {min(limit * 3, 200)}
                     wire_age_days = max(0.0, (now - wire_dt).total_seconds() / 86400.0)
                 except (ValueError, TypeError):
                     pass
+            # Use document creation time for temporal decay
+            doc_age = 0.0
+            created_str = doc_created_at.get(doc_id, "")
+            if created_str:
+                try:
+                    created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                    doc_age = max(0.0, (now - created_dt).total_seconds() / 86400.0)
+                except (ValueError, TypeError):
+                    pass
             composite = _compute_composite_score(
                 importance=0.0,  # triggers DEFAULT_UNVALUATED_IMPORTANCE
                 valence=0.0,
-                doc_age_days=0.0,  # no valuation timestamp available
+                doc_age_days=doc_age,
                 block_wire_count=bwc,
                 doc_wire_count=dwc,
                 wire_age_days=wire_age_days,
@@ -1954,7 +1991,7 @@ WHERE {{
   {filter_clause}
 }}
 ORDER BY DESC(xsd:float(?cumImp) + ABS(xsd:float(?cumVal)))
-LIMIT {min(limit * 3, 60)}
+LIMIT {min(limit * 10, 200)}
 """
         # Run SPARQL query, weights load, and wire index build concurrently
         async def _fetch_rows() -> list[dict]:
@@ -2006,6 +2043,7 @@ LIMIT {min(limit * 3, 60)}
             rows = filtered_rows
 
         now = datetime.now(timezone.utc)
+        doc_created_at = _build_doc_created_index(ws_doc) if ws_doc else {}
 
         # Score and rank
         valuated_block_ids: set[str] = set()
@@ -2022,12 +2060,14 @@ LIMIT {min(limit * 3, 60)}
                 if ":doc:" in pre:
                     parsed_doc_id = pre.rpartition(":doc:")[2]
 
+            # Temporal decay: prefer lastValuatedAt, fall back to document creation time.
             last_val_str = row.get("lastVal", "")
+            timestamp_str = last_val_str or doc_created_at.get(parsed_doc_id, "")
             doc_age_days = 0.0
-            if last_val_str:
+            if timestamp_str:
                 try:
-                    last_val_dt = datetime.fromisoformat(last_val_str.replace("Z", "+00:00"))
-                    doc_age_days = max(0.0, (now - last_val_dt).total_seconds() / 86400.0)
+                    ts_dt = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                    doc_age_days = max(0.0, (now - ts_dt).total_seconds() / 86400.0)
                 except (ValueError, TypeError):
                     pass
 
@@ -2067,7 +2107,8 @@ LIMIT {min(limit * 3, 60)}
         if folder_doc_ids is not None:
             _scoped_doc_ids = set(folder_doc_ids)
 
-        # Inject unvaluated blocks that have wires
+        # Inject unvaluated blocks that have wires.
+        # Temporal decay uses document creation time as fallback.
         for blk_id, bwc in block_wire_counts.items():
             if blk_id in valuated_block_ids:
                 continue
@@ -2085,10 +2126,19 @@ LIMIT {min(limit * 3, 60)}
                     wire_age_days = max(0.0, (now - wire_dt).total_seconds() / 86400.0)
                 except (ValueError, TypeError):
                     pass
+            # Use document creation time for temporal decay
+            doc_age = 0.0
+            created_str = doc_created_at.get(doc_id, "")
+            if created_str:
+                try:
+                    created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                    doc_age = max(0.0, (now - created_dt).total_seconds() / 86400.0)
+                except (ValueError, TypeError):
+                    pass
             composite = _compute_composite_score(
                 importance=0.0,
                 valence=0.0,
-                doc_age_days=0.0,
+                doc_age_days=doc_age,
                 block_wire_count=bwc,
                 doc_wire_count=dwc,
                 wire_age_days=wire_age_days,
