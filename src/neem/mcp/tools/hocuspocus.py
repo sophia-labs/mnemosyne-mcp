@@ -159,7 +159,7 @@ def _build_find_candidates(requested_find: str) -> list[str]:
 def _find_positions_with_auto_match(
     plain_text: str,
     requested_find: str,
-) -> tuple[list[int], str]:
+) -> tuple[list[tuple[int, int]], str]:
     """Find match offsets with markdown/whitespace/unicode tolerant fallback."""
     candidates = _build_find_candidates(requested_find)
 
@@ -178,7 +178,7 @@ def _find_positions_with_auto_match(
     for candidate in candidates:
         positions = find_all(plain_text, candidate)
         if positions:
-            return positions, candidate
+            return [(pos, len(candidate)) for pos in positions], candidate
 
     # Pass 2: whitespace-collapsed match projected back to original offsets.
     collapsed_haystack, index_map = _collapse_ws_with_map(plain_text)
@@ -188,8 +188,28 @@ def _find_positions_with_auto_match(
             continue
         collapsed_positions = find_all(collapsed_haystack, normalized)
         if collapsed_positions:
-            mapped = [index_map[pos] for pos in collapsed_positions]
-            return mapped, normalized
+            spans: list[tuple[int, int]] = []
+            for collapsed_start in collapsed_positions:
+                orig_start = index_map[collapsed_start]
+
+                produced = 0
+                i = orig_start
+                in_ws = False
+                # Advance through original text until we emit the same number of
+                # collapsed characters as the normalized candidate.
+                while i < len(plain_text) and produced < len(normalized):
+                    ch = plain_text[i]
+                    if ch.isspace():
+                        if not in_ws:
+                            produced += 1
+                            in_ws = True
+                    else:
+                        produced += 1
+                        in_ws = False
+                    i += 1
+
+                spans.append((orig_start, max(0, i - orig_start)))
+            return spans, normalized
 
     return [], requested_find
 
@@ -3557,12 +3577,12 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                             raise ValueError(f"Block not found: {block_id_clean}")
 
                         plain_text = text_info["text"]
-                        positions, matched_find = _find_positions_with_auto_match(
+                        matches, matched_find = _find_positions_with_auto_match(
                             plain_text=plain_text,
                             requested_find=find,  # type: ignore[arg-type]
                         )
 
-                        if not positions:
+                        if not matches:
                             raise _EditMatchError(
                                 f"Text {find!r} not found in block {block_id_clean}",
                                 code="no_match",
@@ -3577,46 +3597,45 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
 
                         # Select which occurrences to replace
                         if occurrence == 0:
-                            selected = positions
+                            selected = matches
                         elif occurrence > 0:
-                            if occurrence > len(positions):
+                            if occurrence > len(matches):
                                 raise _EditMatchError(
                                     f"Occurrence {occurrence} requested but only "
-                                    f"{len(positions)} match(es) found",
+                                    f"{len(matches)} match(es) found",
                                     code="occurrence_out_of_range",
                                     diagnostics={
                                         "requested_find": find,
                                         "matched_find": matched_find,
-                                        "positions": positions,
+                                        "positions": [pos for pos, _ in matches],
                                         "occurrence": occurrence,
                                         "block_text_preview": plain_text[:400],
                                     },
                                 )
-                            selected = [positions[occurrence - 1]]
+                            selected = [matches[occurrence - 1]]
                         else:  # negative
-                            if abs(occurrence) > len(positions):
+                            if abs(occurrence) > len(matches):
                                 raise _EditMatchError(
                                     f"Occurrence {occurrence} requested but only "
-                                    f"{len(positions)} match(es) found",
+                                    f"{len(matches)} match(es) found",
                                     code="occurrence_out_of_range",
                                     diagnostics={
                                         "requested_find": find,
                                         "matched_find": matched_find,
-                                        "positions": positions,
+                                        "positions": [pos for pos, _ in matches],
                                         "occurrence": occurrence,
                                         "block_text_preview": plain_text[:400],
                                     },
                                 )
-                            selected = [positions[occurrence]]
+                            selected = [matches[occurrence]]
 
                         # Build offset operations (delete + insert for each match)
                         # Order: each position gets delete then insert at same offset.
                         # edit_block_text sorts descending by offset (stable sort
                         # preserves delete-before-insert for same offset).
-                        find_len = len(matched_find)
                         ops: list[dict] = []
-                        for pos in selected:
-                            ops.append({"type": "delete", "offset": pos, "length": find_len})
+                        for pos, span_len in selected:
+                            ops.append({"type": "delete", "offset": pos, "length": span_len})
                             if replace:  # skip insert for empty replacement (pure deletion)
                                 ops.append({"type": "insert", "offset": pos, "text": replace})
 
