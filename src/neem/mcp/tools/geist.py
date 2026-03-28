@@ -665,135 +665,6 @@ def _extract_query_result(result: JsonDict) -> Any | None:
     return inline
 
 
-# ── Reciprocal Rank Fusion ──────────────────────────────────────────
-
-
-def _rrf_merge(
-    memory_results: list[dict],
-    vector_results: list[dict],
-    k: int = 60,
-) -> list[dict]:
-    """Merge two ranked lists using Reciprocal Rank Fusion.
-
-    Each item gets score = 1/(k + rank) from each list it appears in.
-    Items that appear in both lists get scores summed.
-
-    Memory results are keyed by "number" (memory queue entries).
-    Vector results are keyed by "block_id:doc_id" (graph-wide blocks).
-    Since they come from different namespaces, they never collide —
-    every item keeps its source attribution and scores simply accumulate
-    for anything that happens to appear in both.
-
-    Returns merged list sorted by RRF score descending.
-    """
-    scores: dict[str, float] = {}
-    items: dict[str, dict] = {}
-
-    # Score memory results (keyed by memory number)
-    for rank, mem in enumerate(memory_results):
-        key = f"mem:{mem.get('number', rank)}"
-        scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
-        if key not in items:
-            items[key] = {**mem, "source": "memory"}
-
-    # Score vector results (keyed by block_id:doc_id)
-    for rank, hit in enumerate(vector_results):
-        key = f"vec:{hit.get('doc_id', '')}:{hit.get('block_id', '')}"
-        scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
-        if key not in items:
-            items[key] = {
-                "text": hit.get("text_preview", ""),
-                "doc_id": hit.get("doc_id", ""),
-                "doc_title": hit.get("doc_title", ""),
-                "block_id": hit.get("block_id", ""),
-                "score": hit.get("score", 0.0),
-                "source": "vector",
-            }
-
-    # Sort by RRF score
-    ranked_keys = sorted(scores, key=lambda k: scores[k], reverse=True)
-    merged = []
-    for key in ranked_keys:
-        item = items[key]
-        item["rrf_score"] = round(scores[key], 6)
-        merged.append(item)
-
-    return merged
-
-
-async def _run_semantic_search(
-    backend_config: Any,
-    job_stream: Any,
-    auth: MCPAuthContext,
-    graph_id: str,
-    query: str,
-    limit: int,
-) -> list[dict]:
-    """Run semantic search via the worker pipeline. Returns hits or empty list."""
-    try:
-        if job_stream:
-            try:
-                await job_stream.ensure_ready()
-            except Exception:
-                pass
-
-        metadata = await submit_job(
-            base_url=backend_config.base_url,
-            auth=auth,
-            task_type="semantic_search",
-            payload={
-                "graph_id": graph_id,
-                "query": query,
-                "limit": limit,
-            },
-        )
-
-        ws_events, poll_payload = await await_job_completion(
-            job_stream, metadata, auth, timeout=STREAM_TIMEOUT_SECONDS,
-        )
-
-        # Extract results from WS events
-        if ws_events:
-            for event in reversed(ws_events):
-                event_type = event.get("type", "")
-                payload = event.get("payload", {})
-                payload_status = payload.get("status", "") if isinstance(payload, dict) else ""
-                is_success = (
-                    event_type in ("job_completed", "completed", "succeeded")
-                    or (event_type == "job_update" and payload_status == "succeeded")
-                )
-                if is_success:
-                    inline: Any = None
-                    if isinstance(payload, dict):
-                        detail = payload.get("detail", {})
-                        if isinstance(detail, dict):
-                            inline = detail.get("result_inline")
-                        if inline is None and payload.get("result_inline") is not None:
-                            inline = payload.get("result_inline")
-                    if inline is None and event.get("result_inline") is not None:
-                        inline = event.get("result_inline")
-                    if isinstance(inline, dict):
-                        results = inline.get("results", [])
-                        if isinstance(results, list):
-                            return results
-
-        # Extract from poll
-        if poll_payload:
-            detail = poll_payload.get("detail", {})
-            if isinstance(detail, dict):
-                inline = detail.get("result_inline", {})
-                if isinstance(inline, dict):
-                    return inline.get("results", [])
-
-    except Exception as exc:
-        logger.warning(
-            "hybrid_recall_semantic_search_failed",
-            extra_context={"graph_id": graph_id, "error": str(exc)},
-        )
-
-    return []
-
-
 # ── Tool registration ───────────────────────────────────────────────
 
 
@@ -999,17 +870,6 @@ def register_geist_tools(server: FastMCP) -> None:
                 })
             return _render_json({"memories": [], "note": f"Memory #{number} not found"})
 
-        # When query is provided, run hybrid search: memory queue + vector search
-        # in parallel, then merge with Reciprocal Rank Fusion.
-        vector_task = None
-        if query and query.strip():
-            vector_task = asyncio.create_task(
-                _run_semantic_search(
-                    backend_config, job_stream, auth,
-                    graph_id, query.strip(), limit,
-                )
-            )
-
         # Collect all memory metadata
         memories = []
         for num_str, entry in mem_entries.items():
@@ -1035,30 +895,8 @@ def register_geist_tools(server: FastMCP) -> None:
             return max(m.get("created_at", ""), m.get("last_active", ""))
 
         memories.sort(key=sort_key, reverse=True)
-
-        # If no query, return plain memory results (original behavior)
-        if not vector_task:
-            memories = memories[:limit]
-            return _render_json({"memories": memories, "count": len(memories)})
-
-        # Hybrid path: await vector results and merge via RRF
-        vector_hits = await vector_task
-        if not vector_hits:
-            # Vector search returned nothing — fall back to memory-only
-            memories = memories[:limit]
-            return _render_json({"memories": memories, "count": len(memories)})
-
-        merged = _rrf_merge(memories, vector_hits)
-        merged = merged[:limit]
-
-        return _render_json({
-            "results": merged,
-            "count": len(merged),
-            "sources": {
-                "memory": len([r for r in merged if r.get("source") == "memory"]),
-                "vector": len([r for r in merged if r.get("source") == "vector"]),
-            },
-        })
+        memories = memories[:limit]
+        return _render_json({"memories": memories, "count": len(memories)})
 
     @server.tool(
         name="care",

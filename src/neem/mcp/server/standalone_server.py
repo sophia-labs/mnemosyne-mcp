@@ -395,7 +395,7 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
             "- query_blocks: Single-document structural filter (block_type, heading_level, indent, list_type, checked, text_contains). "
             "CRDT-native, instant, no backend round-trip. Use for structural navigation within one document; use search_blocks for cross-document discovery\n"
             "- reindex_graph: Re-embed all documents (admin/maintenance, auto-indexes on save)\n"
-            "- recall with query param uses hybrid search: memory queue + vector similarity merged via RRF\n\n"
+            "- recall with query param searches only the memory queue\n\n"
             "**TipTap XML Reference:**\n"
             "Block types: paragraph, heading (level=\"1-3\"), bulletList, orderedList, blockquote, "
             "codeBlock (language=\"...\"), taskList (taskItem checked=\"true\"), horizontalRule, "
