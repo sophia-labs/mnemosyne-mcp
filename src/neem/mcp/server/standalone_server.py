@@ -563,13 +563,15 @@ def run_standalone_mcp_server_sync():
         logger.error(f"Server error: {exc}")
         raise
     finally:
-        # Best-effort close of the shared httpx client.
+        # Best-effort close of the shared httpx client and clear the global.
         http_client = getattr(mcp_server, "_http_client", None)
         if http_client is not None:
             try:
                 asyncio.run(http_client.aclose())
             except Exception:
                 pass  # Process is exiting anyway
+            from neem.mcp.http_client import clear_http_client
+            clear_http_client()
         logger.info("✅ Standalone MCP server shutdown complete")
 
 

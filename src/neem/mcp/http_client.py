@@ -62,9 +62,25 @@ def create_http_client(
 
 
 def set_http_client(client: httpx.AsyncClient) -> None:
-    """Set the module-level shared client (called once at server startup)."""
+    """Set the module-level shared client (called once at server startup).
+
+    If a previous client exists it is closed best-effort to avoid leaking
+    connections (relevant for tests that spin up multiple servers).
+    """
     global _client
+    old = _client
     _client = client
+    if old is not None and old is not client:
+        try:
+            old.close()  # sync close — enough for cleanup
+        except Exception:
+            pass
+
+
+def clear_http_client() -> None:
+    """Clear the global pointer (call after closing the client at shutdown)."""
+    global _client
+    _client = None
 
 
 def get_http_client() -> httpx.AsyncClient:
