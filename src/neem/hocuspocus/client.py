@@ -128,6 +128,18 @@ class HocuspocusClient:
             0,
             int(os.getenv("MNEMOSYNE_HOCUSPOCUS_CONNECT_RETRIES", str(connect_retries))),
         )
+        max_concurrent_connects_env = os.getenv(
+            "MNEMOSYNE_HOCUSPOCUS_MAX_CONCURRENT_CONNECTS", "8",
+        )
+        try:
+            max_concurrent_connects = int(max_concurrent_connects_env)
+        except ValueError:
+            logger.warning(
+                "Invalid MNEMOSYNE_HOCUSPOCUS_MAX_CONCURRENT_CONNECTS, using default",
+                extra_context={"value": max_concurrent_connects_env, "default": 8},
+            )
+            max_concurrent_connects = 8
+        max_concurrent_connects = max(1, max_concurrent_connects)
         self._heartbeat_interval = heartbeat_interval
 
         # HTTP session for WebSocket connections
@@ -143,6 +155,9 @@ class HocuspocusClient:
         # causing one caller to read from an unsynced channel.
         self._workspace_connect_locks: Dict[str, asyncio.Lock] = {}
         self._document_connect_locks: Dict[str, asyncio.Lock] = {}
+        # Global connect limiter prevents WS connect storms when many tools
+        # open channels in parallel (e.g. pathfinder swarms).
+        self._connect_semaphore = asyncio.Semaphore(max_concurrent_connects)
 
         # Document channel idle cleanup
         self._doc_idle_timeout = max(
@@ -287,63 +302,64 @@ class HocuspocusClient:
         )
 
         try:
-            session = await self._get_http_session()
-            channel.ws = await session.ws_connect(
-                ws_url,
-                headers=headers,
-                protocols=protocols or [],
-                timeout=aiohttp.ClientTimeout(total=self._connect_timeout),
-                heartbeat=self._heartbeat_interval,
-                max_msg_size=16 * 1024 * 1024,  # 16MB — match uvicorn default
-            )
-
-            # Start receiver task
-            channel.receiver_task = asyncio.create_task(
-                self._receiver_loop(channel, channel_name),
-                name=f"hocuspocus-{channel_name}",
-            )
-
-            # Send our state vector to initiate sync
-            state_vector = channel.doc.get_state()
-            logger.info(
-                "Sending sync_step1 with our state vector",
-                extra_context={
-                    "channel": channel_name,
-                    "state_vector_size": len(state_vector),
-                    "state_vector_hex": state_vector.hex() if state_vector else "",
-                },
-            )
-            await channel.ws.send_bytes(encode_sync_step1(state_vector))
-
-            # Wait for sync to complete (server sends sync_step2)
-            try:
-                await asyncio.wait_for(channel.synced.wait(), timeout=self._sync_timeout)
-                channel.synced_at = time.monotonic()
-                logger.info(
-                    "Hocuspocus channel synced",
-                    extra_context={"channel": channel_name},
+            async with self._connect_semaphore:
+                session = await self._get_http_session()
+                channel.ws = await session.ws_connect(
+                    ws_url,
+                    headers=headers,
+                    protocols=protocols or [],
+                    timeout=aiohttp.ClientTimeout(total=self._connect_timeout),
+                    heartbeat=self._heartbeat_interval,
+                    max_msg_size=16 * 1024 * 1024,  # 16MB — match uvicorn default
                 )
-            except asyncio.TimeoutError:
-                close_code = channel.ws.close_code if channel.ws is not None else None
-                ws_exception = None
-                try:
-                    if channel.ws is not None:
-                        ws_exception = channel.ws.exception()
-                except Exception:
-                    ws_exception = None
-                logger.error(
-                    "Hocuspocus sync timeout",
+
+                # Start receiver task
+                channel.receiver_task = asyncio.create_task(
+                    self._receiver_loop(channel, channel_name),
+                    name=f"hocuspocus-{channel_name}",
+                )
+
+                # Send our state vector to initiate sync
+                state_vector = channel.doc.get_state()
+                logger.info(
+                    "Sending sync_step1 with our state vector",
                     extra_context={
                         "channel": channel_name,
-                        "timeout_seconds": self._sync_timeout,
-                        "close_code": close_code,
-                        "ws_exception": str(ws_exception) if ws_exception else None,
+                        "state_vector_size": len(state_vector),
+                        "state_vector_hex": state_vector.hex() if state_vector else "",
                     },
                 )
-                raise TimeoutError(
-                    f"Hocuspocus sync timed out for channel: {channel_name} "
-                    f"(timeout={self._sync_timeout}s close_code={close_code})"
-                )
+                await channel.ws.send_bytes(encode_sync_step1(state_vector))
+
+                # Wait for sync to complete (server sends sync_step2)
+                try:
+                    await asyncio.wait_for(channel.synced.wait(), timeout=self._sync_timeout)
+                    channel.synced_at = time.monotonic()
+                    logger.info(
+                        "Hocuspocus channel synced",
+                        extra_context={"channel": channel_name},
+                    )
+                except asyncio.TimeoutError:
+                    close_code = channel.ws.close_code if channel.ws is not None else None
+                    ws_exception = None
+                    try:
+                        if channel.ws is not None:
+                            ws_exception = channel.ws.exception()
+                    except Exception:
+                        ws_exception = None
+                    logger.error(
+                        "Hocuspocus sync timeout",
+                        extra_context={
+                            "channel": channel_name,
+                            "timeout_seconds": self._sync_timeout,
+                            "close_code": close_code,
+                            "ws_exception": str(ws_exception) if ws_exception else None,
+                        },
+                    )
+                    raise TimeoutError(
+                        f"Hocuspocus sync timed out for channel: {channel_name} "
+                        f"(timeout={self._sync_timeout}s close_code={close_code})"
+                    )
 
         except Exception as exc:
             await self._reset_channel(channel)

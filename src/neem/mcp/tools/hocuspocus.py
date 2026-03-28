@@ -327,7 +327,9 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
     # ------------------------------------------------------------------
     # Direct read path (Platform HTTP blob endpoint -> WebSocket fallback)
     # ------------------------------------------------------------------
-    raw_read_path_mode = (os.getenv("MNEMOSYNE_READ_PATH", "websocket").strip().lower() or "websocket")
+    # Default to hybrid: HTTP blob fast path for read-heavy workloads,
+    # with WebSocket fallback for compatibility.
+    raw_read_path_mode = (os.getenv("MNEMOSYNE_READ_PATH", "hybrid").strip().lower() or "hybrid")
     mode_aliases = {
         "redis": "http_blob",  # deprecated alias
         "blob": "http_blob",
