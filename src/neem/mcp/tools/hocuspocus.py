@@ -14,6 +14,7 @@ import math
 import mimetypes
 import os
 import re
+import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,6 +76,117 @@ def _ensure_xml_multiblock(text: str) -> str:
     return "".join(
         f"<paragraph>{html_mod.escape(p)}</paragraph>" for p in paragraphs
     )
+
+
+_LIST_PREFIX_RE = re.compile(r"(?m)^\s*(?:[-+*]|\d+\.)\s+(?:\[[ xX]\]\s+)?")
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_FOOTNOTE_REF_RE = re.compile(r"\[\^[^\]]+\]")
+
+
+def _collapse_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _collapse_ws_with_map(text: str) -> tuple[str, list[int]]:
+    """Collapse whitespace while preserving normalized->original index mapping."""
+    out: list[str] = []
+    idx_map: list[int] = []
+    in_ws = False
+    for i, ch in enumerate(text):
+        if ch.isspace():
+            if not in_ws:
+                out.append(" ")
+                idx_map.append(i)
+                in_ws = True
+        else:
+            out.append(ch)
+            idx_map.append(i)
+            in_ws = False
+    return "".join(out), idx_map
+
+
+def _strip_markdown_wrappers(text: str) -> str:
+    """Best-effort projection from markdown-ish text to plain block text."""
+    out = text
+    out = _LIST_PREFIX_RE.sub("", out)
+    out = _MARKDOWN_LINK_RE.sub(r"\1", out)
+    out = _FOOTNOTE_REF_RE.sub("", out)
+
+    # Strip common inline markdown wrappers while preserving inner text.
+    patterns = [
+        (r"\*\*(.*?)\*\*", r"\1"),
+        (r"__(.*?)__", r"\1"),
+        (r"\*(.*?)\*", r"\1"),
+        (r"_(.*?)_", r"\1"),
+        (r"~~(.*?)~~", r"\1"),
+        (r"`([^`]*)`", r"\1"),
+        (r"==(.+?)==", r"\1"),
+    ]
+    for pattern, repl in patterns:
+        out = re.sub(pattern, repl, out, flags=re.DOTALL)
+
+    return out
+
+
+def _find_positions_with_auto_match(
+    plain_text: str,
+    requested_find: str,
+) -> tuple[list[int], str]:
+    """Find match offsets with markdown/whitespace/unicode tolerant fallback."""
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def push(value: str) -> None:
+        if value is None:
+            return
+        value = value.strip()
+        if not value or value in seen:
+            return
+        seen.add(value)
+        candidates.append(value)
+
+    raw = requested_find
+    push(raw)
+    push(unicodedata.normalize("NFC", raw))
+    push(unicodedata.normalize("NFKC", raw))
+
+    md_stripped = _strip_markdown_wrappers(raw)
+    push(md_stripped)
+    push(unicodedata.normalize("NFKC", md_stripped))
+
+    push(_collapse_ws(raw))
+    push(_collapse_ws(md_stripped))
+    push(_collapse_ws(unicodedata.normalize("NFKC", md_stripped)))
+
+    def find_all(haystack: str, needle: str) -> list[int]:
+        positions: list[int] = []
+        start = 0
+        while True:
+            idx = haystack.find(needle, start)
+            if idx == -1:
+                break
+            positions.append(idx)
+            start = idx + 1
+        return positions
+
+    # Pass 1: direct literal matching with normalized candidates.
+    for candidate in candidates:
+        positions = find_all(plain_text, candidate)
+        if positions:
+            return positions, candidate
+
+    # Pass 2: whitespace-collapsed match projected back to original offsets.
+    collapsed_haystack, index_map = _collapse_ws_with_map(plain_text)
+    for candidate in candidates:
+        normalized = _collapse_ws(candidate)
+        if not normalized:
+            continue
+        collapsed_positions = find_all(collapsed_haystack, normalized)
+        if collapsed_positions:
+            mapped = [index_map[pos] for pos in collapsed_positions]
+            return mapped, normalized
+
+    return [], requested_find
 
 
 def _normalize_timestamp_to_iso(value: Any) -> str | None:
@@ -3337,6 +3449,8 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "with concurrent browser edits. Two modes:\n\n"
             "**Find-and-replace mode (recommended):** Pass `find` and `replace` strings. "
             "The tool locates the text and generates precise offset operations internally. "
+            "Matching defaults to `match_mode='auto'` (markdown/whitespace tolerant), "
+            "so agents can safely pass text copied from markdown reads. "
             "Use `occurrence` to control which match: 1 (default) = first, -1 = last, "
             "0 = all. No need to calculate offsets manually.\n\n"
             "**Offset mode:** Pass `operations` list for direct character-level control. "
@@ -3358,6 +3472,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         find: Optional[str] = None,
         replace: Optional[str] = None,
         occurrence: int = 1,
+        match_mode: str = "auto",
         context: Context | None = None,
     ) -> dict:
         """Edit text within a block — find/replace or raw offset operations.
@@ -3370,6 +3485,8 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             find: Text to find within the block (find/replace mode)
             replace: Text to replace matches with (find/replace mode)
             occurrence: Which occurrence to replace: 1=first, -1=last, 0=all
+            match_mode: Matching behavior: "auto" (default, markdown/whitespace tolerant)
+                or "strict" (exact literal matching)
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
@@ -3393,6 +3510,8 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 raise ValueError("'find' must be a non-empty string")
             if replace is None:
                 raise ValueError("'replace' is required when using find/replace mode")
+            if match_mode not in ("auto", "strict"):
+                raise ValueError("match_mode must be 'auto' or 'strict'")
 
         try:
             # Validate document exists in workspace
@@ -3417,15 +3536,22 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
 
                     plain_text = text_info["text"]
 
-                    # Find all occurrences
-                    positions: list[int] = []
-                    start = 0
-                    while True:
-                        idx = plain_text.find(find, start)  # type: ignore[arg-type]
-                        if idx == -1:
-                            break
-                        positions.append(idx)
-                        start = idx + 1
+                    # Find all occurrences (default: tolerant auto-matching).
+                    if match_mode == "strict":
+                        matched_find = find  # type: ignore[assignment]
+                        positions = []
+                        start = 0
+                        while True:
+                            idx = plain_text.find(matched_find, start)  # type: ignore[arg-type]
+                            if idx == -1:
+                                break
+                            positions.append(idx)
+                            start = idx + 1
+                    else:
+                        positions, matched_find = _find_positions_with_auto_match(
+                            plain_text=plain_text,
+                            requested_find=find,  # type: ignore[arg-type]
+                        )
 
                     if not positions:
                         raise ValueError(
@@ -3454,7 +3580,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                     # Order: each position gets delete then insert at same offset.
                     # edit_block_text sorts descending by offset (stable sort
                     # preserves delete-before-insert for same offset).
-                    find_len = len(find)  # type: ignore[arg-type]
+                    find_len = len(matched_find)
                     ops: list[dict] = []
                     for pos in selected:
                         ops.append({"type": "delete", "offset": pos, "length": find_len})

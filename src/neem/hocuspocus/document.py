@@ -279,6 +279,79 @@ def _escape_xml(text: str) -> str:
     )
 
 
+def _walk_text_runs(
+    node: Any,
+    runs: list[dict[str, Any]],
+    offset_cp: int,
+    include_nodes: bool = False,
+) -> tuple[int, bool]:
+    """Recursively collect text/inline runs from a block subtree.
+
+    This treats nested container elements (e.g. listItem > paragraph) as
+    structural and descends into them. Only known inline atom nodes are
+    represented as a single placeholder character in offset space.
+    """
+    has_inline = False
+
+    if isinstance(node, pycrdt.XmlText):
+        diff_runs = node.diff()
+        for text_or_embed, attrs in diff_runs:
+            if isinstance(text_or_embed, str) and text_or_embed:
+                run_len = len(text_or_embed)
+                run: dict[str, Any] = {
+                    "text": text_or_embed,
+                    "offset": offset_cp,
+                    "length": run_len,
+                    "attrs": attrs if attrs else None,
+                }
+                if include_nodes:
+                    run["text_node"] = node
+                runs.append(run)
+                offset_cp += run_len
+        return offset_cp, has_inline
+
+    if isinstance(node, pycrdt.XmlElement):
+        tag = getattr(node, "tag", "")
+        if tag in INLINE_NODE_ELEMENTS:
+            inline_run: dict[str, Any] = {
+                "text": None,
+                "offset": offset_cp,
+                "length": 1,
+                "attrs": None,
+                "inline_element": tag,
+            }
+            if include_nodes:
+                inline_run["inline_node"] = node
+            runs.append(inline_run)
+            return offset_cp + 1, True
+
+        for child in node.children:
+            offset_cp, child_has_inline = _walk_text_runs(
+                child, runs, offset_cp, include_nodes=include_nodes,
+            )
+            has_inline = has_inline or child_has_inline
+
+    return offset_cp, has_inline
+
+
+def _extract_block_text_state(block: Any, include_nodes: bool = False) -> dict[str, Any]:
+    """Extract canonical block text state from a block subtree."""
+    runs: list[dict[str, Any]] = []
+    length_cp, has_inline = _walk_text_runs(
+        block, runs, 0, include_nodes=include_nodes,
+    )
+    full_text = "".join(
+        run["text"] if run.get("text") is not None else "\ufffc"
+        for run in runs
+    )
+    return {
+        "text": full_text,
+        "length": length_cp,
+        "runs": runs,
+        "has_inline_nodes": has_inline,
+    }
+
+
 def _mark_name_to_xml_tag(mark_name: str) -> str | None:
     """Convert TipTap internal mark name to XML element tag.
 
@@ -622,14 +695,10 @@ class DocumentReader:
         # Extract attributes
         attrs = dict(elem.attributes) if hasattr(elem, "attributes") else {}
 
-        # Get text content
-        text_content = str(elem) if elem else ""
-        # Strip XML tags for plain text (simple extraction)
-        import re
-        plain_text = re.sub(r"<[^>]+>", "", text_content)
-
-        # Compute text_length from XmlText children
-        text_length = self._compute_text_length(elem)
+        text_state = _extract_block_text_state(elem, include_nodes=False)
+        # Exclude inline placeholder chars from plain-text display.
+        plain_text = text_state["text"].replace("\ufffc", "").strip()
+        text_length = text_state["length"]
 
         return {
             "block_id": block_id,
@@ -771,8 +840,9 @@ class DocumentReader:
     def _compute_text_length(self, elem: Any) -> int:
         """Compute the total text length of a block element.
 
-        Walks XmlText children (counting characters) and XmlElement children
-        (counting 1 position each for inline nodes like footnotes).
+        Recursively walks the block subtree. Container elements (e.g. paragraph
+        inside listItem) are traversed, while inline atom nodes (footnote) count
+        as a single position.
 
         Args:
             elem: A pycrdt.XmlElement block
@@ -780,16 +850,7 @@ class DocumentReader:
         Returns:
             Total character count in the offset space.
         """
-        total = 0
-        if not hasattr(elem, "children"):
-            return 0
-        for child in elem.children:
-            if isinstance(child, pycrdt.XmlText):
-                total += len(child)
-            elif isinstance(child, pycrdt.XmlElement):
-                # Inline elements (footnote, etc.) occupy 1 position
-                total += 1
-        return total
+        return _extract_block_text_state(elem, include_nodes=False)["length"]
 
     def get_block_text_info(self, block_id: str) -> dict[str, Any] | None:
         """Get detailed text info for a block, optimized for the editing tool.
@@ -819,52 +880,14 @@ class DocumentReader:
             return None
 
         _, elem = result
-        children = list(elem.children)
-
-        has_inline_nodes = any(
-            isinstance(child, pycrdt.XmlElement) for child in children
-        )
-
-        # Build runs by walking children
-        runs: list[dict[str, Any]] = []
-        full_text_parts: list[str] = []
-        global_offset = 0
-
-        for child in children:
-            if isinstance(child, pycrdt.XmlText):
-                # Get formatting runs from diff()
-                diff_runs = child.diff()
-                for text_or_embed, attrs in diff_runs:
-                    if isinstance(text_or_embed, str):
-                        run_len = len(text_or_embed)
-                        runs.append({
-                            "text": text_or_embed,
-                            "offset": global_offset,
-                            "length": run_len,
-                            "attrs": attrs if attrs else None,
-                        })
-                        full_text_parts.append(text_or_embed)
-                        global_offset += run_len
-            elif isinstance(child, pycrdt.XmlElement):
-                # Inline element (footnote, etc.) — 1 position
-                runs.append({
-                    "text": None,
-                    "offset": global_offset,
-                    "length": 1,
-                    "attrs": None,
-                    "inline_element": child.tag,
-                })
-                full_text_parts.append("\ufffc")  # Object replacement char
-                global_offset += 1
-
-        full_text = "".join(full_text_parts)
+        text_state = _extract_block_text_state(elem, include_nodes=False)
 
         return {
             "block_id": block_id,
-            "text": full_text,
-            "length": global_offset,
-            "runs": runs,
-            "has_inline_nodes": has_inline_nodes,
+            "text": text_state["text"],
+            "length": text_state["length"],
+            "runs": text_state["runs"],
+            "has_inline_nodes": text_state["has_inline_nodes"],
         }
 
     def get_comments_map(self) -> "pycrdt.Map[dict[str, Any]]":
@@ -1044,11 +1067,16 @@ class DocumentWriter:
             if op_type == "delete" and "length" not in op:
                 raise ValueError(f"Operation {i}: 'length' is required for delete")
 
-        # Sort by offset descending so earlier offsets don't shift later ones
-        sorted_ops = sorted(operations, key=lambda op: op["offset"], reverse=True)
+        # Sort by offset descending so earlier offsets don't shift later ones.
+        # For equal offsets, preserve caller order.
+        sorted_ops = sorted(
+            enumerate(operations),
+            key=lambda pair: pair[1]["offset"],
+            reverse=True,
+        )
 
         with self._doc.transaction():
-            for op in sorted_ops:
+            for _idx, op in sorted_ops:
                 op_type = op["type"]
                 offset = op["offset"]
 
@@ -1057,8 +1085,8 @@ class DocumentWriter:
                     if not text:
                         continue  # Skip empty inserts
 
-                    text_node, local_offset = self._resolve_offset_to_text_node(
-                        block, offset, clamp=True
+                    text_node, local_offset = self._resolve_insert_anchor(
+                        block, int(offset)
                     )
 
                     # Determine formatting attrs
@@ -1079,30 +1107,11 @@ class DocumentWriter:
                     if length <= 0:
                         continue  # Skip zero-length deletes
 
-                    text_node, local_byte_offset = self._resolve_offset_to_text_node(
-                        block, offset, clamp=False
+                    self._delete_codepoint_range(
+                        block=block,
+                        global_offset=int(offset),
+                        length_cp=int(length),
                     )
-
-                    # Validate delete doesn't start past end
-                    text_byte_len = len(text_node)
-                    if local_byte_offset >= text_byte_len:
-                        raise ValueError(
-                            f"Delete offset {offset} is beyond text length"
-                        )
-
-                    # Convert code-point delete length to UTF-8 byte length.
-                    # Use _get_plain_text (not str()) since str() includes markup tags.
-                    plain_text = self._get_plain_text(text_node)
-                    plain_bytes = plain_text.encode("utf-8")
-                    # Find the code-point position corresponding to byte offset
-                    cp_start = len(plain_bytes[:local_byte_offset].decode("utf-8"))
-                    # Slice the string by code points, then get byte length
-                    delete_substr = plain_text[cp_start:cp_start + length]
-                    byte_length = len(delete_substr.encode("utf-8"))
-
-                    # Clamp to not exceed text end
-                    end = min(local_byte_offset + byte_length, text_byte_len)
-                    del text_node[local_byte_offset:end]
 
         # Read back updated text info
         reader = DocumentReader(self._doc)
@@ -1122,91 +1131,133 @@ class DocumentWriter:
                 parts.append(text_or_embed)
         return "".join(parts)
 
-    def _resolve_offset_to_text_node(
+    def _build_edit_spans(self, block: Any) -> tuple[list[dict[str, Any]], int]:
+        """Build recursive text/inline spans for offset resolution."""
+        spans: list[dict[str, Any]] = []
+        offset_cp = 0
+
+        def walk(node: Any) -> None:
+            nonlocal offset_cp
+
+            if isinstance(node, pycrdt.XmlText):
+                plain = self._get_plain_text(node)
+                length = len(plain)
+                spans.append({
+                    "kind": "text",
+                    "node": node,
+                    "text": plain,
+                    "start": offset_cp,
+                    "end": offset_cp + length,
+                })
+                offset_cp += length
+                return
+
+            if isinstance(node, pycrdt.XmlElement):
+                tag = getattr(node, "tag", "")
+                if tag in INLINE_NODE_ELEMENTS:
+                    spans.append({
+                        "kind": "inline",
+                        "node": node,
+                        "tag": tag,
+                        "start": offset_cp,
+                        "end": offset_cp + 1,
+                    })
+                    offset_cp += 1
+                    return
+
+                for child in node.children:
+                    walk(child)
+
+        walk(block)
+        return spans, offset_cp
+
+    def _resolve_insert_anchor(
         self,
         block: Any,
         global_offset: int,
-        clamp: bool = True,
     ) -> tuple[pycrdt.XmlText, int]:
-        """Resolve a global code-point offset to a specific XmlText node and local UTF-8 byte offset.
+        """Resolve insert offset to (XmlText node, local UTF-8 byte offset)."""
+        spans, total_cp = self._build_edit_spans(block)
+        text_spans = [s for s in spans if s["kind"] == "text"]
+        if not text_spans:
+            raise ValueError("Block has no text content to edit")
 
-        Accepts offsets in Unicode code points (what agents/humans count) and
-        returns byte offsets (what pycrdt/Yrs uses internally). This bridges the
-        gap between the MCP API (code points) and pycrdt operations (UTF-8 bytes).
+        cp_offset = max(0, min(global_offset, total_cp))
 
-        IMPORTANT: str(XmlText) includes XML markup tags, so we must use diff()
-        to get the plain text for offset calculation.
+        # Prefer exact containing span (including end boundary for inserts).
+        for span in text_spans:
+            if span["start"] <= cp_offset <= span["end"]:
+                local_cp = cp_offset - span["start"]
+                local_byte = len(span["text"][:local_cp].encode("utf-8"))
+                return span["node"], local_byte
 
-        Walks the block's children. Common case (single XmlText child) is a
-        direct lookup. For blocks with inline nodes (footnote, etc.), each
-        XmlText contributes its plain-text code-point count, each inline
-        XmlElement contributes 1 position.
+        # Fallback to nearest text span.
+        previous: dict[str, Any] | None = None
+        next_span: dict[str, Any] | None = None
+        for span in text_spans:
+            if span["end"] <= cp_offset:
+                previous = span
+            if next_span is None and cp_offset <= span["start"]:
+                next_span = span
 
-        Args:
-            block: The pycrdt.XmlElement block
-            global_offset: The global code-point offset (0-indexed)
-            clamp: If True, clamp offset to text end (for inserts).
-                   If False, raise on out-of-bounds (for deletes).
+        if previous is not None:
+            return previous["node"], len(previous["text"].encode("utf-8"))
+        if next_span is not None:
+            return next_span["node"], 0
 
-        Returns:
-            Tuple of (XmlText node, local UTF-8 byte offset within that node).
+        raise ValueError("Failed to resolve insert offset to editable text")
 
-        Raises:
-            ValueError: If offset points at an inline element, or if clamp=False
-                       and offset is out of bounds.
-        """
-        children = list(block.children)
+    def _delete_codepoint_range(
+        self,
+        block: Any,
+        global_offset: int,
+        length_cp: int,
+    ) -> None:
+        """Delete a code-point range, supporting multi-node spans."""
+        if length_cp <= 0:
+            return
 
-        # Fast path: single text node (vast majority of blocks)
-        if len(children) == 1 and isinstance(children[0], pycrdt.XmlText):
-            text_node = children[0]
-            plain_text = self._get_plain_text(text_node)
-            text_len_cp = len(plain_text)
-            if clamp:
-                cp_offset = min(global_offset, text_len_cp)
-            elif global_offset > text_len_cp:
+        spans, total_cp = self._build_edit_spans(block)
+        if global_offset < 0 or global_offset >= total_cp:
+            raise ValueError(f"Delete offset {global_offset} is beyond text length")
+
+        remaining = length_cp
+        cursor = global_offset
+
+        while remaining > 0:
+            spans, total_cp = self._build_edit_spans(block)
+            if cursor >= total_cp:
+                break
+
+            target: dict[str, Any] | None = None
+            for span in spans:
+                if span["start"] <= cursor < span["end"]:
+                    target = span
+                    break
+
+            if target is None:
+                break
+
+            if target["kind"] != "text":
+                tag = target.get("tag", "inline")
                 raise ValueError(
-                    f"Offset {global_offset} is beyond text length {text_len_cp}"
+                    f"Delete range intersects inline element ({tag}) at offset {cursor}; "
+                    "target a surrounding text range instead."
                 )
-            else:
-                cp_offset = global_offset
-            # Convert code-point offset to UTF-8 byte offset
-            byte_offset = len(plain_text[:cp_offset].encode("utf-8"))
-            return (text_node, byte_offset)
 
-        # Walk children for blocks with inline nodes
-        running_cp = 0
-        last_text_node = None
+            available = target["end"] - cursor
+            chunk_cp = min(remaining, available)
 
-        for child in children:
-            if isinstance(child, pycrdt.XmlText):
-                last_text_node = child
-                child_plain = self._get_plain_text(child)
-                child_len_cp = len(child_plain)
-                if global_offset <= running_cp + child_len_cp:
-                    local_cp = global_offset - running_cp
-                    byte_offset = len(child_plain[:local_cp].encode("utf-8"))
-                    return (child, byte_offset)
-                running_cp += child_len_cp
-            elif isinstance(child, pycrdt.XmlElement):
-                if global_offset == running_cp:
-                    raise ValueError(
-                        f"Offset {global_offset} points at an inline element "
-                        f"({child.tag}). Use offsets before or after inline elements."
-                    )
-                running_cp += 1
+            local_cp_start = cursor - target["start"]
+            local_cp_end = local_cp_start + chunk_cp
 
-        # Beyond end — return byte length for clamping
-        if clamp and last_text_node is not None:
-            return (last_text_node, len(last_text_node))
+            plain = target["text"]
+            byte_start = len(plain[:local_cp_start].encode("utf-8"))
+            byte_end = len(plain[:local_cp_end].encode("utf-8"))
+            del target["node"][byte_start:byte_end]
 
-        if not clamp:
-            raise ValueError(
-                f"Offset {global_offset} is beyond total text length {running_cp}"
-            )
-
-        # Fallback: no text nodes at all (empty block or block with only inline elements)
-        raise ValueError(f"Block has no text content to edit")
+            remaining -= chunk_cp
+            # Keep cursor fixed: document text shifts left after each delete.
 
     def _get_format_at_offset(
         self, text_node: pycrdt.XmlText, local_byte_offset: int

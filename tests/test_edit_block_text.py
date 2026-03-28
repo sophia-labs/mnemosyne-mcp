@@ -47,6 +47,17 @@ def multi_block_doc():
     return doc
 
 
+@pytest.fixture
+def list_item_doc():
+    """Create a Y.Doc with a canonical listItem -> paragraph structure."""
+    doc = pycrdt.Doc()
+    writer = DocumentWriter(doc)
+    writer.replace_all_content(
+        '<listItem listType="bullet" data-indent="0"><paragraph>Hello list world</paragraph></listItem>'
+    )
+    return doc
+
+
 def _get_block_id(doc, index):
     """Helper to get block ID at index."""
     reader = DocumentReader(doc)
@@ -99,6 +110,18 @@ class TestGetBlockTextInfo:
         reader = DocumentReader(plain_doc)
         info = reader.get_block_text_info("block-nonexistent")
         assert info is None
+
+    def test_list_item_nested_paragraph_text(self, list_item_doc):
+        """List items with nested paragraph children should expose real text."""
+        reader = DocumentReader(list_item_doc)
+        block_id = _get_block_id(list_item_doc, 0)
+        info = reader.get_block_text_info(block_id)
+
+        assert info is not None
+        assert info["text"] == "Hello list world"
+        assert info["length"] == len("Hello list world")
+        assert info["has_inline_nodes"] is False
+        assert any(run["text"] == "Hello list world" for run in info["runs"])
 
     def test_text_length_in_get_block_info(self, plain_doc):
         """Test that get_block_info includes text_length."""
@@ -503,6 +526,28 @@ class TestEdgeCases:
         ])
 
         assert result["text"] == "Title Page"
+
+    def test_list_item_insert(self, list_item_doc):
+        """Insert should work for canonical listItem->paragraph blocks."""
+        writer = DocumentWriter(list_item_doc)
+        block_id = _get_block_id(list_item_doc, 0)
+
+        result = writer.edit_block_text(block_id, [
+            {"type": "insert", "offset": 5, "text": " bullet"},
+        ])
+
+        assert result["text"] == "Hello bullet list world"
+
+    def test_list_item_delete(self, list_item_doc):
+        """Delete should work for canonical listItem->paragraph blocks."""
+        writer = DocumentWriter(list_item_doc)
+        block_id = _get_block_id(list_item_doc, 0)
+
+        result = writer.edit_block_text(block_id, [
+            {"type": "delete", "offset": 5, "length": 6},
+        ])
+
+        assert result["text"] == "Helloworld"
 
 
 if __name__ == "__main__":
