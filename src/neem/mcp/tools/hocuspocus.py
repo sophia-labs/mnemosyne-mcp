@@ -128,11 +128,7 @@ def _strip_markdown_wrappers(text: str) -> str:
     return out
 
 
-def _find_positions_with_auto_match(
-    plain_text: str,
-    requested_find: str,
-) -> tuple[list[int], str]:
-    """Find match offsets with markdown/whitespace/unicode tolerant fallback."""
+def _build_find_candidates(requested_find: str) -> list[str]:
     candidates: list[str] = []
     seen: set[str] = set()
 
@@ -157,6 +153,15 @@ def _find_positions_with_auto_match(
     push(_collapse_ws(raw))
     push(_collapse_ws(md_stripped))
     push(_collapse_ws(unicodedata.normalize("NFKC", md_stripped)))
+    return candidates
+
+
+def _find_positions_with_auto_match(
+    plain_text: str,
+    requested_find: str,
+) -> tuple[list[int], str]:
+    """Find match offsets with markdown/whitespace/unicode tolerant fallback."""
+    candidates = _build_find_candidates(requested_find)
 
     def find_all(haystack: str, needle: str) -> list[int]:
         positions: list[int] = []
@@ -187,6 +192,15 @@ def _find_positions_with_auto_match(
             return mapped, normalized
 
     return [], requested_find
+
+
+class _EditMatchError(ValueError):
+    """Structured find/replace mismatch for clear agent diagnostics."""
+
+    def __init__(self, message: str, *, code: str, diagnostics: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.code = code
+        self.diagnostics = diagnostics
 
 
 def _normalize_timestamp_to_iso(value: Any) -> str | None:
@@ -3449,8 +3463,8 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "with concurrent browser edits. Two modes:\n\n"
             "**Find-and-replace mode (recommended):** Pass `find` and `replace` strings. "
             "The tool locates the text and generates precise offset operations internally. "
-            "Matching defaults to `match_mode='auto'` (markdown/whitespace tolerant), "
-            "so agents can safely pass text copied from markdown reads. "
+            "Matching is markdown/whitespace tolerant, so agents can safely pass text "
+            "copied from markdown reads. "
             "Use `occurrence` to control which match: 1 (default) = first, -1 = last, "
             "0 = all. No need to calculate offsets manually.\n\n"
             "**Offset mode:** Pass `operations` list for direct character-level control. "
@@ -3472,7 +3486,6 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         find: Optional[str] = None,
         replace: Optional[str] = None,
         occurrence: int = 1,
-        match_mode: str = "auto",
         context: Context | None = None,
     ) -> dict:
         """Edit text within a block — find/replace or raw offset operations.
@@ -3485,8 +3498,6 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             find: Text to find within the block (find/replace mode)
             replace: Text to replace matches with (find/replace mode)
             occurrence: Which occurrence to replace: 1=first, -1=last, 0=all
-            match_mode: Matching behavior: "auto" (default, markdown/whitespace tolerant)
-                or "strict" (exact literal matching)
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
@@ -3510,96 +3521,166 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 raise ValueError("'find' must be a non-empty string")
             if replace is None:
                 raise ValueError("'replace' is required when using find/replace mode")
-            if match_mode not in ("auto", "strict"):
-                raise ValueError("match_mode must be 'auto' or 'strict'")
 
         try:
+            graph_id_clean = graph_id.strip()
+            document_id_clean = document_id.strip()
+            block_id_clean = block_id.strip()
+
             # Validate document exists in workspace
-            await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id, auth=auth)
-            await _assert_document_writable(graph_id.strip(), document_id.strip(), auth.user_id)
+            await _validate_document_in_workspace(graph_id_clean, document_id_clean, auth.user_id, auth=auth)
+            await _assert_document_writable(graph_id_clean, document_id_clean, auth.user_id)
 
-            await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
+            max_attempts = 2 if has_find_replace else 1
+            last_match_error: _EditMatchError | None = None
 
-            updated_text_info: dict = {}
+            for attempt in range(1, max_attempts + 1):
+                force_fresh = attempt > 1
+                await hp_client.connect_document(
+                    graph_id_clean,
+                    document_id_clean,
+                    user_id=auth.user_id,
+                    force_fresh=force_fresh,
+                )
 
-            def perform_edit(doc: Any) -> None:
-                nonlocal updated_text_info
-                reader = DocumentReader(doc)
-                writer = DocumentWriter(doc)
-                bid = block_id.strip()
+                updated_text_info: dict = {}
 
-                if has_find_replace:
-                    # Find/replace mode: resolve text matches to offset operations
-                    text_info = reader.get_block_text_info(bid)
-                    if text_info is None:
-                        raise ValueError(f"Block not found: {bid}")
+                def perform_edit(doc: Any) -> None:
+                    nonlocal updated_text_info
+                    reader = DocumentReader(doc)
+                    writer = DocumentWriter(doc)
 
-                    plain_text = text_info["text"]
+                    if has_find_replace:
+                        # Find/replace mode: resolve text matches to offset operations
+                        text_info = reader.get_block_text_info(block_id_clean)
+                        if text_info is None:
+                            raise ValueError(f"Block not found: {block_id_clean}")
 
-                    # Find all occurrences (default: tolerant auto-matching).
-                    if match_mode == "strict":
-                        matched_find = find  # type: ignore[assignment]
-                        positions = []
-                        start = 0
-                        while True:
-                            idx = plain_text.find(matched_find, start)  # type: ignore[arg-type]
-                            if idx == -1:
-                                break
-                            positions.append(idx)
-                            start = idx + 1
-                    else:
+                        plain_text = text_info["text"]
                         positions, matched_find = _find_positions_with_auto_match(
                             plain_text=plain_text,
                             requested_find=find,  # type: ignore[arg-type]
                         )
 
-                    if not positions:
-                        raise ValueError(
-                            f"Text {find!r} not found in block {bid}"
+                        if not positions:
+                            raise _EditMatchError(
+                                f"Text {find!r} not found in block {block_id_clean}",
+                                code="no_match",
+                                diagnostics={
+                                    "requested_find": find,
+                                    "normalized_candidates": _build_find_candidates(find),  # type: ignore[arg-type]
+                                    "block_text_preview": plain_text[:400],
+                                    "block_text_length": len(plain_text),
+                                    "occurrence": occurrence,
+                                },
+                            )
+
+                        # Select which occurrences to replace
+                        if occurrence == 0:
+                            selected = positions
+                        elif occurrence > 0:
+                            if occurrence > len(positions):
+                                raise _EditMatchError(
+                                    f"Occurrence {occurrence} requested but only "
+                                    f"{len(positions)} match(es) found",
+                                    code="occurrence_out_of_range",
+                                    diagnostics={
+                                        "requested_find": find,
+                                        "matched_find": matched_find,
+                                        "positions": positions,
+                                        "occurrence": occurrence,
+                                        "block_text_preview": plain_text[:400],
+                                    },
+                                )
+                            selected = [positions[occurrence - 1]]
+                        else:  # negative
+                            if abs(occurrence) > len(positions):
+                                raise _EditMatchError(
+                                    f"Occurrence {occurrence} requested but only "
+                                    f"{len(positions)} match(es) found",
+                                    code="occurrence_out_of_range",
+                                    diagnostics={
+                                        "requested_find": find,
+                                        "matched_find": matched_find,
+                                        "positions": positions,
+                                        "occurrence": occurrence,
+                                        "block_text_preview": plain_text[:400],
+                                    },
+                                )
+                            selected = [positions[occurrence]]
+
+                        # Build offset operations (delete + insert for each match)
+                        # Order: each position gets delete then insert at same offset.
+                        # edit_block_text sorts descending by offset (stable sort
+                        # preserves delete-before-insert for same offset).
+                        find_len = len(matched_find)
+                        ops: list[dict] = []
+                        for pos in selected:
+                            ops.append({"type": "delete", "offset": pos, "length": find_len})
+                            if replace:  # skip insert for empty replacement (pure deletion)
+                                ops.append({"type": "insert", "offset": pos, "text": replace})
+
+                        updated_text_info = writer.edit_block_text(block_id_clean, ops)
+                    else:
+                        # Offset mode: pass through directly
+                        updated_text_info = writer.edit_block_text(block_id_clean, operations)  # type: ignore[arg-type]
+
+                try:
+                    await hp_client.transact_document(
+                        graph_id_clean,
+                        document_id_clean,
+                        perform_edit,
+                        user_id=auth.user_id,
+                    )
+                    if force_fresh:
+                        logger.info(
+                            "edit_block_text_retry_succeeded",
+                            extra_context={
+                                "graph_id": graph_id_clean,
+                                "document_id": document_id_clean,
+                                "block_id": block_id_clean,
+                                "attempt": attempt,
+                            },
                         )
+                    return {"success": True, "block": updated_text_info}
+                except _EditMatchError as me:
+                    last_match_error = me
+                    logger.warning(
+                        "edit_block_text_match_failed",
+                        extra_context={
+                            "graph_id": graph_id_clean,
+                            "document_id": document_id_clean,
+                            "block_id": block_id_clean,
+                            "attempt": attempt,
+                            "reason": me.code,
+                            "message": str(me),
+                        },
+                    )
+                    if attempt < max_attempts:
+                        logger.info(
+                            "edit_block_text_force_fresh_retry",
+                            extra_context={
+                                "graph_id": graph_id_clean,
+                                "document_id": document_id_clean,
+                                "block_id": block_id_clean,
+                                "reason": me.code,
+                            },
+                        )
+                        continue
+                    break
 
-                    # Select which occurrences to replace
-                    if occurrence == 0:
-                        selected = positions
-                    elif occurrence > 0:
-                        if occurrence > len(positions):
-                            raise ValueError(
-                                f"Occurrence {occurrence} requested but only "
-                                f"{len(positions)} match(es) found"
-                            )
-                        selected = [positions[occurrence - 1]]
-                    else:  # negative
-                        if abs(occurrence) > len(positions):
-                            raise ValueError(
-                                f"Occurrence {occurrence} requested but only "
-                                f"{len(positions)} match(es) found"
-                            )
-                        selected = [positions[occurrence]]
+            if last_match_error is not None:
+                diagnostic_payload = {
+                    "code": last_match_error.code,
+                    "message": str(last_match_error),
+                    "diagnostics": last_match_error.diagnostics,
+                    "hint": "Read the block again and use a shorter literal fragment from text format.",
+                }
+                raise RuntimeError(
+                    f"edit_block_text match failed: {json.dumps(diagnostic_payload, ensure_ascii=False)}"
+                )
 
-                    # Build offset operations (delete + insert for each match)
-                    # Order: each position gets delete then insert at same offset.
-                    # edit_block_text sorts descending by offset (stable sort
-                    # preserves delete-before-insert for same offset).
-                    find_len = len(matched_find)
-                    ops: list[dict] = []
-                    for pos in selected:
-                        ops.append({"type": "delete", "offset": pos, "length": find_len})
-                        if replace:  # skip insert for empty replacement (pure deletion)
-                            ops.append({"type": "insert", "offset": pos, "text": replace})
-
-                    updated_text_info = writer.edit_block_text(bid, ops)
-                else:
-                    # Offset mode: pass through directly
-                    updated_text_info = writer.edit_block_text(bid, operations)  # type: ignore[arg-type]
-
-            await hp_client.transact_document(
-                graph_id.strip(),
-                document_id.strip(),
-                perform_edit,
-                user_id=auth.user_id,
-            )
-
-            return {"success": True, "block": updated_text_info}
+            raise RuntimeError("edit_block_text failed without match diagnostics")
 
         except ValueError as ve:
             # Validation errors - return as-is for clear agent feedback
