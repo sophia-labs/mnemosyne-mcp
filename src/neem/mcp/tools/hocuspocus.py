@@ -337,10 +337,10 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
     read_path_mode = mode_aliases.get(raw_read_path_mode, raw_read_path_mode)
     if read_path_mode not in {"websocket", "http_blob", "hybrid"}:
         logger.warning(
-            "Invalid MNEMOSYNE_READ_PATH value; falling back to websocket",
+            "Invalid MNEMOSYNE_READ_PATH value; falling back to hybrid",
             extra_context={"mode": raw_read_path_mode},
         )
-        read_path_mode = "websocket"
+        read_path_mode = "hybrid"
     elif raw_read_path_mode in mode_aliases:
         logger.warning(
             "Deprecated MNEMOSYNE_READ_PATH alias in use",

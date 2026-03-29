@@ -303,6 +303,10 @@ class HocuspocusClient:
 
         try:
             async with self._connect_semaphore:
+                # Intentionally hold the semaphore through sync completion,
+                # not just ws_connect(). This caps concurrent unsynced channels
+                # (the observed failure mode behind read-path 503 bursts), not
+                # merely TCP handshake rate.
                 session = await self._get_http_session()
                 channel.ws = await session.ws_connect(
                     ws_url,
