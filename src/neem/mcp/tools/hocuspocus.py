@@ -2159,6 +2159,13 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 result["depth"] = depth
             if folder_id:
                 result["folder_id"] = folder_id
+
+            # Surface dream journal if it exists (root-level only)
+            if not folder_id:
+                dj_id = f"{graph_id}-dream-journal"
+                docs_snap = snapshot.get("documents", {})
+                if dj_id in docs_snap:
+                    result["dream_journal"] = dj_id
             if folders_only:
                 result["folders_only"] = True
                 # Count unfiled (root-level) documents
