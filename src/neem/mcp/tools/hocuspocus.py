@@ -1894,10 +1894,22 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                         f"tombstoned from a previous deletion — try a different document ID."
                     )
 
-            # 3. Update workspace navigation so document appears in file tree
-            # Extract title from first heading, fallback to document_id
-            title = extract_title_from_xml(xml_content) or document_id
+            # 3. Update workspace navigation so document appears in file tree.
+            # Preserve existing title when content has no H1.
+            derived_title = extract_title_from_xml(xml_content)
+            existing_title: str | None = None
             await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
+            ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
+            if ws_channel is not None:
+                ws_reader = WorkspaceReader(ws_channel.doc)
+                existing_doc = ws_reader.get_document(document_id)
+                if isinstance(existing_doc, dict):
+                    raw_existing_title = existing_doc.get("title")
+                    if isinstance(raw_existing_title, str):
+                        stripped = raw_existing_title.strip()
+                        if stripped:
+                            existing_title = stripped
+            title = derived_title or existing_title or document_id
             await hp_client.transact_workspace(
                 graph_id,
                 lambda doc: WorkspaceWriter(doc).upsert_document(document_id, title),
