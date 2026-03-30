@@ -40,8 +40,6 @@ from neem.utils.token_storage import get_dev_user_id, get_internal_service_secre
 
 logger = LoggerFactory.get_logger("mcp.standalone_server")
 
-DEFAULT_STREAMABLE_HTTP_PATH = "/mcp"
-
 # Defaults align with `kubectl port-forward svc/mnemosyne-api 8080:80`
 # The mnemosyne-api service exposes port 80, targeting pod port 8000
 DEFAULT_LOCAL_BACKEND_URL = "http://127.0.0.1:8080"
@@ -61,22 +59,13 @@ async def _health_response(_request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
-def _resolve_streamable_http_path() -> str:
-    """Return the externally exposed HTTP transport path."""
-    raw = (os.getenv("MNEMOSYNE_MCP_STREAMABLE_HTTP_PATH", "").strip() or DEFAULT_STREAMABLE_HTTP_PATH)
-    if raw == "/":
-        return raw
-    return raw if raw.startswith("/") else f"/{raw}"
-
-
 def build_streamable_http_app(mcp_server: FastMCP) -> Starlette:
     """Wrap the FastMCP app with a simple health endpoint."""
     transport_app = mcp_server.streamable_http_app()
-    transport_path = _resolve_streamable_http_path()
     return Starlette(
         routes=[
             Route("/health", endpoint=_health_response),
-            Mount(transport_path, app=transport_app),
+            Mount("/", app=transport_app),
         ]
     )
 
