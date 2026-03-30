@@ -8,9 +8,8 @@ from typing import Any, List, Optional
 from mcp.server.fastmcp import Context, FastMCP
 
 from neem.hocuspocus import HocuspocusClient, WorkspaceReader
-from neem.mcp.auth import MCPAuthContext
+from neem.mcp.auth import MCPAuthContext, get_current_auth_token, get_hocuspocus_client_kwargs
 from neem.utils.logging import LoggerFactory
-from neem.utils.token_storage import get_dev_user_id, get_internal_service_secret, validate_token_and_load
 
 logger = LoggerFactory.get_logger("mcp.tools.surface")
 
@@ -27,9 +26,7 @@ def register_surface_tools(server: FastMCP) -> None:
     if hp_client is None:
         hp_client = HocuspocusClient(
             base_url=backend_config.base_url,
-            token_provider=validate_token_and_load,
-            dev_user_id=get_dev_user_id(),
-            internal_service_secret=get_internal_service_secret(),
+            **get_hocuspocus_client_kwargs(token_provider=get_current_auth_token),
         )
         server._hocuspocus_client = hp_client  # type: ignore[attr-defined]
 

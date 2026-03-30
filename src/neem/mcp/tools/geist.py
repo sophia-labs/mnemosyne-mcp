@@ -38,15 +38,13 @@ from neem.hocuspocus import (
     WorkspaceWriter,
 )
 from neem.hocuspocus.converters import tiptap_xml_to_markdown
-from neem.mcp.auth import MCPAuthContext, get_current_auth_token
+from neem.mcp.auth import MCPAuthContext, get_current_auth_token, get_hocuspocus_client_kwargs
 from neem.mcp.http_client import get_http_client
 from neem.mcp.jobs import RealtimeJobClient
 from neem.mcp.tools.basic import await_job_completion, submit_job
 from neem.mcp.tools.wire_tools import _get_all_wires, _resolve_title_from_workspace
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import (
-    get_dev_user_id,
-    get_internal_service_secret,
     get_user_id_from_token,
 )
 
@@ -680,9 +678,7 @@ def register_geist_tools(server: FastMCP) -> None:
     if hp_client is None:
         hp_client = HocuspocusClient(
             base_url=backend_config.base_url,
-            token_provider=get_current_auth_token,
-            dev_user_id=get_dev_user_id(),
-            internal_service_secret=get_internal_service_secret(),
+            **get_hocuspocus_client_kwargs(token_provider=get_current_auth_token),
         )
         server._hocuspocus_client = hp_client  # type: ignore[attr-defined]
 

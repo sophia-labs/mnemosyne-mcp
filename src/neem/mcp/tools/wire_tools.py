@@ -20,10 +20,9 @@ import pycrdt
 from mcp.server.fastmcp import Context, FastMCP
 
 from neem.hocuspocus import HocuspocusClient, WorkspaceReader, WorkspaceWriter
-from neem.mcp.auth import MCPAuthContext, get_current_auth_token
+from neem.mcp.auth import MCPAuthContext, get_current_auth_token, get_hocuspocus_client_kwargs
 from neem.mcp.http_client import get_http_client
 from neem.utils.logging import LoggerFactory
-from neem.utils.token_storage import get_dev_user_id, get_internal_service_secret
 
 logger = LoggerFactory.get_logger("mcp.tools.wire_tools")
 
@@ -336,9 +335,7 @@ def register_wire_tools(server: FastMCP) -> None:
     if hp_client is None:
         hp_client = HocuspocusClient(
             base_url=backend_config.base_url,
-            token_provider=get_current_auth_token,
-            dev_user_id=get_dev_user_id(),
-            internal_service_secret=get_internal_service_secret(),
+            **get_hocuspocus_client_kwargs(token_provider=get_current_auth_token),
         )
         server._hocuspocus_client = hp_client  # type: ignore[attr-defined]
 

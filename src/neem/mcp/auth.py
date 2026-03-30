@@ -30,6 +30,8 @@ _CURRENT_AUTH_CONTEXT: contextvars.ContextVar[Optional["MCPAuthContext"]] = cont
     "mcp_current_auth_context",
     default=None,
 )
+_INTERNAL_TRUST_AUTH_MODES = frozenset({"hosted", "sidecar"})
+_REQUEST_SCOPED_AUTH_MODES = _INTERNAL_TRUST_AUTH_MODES | frozenset({"public"})
 
 
 def _auth_mode() -> str:
@@ -38,7 +40,15 @@ def _auth_mode() -> str:
 
 def _allow_local_fallbacks() -> bool:
     mode = _auth_mode()
-    return mode not in {"hosted", "sidecar"}
+    return mode not in _REQUEST_SCOPED_AUTH_MODES
+
+
+def _allow_forwarded_user_id_header() -> bool:
+    return _auth_mode() in _INTERNAL_TRUST_AUTH_MODES
+
+
+def _allow_internal_service_auth() -> bool:
+    return _auth_mode() in _INTERNAL_TRUST_AUTH_MODES
 
 
 @dataclass
@@ -99,12 +109,18 @@ class MCPAuthContext:
                             "auth_from_http_header",
                             extra_context={"token_prefix": token[:12] + "..." if token else None},
                         )
-                    # OpenCode may also pass user context
-                    user_id = headers.get("x-user-id") or headers.get("X-User-ID")
-                    if user_id:
+                    # Sidecar deployments may also pass user context explicitly.
+                    forwarded_user_id = headers.get("x-user-id") or headers.get("X-User-ID")
+                    if forwarded_user_id and _allow_forwarded_user_id_header():
+                        user_id = forwarded_user_id
                         logger.info(
                             "user_id_from_header",
                             extra_context={"user_id": user_id},
+                        )
+                    elif forwarded_user_id:
+                        logger.warning(
+                            "ignoring_forwarded_user_id_header",
+                            extra_context={"auth_mode": _auth_mode()},
                         )
 
         # 2. Fall back to local/env token (CLI mode).
@@ -130,7 +146,7 @@ class MCPAuthContext:
                     extra_context={"user_id": user_id},
                 )
 
-        internal_secret = get_internal_service_secret()
+        internal_secret = get_internal_service_secret() if _allow_internal_service_auth() else None
 
         result = cls(
             token=token,
@@ -163,7 +179,7 @@ class MCPAuthContext:
         if self.token:
             return self.token
 
-        if self.internal_service_secret and self.user_id:
+        if _allow_internal_service_auth() and self.internal_service_secret and self.user_id:
             # Internal service auth is valid even without a token
             logger.debug(
                 "auth_via_internal_service",
@@ -189,10 +205,10 @@ class MCPAuthContext:
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
 
-        if self.user_id:
+        if self.user_id and _allow_forwarded_user_id_header():
             headers["X-User-ID"] = self.user_id
 
-        if self.internal_service_secret:
+        if self.internal_service_secret and _allow_internal_service_auth():
             headers["X-Internal-Service"] = self.internal_service_secret
 
         return headers
@@ -225,6 +241,21 @@ def create_context_aware_token_provider(
         return auth.token
 
     return provider
+
+
+def get_hocuspocus_client_kwargs(
+    *,
+    token_provider: Callable[[], Optional[str]],
+) -> Dict[str, object]:
+    """Return HocuspocusClient auth kwargs appropriate for the active auth mode."""
+    kwargs: Dict[str, object] = {"token_provider": token_provider}
+    if _allow_internal_service_auth():
+        kwargs["dev_user_id"] = get_dev_user_id()
+        kwargs["internal_service_secret"] = get_internal_service_secret()
+    else:
+        kwargs["dev_user_id"] = None
+        kwargs["internal_service_secret"] = None
+    return kwargs
 
 
 def get_current_auth_context() -> Optional[MCPAuthContext]:

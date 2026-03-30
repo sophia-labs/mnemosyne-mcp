@@ -76,3 +76,40 @@ def test_auto_mode_allows_local_token_fallback(monkeypatch: pytest.MonkeyPatch) 
     auth = MCPAuthContext.from_context(_ctx({}))
     assert auth.token == "local-token"
     assert get_current_auth_token() == "local-token"
+
+
+def test_public_mode_ignores_forwarded_user_id_and_internal_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MNEMOSYNE_MCP_AUTH_MODE", "public")
+    monkeypatch.setattr("neem.mcp.auth.get_user_id_from_token", lambda token: "derived-user")
+    monkeypatch.setattr("neem.mcp.auth.get_internal_service_secret", lambda: "internal-secret")
+
+    auth = MCPAuthContext.from_context(
+        _ctx(
+            {
+                "authorization": "Bearer request-token",
+                "x-user-id": "forwarded-user",
+            }
+        )
+    )
+
+    assert auth.token == "request-token"
+    assert auth.user_id == "derived-user"
+    assert auth.internal_service_secret is None
+    assert auth.http_headers() == {"Authorization": "Bearer request-token"}
+
+
+def test_public_mode_requires_bearer_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MNEMOSYNE_MCP_AUTH_MODE", "public")
+    monkeypatch.setattr("neem.mcp.auth.get_internal_service_secret", lambda: "internal-secret")
+
+    auth = MCPAuthContext.from_context(_ctx({"x-user-id": "forwarded-user"}))
+
+    assert auth.token is None
+    assert auth.user_id is None
+    assert auth.is_authenticated() is False
+    with pytest.raises(RuntimeError, match="Not authenticated"):
+        auth.require_auth()

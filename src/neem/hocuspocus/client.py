@@ -29,6 +29,24 @@ from neem.utils.logging import LoggerFactory
 logger = LoggerFactory.get_logger("hocuspocus.client")
 
 TokenProvider = Callable[[], Optional[str]]
+_INTERNAL_TRUST_AUTH_MODES = frozenset({"hosted", "sidecar"})
+_REQUEST_SCOPED_AUTH_MODES = _INTERNAL_TRUST_AUTH_MODES | frozenset({"public"})
+
+
+def _mcp_auth_mode() -> str:
+    return (os.getenv("MNEMOSYNE_MCP_AUTH_MODE", "").strip().lower() or "auto")
+
+
+def _allow_forwarded_user_id_header() -> bool:
+    return _mcp_auth_mode() in _INTERNAL_TRUST_AUTH_MODES
+
+
+def _allow_internal_service_auth() -> bool:
+    return _mcp_auth_mode() in _INTERNAL_TRUST_AUTH_MODES
+
+
+def _allow_user_id_subprotocol_fallback() -> bool:
+    return _mcp_auth_mode() not in _REQUEST_SCOPED_AUTH_MODES
 
 
 @dataclass
@@ -205,10 +223,10 @@ class HocuspocusClient:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         effective_user_id = user_id or self._dev_user_id
-        if effective_user_id:
+        if effective_user_id and _allow_forwarded_user_id_header():
             headers["X-User-ID"] = effective_user_id
         # Add internal service auth header for cluster-internal requests
-        if self._internal_service_secret:
+        if self._internal_service_secret and _allow_internal_service_auth():
             headers["X-Internal-Service"] = self._internal_service_secret
         return headers
 
@@ -228,14 +246,14 @@ class HocuspocusClient:
         """
         effective_user_id = user_id or self._dev_user_id
         # Prefer internal service auth via subprotocol (survives proxies)
-        if self._internal_service_secret and effective_user_id:
+        if self._internal_service_secret and effective_user_id and _allow_internal_service_auth():
             return [f"internal.{effective_user_id}.{self._internal_service_secret}"]
         # Use JWT token in subprotocol (required for cognito_jwt auth mode)
         token = self._token_provider()
         if token:
             return [f"Bearer.{token}"]
         # Fallback to user_id for dev_no_auth mode (server treats it as user identity)
-        if effective_user_id:
+        if effective_user_id and _allow_user_id_subprotocol_fallback():
             return [f"Bearer.{effective_user_id}"]
         return None
 

@@ -20,6 +20,9 @@ from urllib.parse import urlparse, urlunparse
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
 
 from neem.mcp.auth import get_current_auth_token
 from neem.mcp.http_client import create_http_client, set_http_client
@@ -49,6 +52,22 @@ HOST_PORT_ENV_VARS = (
     ("MNEMOSYNE_FASTAPI_HOST", "MNEMOSYNE_FASTAPI_PORT"),
     ("FASTAPI_SERVICE_HOST", "FASTAPI_SERVICE_PORT"),
 )
+
+
+async def _health_response(_request) -> JSONResponse:
+    """Lightweight process health for container and ingress probes."""
+    return JSONResponse({"status": "ok"})
+
+
+def build_streamable_http_app(mcp_server: FastMCP) -> Starlette:
+    """Wrap the FastMCP app with a simple health endpoint."""
+    transport_app = mcp_server.streamable_http_app()
+    return Starlette(
+        routes=[
+            Route("/health", endpoint=_health_response),
+            Mount("/", app=transport_app),
+        ]
+    )
 
 
 @dataclass(frozen=True)
@@ -425,7 +444,7 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
     set_http_client(http_client)
     mcp_server._http_client = http_client  # type: ignore[attr-defined]
     auth_mode = (os.getenv("MNEMOSYNE_MCP_AUTH_MODE", "").strip().lower() or "auto")
-    hosted_mode = auth_mode in {"hosted", "sidecar"}
+    hosted_mode = auth_mode in {"hosted", "sidecar", "public"}
 
     if backend_config.has_websocket and not hosted_mode:
         dev_uid = get_dev_user_id()
@@ -555,7 +574,7 @@ def run_standalone_mcp_server_sync():
     try:
         import uvicorn
 
-        http_app = mcp_server.streamable_http_app()
+        http_app = build_streamable_http_app(mcp_server)
         uvicorn.run(http_app, host=host, port=port)
     except KeyboardInterrupt:
         logger.info("Received shutdown signal")
