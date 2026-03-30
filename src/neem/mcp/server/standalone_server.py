@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlparse, urlunparse
@@ -62,7 +63,14 @@ async def _health_response(_request) -> JSONResponse:
 def build_streamable_http_app(mcp_server: FastMCP) -> Starlette:
     """Wrap the FastMCP app with a simple health endpoint."""
     transport_app = mcp_server.streamable_http_app()
+
+    @asynccontextmanager
+    async def lifespan(_app: Starlette):
+        async with transport_app.router.lifespan_context(transport_app):
+            yield
+
     return Starlette(
+        lifespan=lifespan,
         routes=[
             Route("/health", endpoint=_health_response),
             Mount("/", app=transport_app),

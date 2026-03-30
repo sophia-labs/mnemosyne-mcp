@@ -14,3 +14,12 @@ def test_build_streamable_http_app_exposes_health() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_build_streamable_http_app_starts_inner_lifespan() -> None:
+    app = build_streamable_http_app(FastMCP("test"))
+
+    with TestClient(app) as client:
+        response = client.post("/mcp", json={})
+
+    assert response.status_code != 500
