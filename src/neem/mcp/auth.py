@@ -32,6 +32,7 @@ _CURRENT_AUTH_CONTEXT: contextvars.ContextVar[Optional["MCPAuthContext"]] = cont
 )
 _INTERNAL_TRUST_AUTH_MODES = frozenset({"hosted", "sidecar"})
 _REQUEST_SCOPED_AUTH_MODES = _INTERNAL_TRUST_AUTH_MODES | frozenset({"public"})
+_AGENT_SESSION_TOKEN_PREFIX = "agsa_"
 
 
 def _auth_mode() -> str:
@@ -49,6 +50,10 @@ def _allow_forwarded_user_id_header() -> bool:
 
 def _allow_internal_service_auth() -> bool:
     return _auth_mode() in _INTERNAL_TRUST_AUTH_MODES
+
+
+def _is_valid_public_bearer(token: str) -> bool:
+    return token.startswith(_AGENT_SESSION_TOKEN_PREFIX)
 
 
 @dataclass
@@ -103,12 +108,19 @@ class MCPAuthContext:
                     )
                     auth_header = headers.get("authorization", "") or headers.get("Authorization", "")
                     if auth_header.startswith("Bearer "):
-                        token = auth_header[7:]
-                        source = "http_header"
-                        logger.info(
-                            "auth_from_http_header",
-                            extra_context={"token_prefix": token[:12] + "..." if token else None},
-                        )
+                        candidate = auth_header[7:]
+                        if _auth_mode() == "public" and not _is_valid_public_bearer(candidate):
+                            logger.warning(
+                                "rejecting_non_agent_public_bearer",
+                                extra_context={"auth_mode": _auth_mode()},
+                            )
+                        else:
+                            token = candidate
+                            source = "http_header"
+                            logger.info(
+                                "auth_from_http_header",
+                                extra_context={"has_token": bool(token)},
+                            )
                     # Sidecar deployments may also pass user context explicitly.
                     forwarded_user_id = headers.get("x-user-id") or headers.get("X-User-ID")
                     if forwarded_user_id and _allow_forwarded_user_id_header():
@@ -188,7 +200,9 @@ class MCPAuthContext:
             return ""
 
         raise RuntimeError(
-            "Not authenticated. Either run `neem init` to get a token, "
+            "Hosted session bearer token required."
+            if _auth_mode() == "public"
+            else "Not authenticated. Either run `neem init` to get a token, "
             "or configure MNEMOSYNE_INTERNAL_SERVICE_SECRET and MNEMOSYNE_DEV_USER_ID."
         )
 

@@ -82,22 +82,22 @@ def test_public_mode_ignores_forwarded_user_id_and_internal_secret(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MNEMOSYNE_MCP_AUTH_MODE", "public")
-    monkeypatch.setattr("neem.mcp.auth.get_user_id_from_token", lambda token: "derived-user")
+    monkeypatch.setattr("neem.mcp.auth.get_user_id_from_token", lambda token: None)
     monkeypatch.setattr("neem.mcp.auth.get_internal_service_secret", lambda: "internal-secret")
 
     auth = MCPAuthContext.from_context(
         _ctx(
             {
-                "authorization": "Bearer request-token",
+                "authorization": "Bearer agsa_request_token",
                 "x-user-id": "forwarded-user",
             }
         )
     )
 
-    assert auth.token == "request-token"
-    assert auth.user_id == "derived-user"
+    assert auth.token == "agsa_request_token"
+    assert auth.user_id is None
     assert auth.internal_service_secret is None
-    assert auth.http_headers() == {"Authorization": "Bearer request-token"}
+    assert auth.http_headers() == {"Authorization": "Bearer agsa_request_token"}
 
 
 def test_public_mode_requires_bearer_token(
@@ -111,5 +111,45 @@ def test_public_mode_requires_bearer_token(
     assert auth.token is None
     assert auth.user_id is None
     assert auth.is_authenticated() is False
-    with pytest.raises(RuntimeError, match="Not authenticated"):
+    with pytest.raises(RuntimeError, match="Hosted session bearer token required"):
         auth.require_auth()
+
+
+def test_public_mode_rejects_non_agent_session_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MNEMOSYNE_MCP_AUTH_MODE", "public")
+    monkeypatch.setattr("neem.mcp.auth.get_user_id_from_token", lambda token: "jwt-user")
+
+    auth = MCPAuthContext.from_context(
+        _ctx(
+            {
+                "authorization": "Bearer eyJ.fake.jwt",
+            }
+        )
+    )
+
+    assert auth.token is None
+    assert auth.user_id is None
+    assert auth.is_authenticated() is False
+    with pytest.raises(RuntimeError, match="Hosted session bearer token required"):
+        auth.require_auth()
+
+
+def test_public_mode_accepts_agent_session_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MNEMOSYNE_MCP_AUTH_MODE", "public")
+    monkeypatch.setattr("neem.mcp.auth.get_user_id_from_token", lambda token: None)
+
+    auth = MCPAuthContext.from_context(
+        _ctx(
+            {
+                "authorization": "Bearer agsa_test_token",
+            }
+        )
+    )
+
+    assert auth.token == "agsa_test_token"
+    assert auth.is_authenticated() is True
+    assert auth.require_auth() == "agsa_test_token"
