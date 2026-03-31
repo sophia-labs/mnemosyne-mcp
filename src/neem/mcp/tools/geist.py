@@ -3,7 +3,7 @@ MCP tools for Project Geist — Sophia's persistent memory, valuation, and self-
 
 Provides 11 tools organized in four groups:
 - Memory Queue: remember, recall, care, archive_memories
-- Valuation: valuate, get_block_values, get_values, revaluate
+- Valuation: value, get_block_values, get_values, revaluate
 - Song: music, sing (verse/counterpoint/coda modes)
 - Orientation: quick_orient
 
@@ -1200,22 +1200,22 @@ def register_geist_tools(server: FastMCP) -> None:
     # ================================================================
 
     @server.tool(
-        name="valuate",
-        title="Valuate Block(s)",
+        name="value",
+        title="Value Block(s)",
         description=(
             "Assign importance (0-5) and/or valence (-5 to +5) to block(s) in the graph. "
             "For a single block, pass document_id, block_id, and importance/valence directly. "
             "For multiple blocks, pass a `valuations` list where each entry has "
             "document_id, block_id, and at least one of importance or valence.\n\n"
             "Uses logarithmic accumulation: each valuation adds to a cumulative sum, so "
-            "repeated attention builds durable scores. Valuating at 0 = active forgetting.\n\n"
+            "repeated attention builds durable scores. Valuing at 0 = active forgetting.\n\n"
             "Scoring criteria are defined in the graph's valuation config (see get_values). "
             "The importance and valence prompts can evolve over time.\n\n"
             "Wires express relationships between things; valuation expresses the agent's "
             "judgment about a single thing. Use both."
         ),
     )
-    async def valuate_tool(
+    async def value_tool(
         graph_id: str,
         document_id: Optional[str] = None,
         block_id: Optional[str] = None,
@@ -1224,7 +1224,7 @@ def register_geist_tools(server: FastMCP) -> None:
         valuations: list[dict[str, Any]] | None = None,
         context: Context | None = None,
     ) -> str:
-        """Valuate one or more blocks.
+        """Value one or more blocks.
 
         Uses 3 SPARQL round-trips total (1 read + 1 delete + 1 insert)
         regardless of batch size.

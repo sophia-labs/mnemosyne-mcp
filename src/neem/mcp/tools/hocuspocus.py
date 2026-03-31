@@ -564,7 +564,7 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
         """Query block valuations and compute per-document scores.
 
         Returns (excluded_doc_ids, valued_doc_ids) where:
-        - excluded_doc_ids: docs that have been valuated but score below min_score
+        - excluded_doc_ids: docs that have been valued but score below min_score
         - valued_doc_ids: all docs that have any valuations (for enriched collapse counts)
 
         Documents with no valuations are NOT excluded (unscored docs always pass).
@@ -2143,7 +2143,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "drilling into a specific area after seeing the top-level structure.\n"
             "- min_score (optional): Filter out documents with a document-level composite score below "
             "this threshold. Document scores are computed from block-level valuations (avg importance, "
-            "avg valence). Only applies to documents that have been valuated; unscored documents "
+            "avg valence). Only applies to documents that have been valued; unscored documents "
             "are always shown.\n"
             "- folders_only (default false): Return only the folder hierarchy with document counts "
             "per folder. No individual documents listed. Useful for understanding graph organization "

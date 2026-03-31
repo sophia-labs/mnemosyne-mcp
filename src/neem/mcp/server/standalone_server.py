@@ -452,7 +452,7 @@ HIVEMIND_EXCLUDED: frozenset[str] = frozenset({
 
 # Tools available in the "angel" profile — haiku-class subagents with
 # inherited parent context. Can read, search, wire, append, comment,
-# and valuate — but cannot edit/delete existing content or use
+# and value — but cannot edit/delete existing content or use
 # continuity tools (sing, remember, care) that imply persistent identity.
 ANGEL_TOOLS: frozenset[str] = frozenset({
     # Read & search (same as lite)
@@ -477,7 +477,7 @@ ANGEL_TOOLS: frozenset[str] = frozenset({
     "music",
     "get_important_blocks",
     "recall",
-    "valuate",
+    "value",
     "get_block_values",
     "get_values",
 })
@@ -1059,10 +1059,10 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
             "- Orientation flow: get_user_location → music() → recall() → get_workspace()\n"
             "- music/sing: Read/write the Song (narrative orientation before structural orientation)\n"
             "- remember/recall/care: Working memory queue (FIFO, numbered, append-only)\n"
-            "- valuate/get_block_values: Block-level importance (0-5) and valence (-5 to +5) scoring\n"
+            "- value/get_block_values: Block-level importance (0-5) and valence (-5 to +5) scoring\n"
             "- get_values/revaluate: Read/update scoring configuration\n"
             "- recall only searches the memory queue — use search_blocks for cross-document content discovery\n"
-            "- valuate works on any block in any document, not just the queue\n"
+            "- value works on any block in any document, not just the queue\n"
             "- remember is for the agent's own working memory; append_to_document is for user-facing content\n"
             "- Wires express relationships between things; valuation expresses judgment about a single thing\n\n"
             "**Search:**\n"
