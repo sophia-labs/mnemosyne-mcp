@@ -21,6 +21,10 @@ def test_chatgpt_demo_profile_exposes_only_expected_tools(_demo_env: None) -> No
 
     tools = server._tool_manager._tools
     assert set(tools.keys()) == {
+        "get_workspace",
+        "read_blocks",
+        "get_block",
+        "query_blocks",
         "search_documents",
         "search_blocks",
         "read_document",
@@ -54,6 +58,21 @@ def test_chatgpt_demo_profile_hides_graph_id_and_marks_tools_read_only(_demo_env
     document_digest = tools["document_digest"]
     assert "graph_id" not in document_digest.parameters["properties"]
     assert set(document_digest.parameters["required"]) == {"document_id"}
+
+    get_workspace = tools["get_workspace"]
+    assert "graph_id" not in get_workspace.parameters["properties"]
+
+    read_blocks = tools["read_blocks"]
+    assert "graph_id" not in read_blocks.parameters["properties"]
+    assert set(read_blocks.parameters["required"]) == {"document_id"}
+
+    get_block = tools["get_block"]
+    assert "graph_id" not in get_block.parameters["properties"]
+    assert set(get_block.parameters["required"]) == {"document_id", "block_id"}
+
+    query_blocks = tools["query_blocks"]
+    assert "graph_id" not in query_blocks.parameters["properties"]
+    assert set(query_blocks.parameters["required"]) == {"document_id"}
 
 
 def test_chatgpt_demo_profile_requires_demo_graph_config(
@@ -90,7 +109,7 @@ def test_chatgpt_demo_profile_uses_oauth2_security_in_chatgpt_oauth_mode(
                         "authorizationUrl": "https://api.example.com/oauth/chatgpt/authorize",
                         "tokenUrl": "https://api.example.com/oauth/chatgpt/token",
                         "scopes": {
-                            "mnemosyne.mcp.read": "Read Mnemosyne documents through ChatGPT.",
+                            "mnemosyne.mcp.read": "Use Mnemosyne through ChatGPT.",
                         },
                     }
                 },
@@ -105,7 +124,7 @@ def test_chatgpt_demo_profile_uses_oauth2_security_in_chatgpt_oauth_mode(
                             "authorizationUrl": "https://api.example.com/oauth/chatgpt/authorize",
                             "tokenUrl": "https://api.example.com/oauth/chatgpt/token",
                             "scopes": {
-                                "mnemosyne.mcp.read": "Read Mnemosyne documents through ChatGPT.",
+                                "mnemosyne.mcp.read": "Use Mnemosyne through ChatGPT.",
                             },
                         }
                     },
@@ -113,3 +132,9 @@ def test_chatgpt_demo_profile_uses_oauth2_security_in_chatgpt_oauth_mode(
             ]
         },
     }
+
+    assert {"write_document", "insert_blocks", "update_blocks", "edit_block_text"} <= set(tools.keys())
+    assert tools["write_document"].annotations is not None
+    assert tools["write_document"].annotations.readOnlyHint is False
+    assert tools["insert_blocks"].annotations is not None
+    assert tools["insert_blocks"].annotations.readOnlyHint is False

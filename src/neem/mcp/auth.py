@@ -389,7 +389,7 @@ def _exchange_chatgpt_oauth_token(external_token: str) -> Dict[str, str]:
         "tool_profile": (os.getenv(_CHATGPT_OAUTH_TOOL_PROFILE_ENV) or "chatgpt_demo").strip(),
         "capabilities": {
             "reads": True,
-            "writes": False,
+            "writes": True,
             "dangerous_ops": False,
         },
         "graph_scope": {
