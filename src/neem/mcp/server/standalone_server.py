@@ -12,14 +12,22 @@ before wiring in fresh tools.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlparse, urlunparse
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
+from starlette.applications import Starlette
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Mount, Route
 
 from neem.mcp.auth import get_current_auth_token
 from neem.mcp.http_client import create_http_client, set_http_client
@@ -49,6 +57,159 @@ HOST_PORT_ENV_VARS = (
     ("MNEMOSYNE_FASTAPI_HOST", "MNEMOSYNE_FASTAPI_PORT"),
     ("FASTAPI_SERVICE_HOST", "FASTAPI_SERVICE_PORT"),
 )
+CHATGPT_DEMO_PROFILE = "chatgpt_demo"
+CHATGPT_ACCOUNT_READONLY_PROFILE = "chatgpt_account_readonly"
+CHATGPT_DEMO_GRAPH_ID_ENV = "MNEMOSYNE_CHATGPT_DEMO_GRAPH_ID"
+CHATGPT_OAUTH_AUTH_SERVER_URL_ENV = "MNEMOSYNE_CHATGPT_OAUTH_AUTH_SERVER_URL"
+CHATGPT_OAUTH_RESOURCE_URL_ENV = "MNEMOSYNE_CHATGPT_OAUTH_RESOURCE_URL"
+CHATGPT_OAUTH_SCOPE_ENV = "MNEMOSYNE_CHATGPT_OAUTH_SCOPE"
+CHATGPT_DEMO_READ_TOOLS: frozenset[str] = frozenset({
+    "search_documents",
+    "search_blocks",
+    "read_document",
+    "document_digest",
+    "get_workspace",
+    "read_blocks",
+    "get_block",
+    "query_blocks",
+})
+CHATGPT_ACCOUNT_READONLY_TOOLS: frozenset[str] = frozenset({
+    "list_graphs",
+    "get_workspace",
+    "search_documents",
+    "search_blocks",
+    "read_document",
+    "document_digest",
+    "read_blocks",
+    "get_block",
+    "query_blocks",
+})
+
+
+async def _health_response(_request) -> JSONResponse:
+    """Lightweight process health for container and ingress probes."""
+    return JSONResponse({"status": "ok"})
+
+
+def _auth_mode() -> str:
+    return (os.getenv("MNEMOSYNE_MCP_AUTH_MODE", "").strip().lower() or "auto")
+
+
+def _is_chatgpt_oauth_mode() -> bool:
+    return _auth_mode() == "chatgpt_oauth"
+
+
+def _chatgpt_oauth_scope() -> str:
+    return (os.getenv(CHATGPT_OAUTH_SCOPE_ENV) or "mnemosyne.mcp.read").strip()
+
+
+def _chatgpt_oauth_auth_server_url() -> str:
+    value = (os.getenv(CHATGPT_OAUTH_AUTH_SERVER_URL_ENV) or "").strip().rstrip("/")
+    if not value:
+        raise RuntimeError(
+            f"{CHATGPT_OAUTH_AUTH_SERVER_URL_ENV} must be set when MNEMOSYNE_MCP_AUTH_MODE=chatgpt_oauth."
+        )
+    return value
+
+
+def _protected_resource_metadata_path(mount_path: str) -> str:
+    suffix = "/.well-known/oauth-protected-resource"
+    return f"{mount_path}{suffix}" if mount_path else suffix
+
+
+def _resource_url(mount_path: str) -> str:
+    configured = (os.getenv(CHATGPT_OAUTH_RESOURCE_URL_ENV) or "").strip()
+    if configured:
+        return configured
+    raise RuntimeError(
+        f"{CHATGPT_OAUTH_RESOURCE_URL_ENV} must be set when MNEMOSYNE_MCP_AUTH_MODE=chatgpt_oauth."
+    )
+
+
+def _protected_resource_metadata_url(mount_path: str) -> str:
+    resource = _resource_url(mount_path)
+    parsed = urlparse(resource)
+    return urlunparse(
+        parsed._replace(
+            path=_protected_resource_metadata_path(mount_path),
+            params="",
+            query="",
+            fragment="",
+        )
+    )
+
+
+async def _oauth_protected_resource_response(request: Request) -> JSONResponse:
+    mount_path = getattr(request.app.state, "mcp_mount_path", "")
+    auth_server = _chatgpt_oauth_auth_server_url()
+    return JSONResponse(
+        {
+            "resource": _resource_url(mount_path),
+            "authorization_servers": [auth_server],
+            "bearer_methods_supported": ["header"],
+            "scopes_supported": [_chatgpt_oauth_scope()],
+        }
+    )
+
+
+def build_streamable_http_app(mcp_server: FastMCP) -> Starlette:
+    """Wrap the FastMCP app with a simple health endpoint."""
+    transport_app = mcp_server.streamable_http_app()
+    mount_path = os.getenv("MCP_ROOT_PATH_PREFIX", "").strip()
+    if mount_path and not mount_path.startswith("/"):
+        mount_path = f"/{mount_path}"
+    mount_path = mount_path.rstrip("/")
+    if mount_path == "/":
+        mount_path = ""
+
+    @asynccontextmanager
+    async def lifespan(_app: Starlette):
+        async with transport_app.router.lifespan_context(transport_app):
+            yield
+
+    routes = [
+        Route("/health", endpoint=_health_response),
+        Route("/.well-known/oauth-protected-resource", endpoint=_oauth_protected_resource_response),
+    ]
+    if mount_path:
+        routes.append(
+            Route(
+                _protected_resource_metadata_path(mount_path),
+                endpoint=_oauth_protected_resource_response,
+            )
+        )
+        routes.append(Mount(mount_path, app=transport_app))
+    else:
+        routes.append(Mount("/", app=transport_app))
+
+    app = Starlette(
+        lifespan=lifespan,
+        routes=routes,
+    )
+    app.state.mcp_mount_path = mount_path
+
+    class _ChatGPTOAuthChallengeMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next) -> Response:
+            if _is_chatgpt_oauth_mode():
+                path = request.url.path
+                protected_path = f"{mount_path}/mcp" if mount_path else "/mcp"
+                if path.startswith(protected_path):
+                    auth_header = request.headers.get("authorization", "")
+                    if not auth_header.startswith("Bearer "):
+                        return JSONResponse(
+                            {"error": "authentication_required"},
+                            status_code=401,
+                            headers={
+                                "WWW-Authenticate": (
+                                    'Bearer realm="mnemosyne", '
+                                    f'resource_metadata="{_protected_resource_metadata_url(mount_path)}"'
+                                )
+                            },
+                        )
+            return await call_next(request)
+
+    app.add_middleware(_ChatGPTOAuthChallengeMiddleware)
+    return app
 
 
 @dataclass(frozen=True)
@@ -328,6 +489,732 @@ ANGEL_TOOLS: frozenset[str] = frozenset({
 })
 
 
+def _chatgpt_read_annotations() -> ToolAnnotations:
+    return ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+
+
+def _chatgpt_tool_meta() -> dict[str, Any]:
+    # FastMCP accepts arbitrary per-tool metadata. Choose the ChatGPT-facing
+    # security scheme based on the deployment auth mode.
+    if _is_chatgpt_oauth_mode():
+        auth_server = _chatgpt_oauth_auth_server_url()
+        security = [
+            {
+                "type": "oauth2",
+                "flows": {
+                    "authorizationCode": {
+                        "authorizationUrl": f"{auth_server}/authorize",
+                        "tokenUrl": f"{auth_server}/token",
+                        "scopes": {
+                            _chatgpt_oauth_scope(): "Use Mnemosyne through ChatGPT.",
+                        },
+                    }
+                },
+            }
+        ]
+    else:
+        security = [{"type": "noauth"}]
+    return {
+        "securitySchemes": security,
+        "_meta": {"securitySchemes": security},
+    }
+
+
+def _require_chatgpt_demo_graph_id() -> str:
+    graph_id = os.getenv(CHATGPT_DEMO_GRAPH_ID_ENV, "").strip()
+    if not graph_id:
+        raise RuntimeError(
+            f"{CHATGPT_DEMO_GRAPH_ID_ENV} must be set when MCP_PROFILE={CHATGPT_DEMO_PROFILE}.",
+        )
+    return graph_id
+
+
+def _parse_json_payload(raw: Any, *, tool_name: str) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        raise RuntimeError(f"{tool_name} returned unsupported payload type: {type(raw)!r}")
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{tool_name} returned invalid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"{tool_name} returned non-object JSON payload")
+    return parsed
+
+
+def _register_chatgpt_demo_tools(mcp_server: FastMCP) -> None:
+    demo_graph_id = _require_chatgpt_demo_graph_id()
+    tool_manager = mcp_server._tool_manager  # type: ignore[attr-defined]
+    original_tools = tool_manager._tools
+    enabled_tools = CHATGPT_DEMO_READ_TOOLS
+    missing = sorted(enabled_tools - set(original_tools.keys()))
+    if missing:
+        raise RuntimeError(f"chatgpt_demo profile missing required tools: {', '.join(missing)}")
+
+    original_fns: dict[str, Callable[..., Any]] = {
+        name: original_tools[name].fn for name in enabled_tools
+    }
+
+    for name in list(original_tools.keys()):
+        try:
+            mcp_server.remove_tool(name)
+        except (KeyError, ToolError):
+            pass
+
+    read_annotations = _chatgpt_read_annotations()
+    meta = _chatgpt_tool_meta()
+
+    @mcp_server.tool(
+        name="search_documents",
+        title="Search Documents",
+        description=(
+            "Use this when you know roughly what document you want in the Mnemosyne demo "
+            "workspace and need to find it quickly by title or path."
+        ),
+        annotations=read_annotations,
+        meta=meta,
+        structured_output=True,
+    )
+    async def chatgpt_search_documents_tool(
+        query: str,
+        mode: str = "auto",
+        limit: int = 10,
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        raw = await original_fns["search_documents"](
+            graph_id=demo_graph_id,
+            query=query,
+            mode=mode,
+            limit=min(max(limit, 1), 20),
+            folder_id=None,
+            include_folders=False,
+            context=context,
+        )
+        payload = _parse_json_payload(raw, tool_name="search_documents")
+        results = []
+        for item in payload.get("results", []):
+            if not isinstance(item, dict):
+                continue
+            results.append(
+                {
+                    "document_id": item.get("document_id"),
+                    "title": item.get("title"),
+                    "folder_path": item.get("folder_path"),
+                    "match_type": item.get("match_type"),
+                }
+            )
+        return {
+            "query": payload.get("query", query),
+            "mode": payload.get("mode", mode),
+            "count": len(results),
+            "results": results,
+        }
+
+    @mcp_server.tool(
+        name="search_blocks",
+        title="Search Blocks",
+        description=(
+            "Use this when you need to find passages or notes by content in the Mnemosyne "
+            "demo workspace."
+        ),
+        annotations=read_annotations,
+        meta=meta,
+        structured_output=True,
+    )
+    async def chatgpt_search_blocks_tool(
+        query: str,
+        mode: str = "hybrid",
+        limit: int = 10,
+        document_id: str | None = None,
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        raw = await original_fns["search_blocks"](
+            graph_id=demo_graph_id,
+            query=query,
+            mode=mode,
+            limit=min(max(limit, 1), 20),
+            doc_filter=(document_id.strip() if document_id else None),
+            context=context,
+        )
+        payload = _parse_json_payload(raw, tool_name="search_blocks")
+        results = []
+        for item in payload.get("results", []):
+            if not isinstance(item, dict):
+                continue
+            results.append(
+                {
+                    "document_id": item.get("document_id"),
+                    "document_title": item.get("document_title"),
+                    "block_id": item.get("block_id"),
+                    "snippet": item.get("text_preview"),
+                    "match_source": item.get("match_source"),
+                }
+            )
+        return {
+            "query": payload.get("query", query),
+            "mode": mode,
+            "count": len(results),
+            "results": results,
+        }
+
+    @mcp_server.tool(
+        name="read_document",
+        title="Read Document",
+        description=(
+            "Use this when you already know which document you want and need its contents "
+            "in Markdown."
+        ),
+        annotations=read_annotations,
+        meta=meta,
+        structured_output=True,
+    )
+    async def chatgpt_read_document_tool(
+        document_id: str,
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        result = await original_fns["read_document"](
+            graph_id=demo_graph_id,
+            document_id=document_id,
+            format="markdown",
+            context=context,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("read_document returned unsupported payload")
+        return {
+            "document_id": result.get("document_id", document_id),
+            "format": "markdown",
+            "content": result.get("content", ""),
+            "updated_at": result.get("updated_at"),
+        }
+
+    @mcp_server.tool(
+        name="document_digest",
+        title="Document Digest",
+        description=(
+            "Use this when you want a quick summary of a document before deciding whether "
+            "to read the full text."
+        ),
+        annotations=read_annotations,
+        meta=meta,
+        structured_output=True,
+    )
+    async def chatgpt_document_digest_tool(
+        document_id: str,
+        top_valued: int = 3,
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        result = await original_fns["document_digest"](
+            graph_id=demo_graph_id,
+            document_id=document_id,
+            top_valued=top_valued,
+            context=context,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("document_digest returned unsupported payload")
+        return {
+            "metadata": result.get("metadata"),
+            "size": result.get("size"),
+            "freshness": result.get("freshness"),
+            "headings": result.get("headings"),
+            "wire_summary": result.get("wire_summary"),
+            "valuation_summary": result.get("valuation_summary"),
+        }
+
+    @mcp_server.tool(
+        name="get_workspace",
+        title="Get Workspace",
+        description=(
+            "Use this when you need the folder and document structure of the Mnemosyne "
+            "workspace before choosing what to read or edit."
+        ),
+        annotations=read_annotations,
+        meta=meta,
+        structured_output=True,
+    )
+    async def chatgpt_get_workspace_tool(
+        depth: int = 1,
+        folder_id: str | None = None,
+        folders_only: bool = False,
+        min_score: str | None = None,
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        raw = await original_fns["get_workspace"](
+            graph_id=demo_graph_id,
+            depth=depth,
+            folder_id=folder_id,
+            folders_only=folders_only,
+            min_score=min_score,
+            context=context,
+        )
+        return _parse_json_payload(raw, tool_name="get_workspace")
+
+    @mcp_server.tool(
+        name="read_blocks",
+        title="Read Blocks",
+        description=(
+            "Use this when you need a paginated, block-by-block read of a document, "
+            "including block IDs for targeted follow-up reads or edits."
+        ),
+        annotations=read_annotations,
+        meta=meta,
+        structured_output=True,
+    )
+    async def chatgpt_read_blocks_tool(
+        document_id: str,
+        offset: int = 0,
+        limit: int = 50,
+        format: str = "markdown",
+        block_id: str | None = None,
+        include_ids: bool = True,
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        result = await original_fns["read_blocks"](
+            graph_id=demo_graph_id,
+            document_id=document_id,
+            offset=offset,
+            limit=min(max(limit, 1), 100),
+            format=format,
+            block_id=block_id,
+            include_ids=include_ids,
+            context=context,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("read_blocks returned unsupported payload")
+        return result
+
+    @mcp_server.tool(
+        name="get_block",
+        title="Get Block",
+        description=(
+            "Use this when you already have a block ID and need the exact block content "
+            "or context for targeted reasoning or editing."
+        ),
+        annotations=read_annotations,
+        meta=meta,
+        structured_output=True,
+    )
+    async def chatgpt_get_block_tool(
+        document_id: str,
+        block_id: str,
+        format: str = "markdown",
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        result = await original_fns["get_block"](
+            graph_id=demo_graph_id,
+            document_id=document_id,
+            block_id=block_id,
+            format=format,
+            context=context,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("get_block returned unsupported payload")
+        return result
+
+    @mcp_server.tool(
+        name="query_blocks",
+        title="Query Blocks",
+        description=(
+            "Use this when you need to find blocks in one document by structure or text, "
+            "or when you need to resolve block IDs for targeted edits."
+        ),
+        annotations=read_annotations,
+        meta=meta,
+        structured_output=True,
+    )
+    async def chatgpt_query_blocks_tool(
+        document_id: str,
+        block_type: str | None = None,
+        heading_level: int | None = None,
+        indent: int | None = None,
+        indent_gte: int | None = None,
+        indent_lte: int | None = None,
+        list_type: str | None = None,
+        checked: bool | None = None,
+        text_contains: str | None = None,
+        limit: int = 50,
+        queries: list[dict[str, Any]] | None = None,
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        result = await original_fns["query_blocks"](
+            graph_id=demo_graph_id,
+            document_id=document_id,
+            block_type=block_type,
+            heading_level=heading_level,
+            indent=indent,
+            indent_gte=indent_gte,
+            indent_lte=indent_lte,
+            list_type=list_type,
+            checked=checked,
+            text_contains=text_contains,
+            limit=min(max(limit, 1), 100),
+            queries=queries,
+            context=context,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("query_blocks returned unsupported payload")
+        return result
+
+    logger.info(
+        "ChatGPT demo profile applied",
+        extra_context={
+            "tool_count": len(mcp_server._tool_manager._tools),
+            "demo_graph_id": demo_graph_id,
+        },
+    )
+
+
+def _register_chatgpt_account_readonly_tools(mcp_server: FastMCP) -> None:
+    tool_manager = mcp_server._tool_manager  # type: ignore[attr-defined]
+    original_tools = tool_manager._tools
+    missing = sorted(CHATGPT_ACCOUNT_READONLY_TOOLS - set(original_tools.keys()))
+    if missing:
+        raise RuntimeError(
+            "chatgpt_account_readonly profile missing required tools: "
+            f"{', '.join(missing)}"
+        )
+
+    original_fns: dict[str, Callable[..., Any]] = {
+        name: original_tools[name].fn for name in CHATGPT_ACCOUNT_READONLY_TOOLS
+    }
+
+    for name in list(original_tools.keys()):
+        try:
+            mcp_server.remove_tool(name)
+        except (KeyError, ToolError):
+            pass
+
+    read_annotations = _chatgpt_read_annotations()
+    meta = _chatgpt_tool_meta()
+
+    @mcp_server.tool(
+        name="list_graphs",
+        title="List Graphs",
+        description="List the graphs available to the authenticated user.",
+        annotations=read_annotations,
+        meta=meta,
+        structured_output=True,
+    )
+    async def chatgpt_list_graphs_tool(
+        include_deleted: bool = False,
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        raw = await original_fns["list_graphs"](
+            include_deleted=include_deleted,
+            context=context,
+        )
+        payload = _parse_json_payload(raw, tool_name="list_graphs")
+        graphs = []
+        for item in payload.get("graphs", []):
+            if not isinstance(item, dict):
+                continue
+            graphs.append(
+                {
+                    "graph_id": item.get("graph_id"),
+                    "title": item.get("title"),
+                    "status": item.get("status"),
+                    "role": item.get("role"),
+                    "updated_at": item.get("updated_at"),
+                }
+            )
+        return {"count": len(graphs), "graphs": graphs}
+
+    @mcp_server.tool(
+        name="search_documents",
+        title="Search Documents",
+        description="Search one graph's document titles and paths.",
+        annotations=read_annotations,
+        meta=meta,
+        structured_output=True,
+    )
+    async def chatgpt_account_search_documents_tool(
+        graph_id: str,
+        query: str,
+        mode: str = "auto",
+        limit: int = 10,
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        raw = await original_fns["search_documents"](
+            graph_id=graph_id,
+            query=query,
+            mode=mode,
+            limit=min(max(limit, 1), 20),
+            folder_id=None,
+            include_folders=False,
+            context=context,
+        )
+        payload = _parse_json_payload(raw, tool_name="search_documents")
+        results = []
+        for item in payload.get("results", []):
+            if not isinstance(item, dict):
+                continue
+            results.append(
+                {
+                    "document_id": item.get("document_id"),
+                    "title": item.get("title"),
+                    "folder_path": item.get("folder_path"),
+                    "match_type": item.get("match_type"),
+                }
+            )
+        return {
+            "graph_id": graph_id,
+            "query": payload.get("query", query),
+            "mode": payload.get("mode", mode),
+            "count": len(results),
+            "results": results,
+        }
+
+    @mcp_server.tool(
+        name="search_blocks",
+        title="Search Blocks",
+        description="Search one graph's content blocks by exact text or meaning.",
+        annotations=read_annotations,
+        meta=meta,
+        structured_output=True,
+    )
+    async def chatgpt_account_search_blocks_tool(
+        graph_id: str,
+        query: str,
+        mode: str = "hybrid",
+        limit: int = 10,
+        document_id: str | None = None,
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        raw = await original_fns["search_blocks"](
+            graph_id=graph_id,
+            query=query,
+            mode=mode,
+            limit=min(max(limit, 1), 20),
+            doc_filter=(document_id.strip() if document_id else None),
+            context=context,
+        )
+        payload = _parse_json_payload(raw, tool_name="search_blocks")
+        results = []
+        for item in payload.get("results", []):
+            if not isinstance(item, dict):
+                continue
+            results.append(
+                {
+                    "document_id": item.get("document_id"),
+                    "document_title": item.get("document_title"),
+                    "block_id": item.get("block_id"),
+                    "snippet": item.get("text_preview"),
+                    "match_source": item.get("match_source"),
+                }
+            )
+        return {
+            "graph_id": graph_id,
+            "query": payload.get("query", query),
+            "mode": mode,
+            "count": len(results),
+            "results": results,
+        }
+
+    @mcp_server.tool(
+        name="read_document",
+        title="Read Document",
+        description="Read one document from one graph in Markdown.",
+        annotations=read_annotations,
+        meta=meta,
+        structured_output=True,
+    )
+    async def chatgpt_account_read_document_tool(
+        graph_id: str,
+        document_id: str,
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        result = await original_fns["read_document"](
+            graph_id=graph_id,
+            document_id=document_id,
+            format="markdown",
+            context=context,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("read_document returned unsupported payload")
+        return {
+            "graph_id": graph_id,
+            "document_id": result.get("document_id", document_id),
+            "format": "markdown",
+            "content": result.get("content", ""),
+            "updated_at": result.get("updated_at"),
+        }
+
+    @mcp_server.tool(
+        name="document_digest",
+        title="Document Digest",
+        description="Get a compact summary of one document in one graph.",
+        annotations=read_annotations,
+        meta=meta,
+        structured_output=True,
+    )
+    async def chatgpt_account_document_digest_tool(
+        graph_id: str,
+        document_id: str,
+        top_valued: int = 3,
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        result = await original_fns["document_digest"](
+            graph_id=graph_id,
+            document_id=document_id,
+            top_valued=top_valued,
+            context=context,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("document_digest returned unsupported payload")
+        return {
+            "graph_id": graph_id,
+            "metadata": result.get("metadata"),
+            "size": result.get("size"),
+            "freshness": result.get("freshness"),
+            "headings": result.get("headings"),
+            "wire_summary": result.get("wire_summary"),
+            "valuation_summary": result.get("valuation_summary"),
+        }
+
+    @mcp_server.tool(
+        name="get_workspace",
+        title="Get Workspace",
+        description="Get the folder and document structure for one graph.",
+        annotations=read_annotations,
+        meta=meta,
+        structured_output=True,
+    )
+    async def chatgpt_account_get_workspace_tool(
+        graph_id: str,
+        depth: int = 1,
+        folder_id: str | None = None,
+        folders_only: bool = False,
+        min_score: str | None = None,
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        raw = await original_fns["get_workspace"](
+            graph_id=graph_id,
+            depth=depth,
+            folder_id=folder_id,
+            folders_only=folders_only,
+            min_score=min_score,
+            context=context,
+        )
+        payload = _parse_json_payload(raw, tool_name="get_workspace")
+        payload["graph_id"] = graph_id
+        return payload
+
+    @mcp_server.tool(
+        name="read_blocks",
+        title="Read Blocks",
+        description="Read a paginated block window from one document in one graph.",
+        annotations=read_annotations,
+        meta=meta,
+        structured_output=True,
+    )
+    async def chatgpt_account_read_blocks_tool(
+        graph_id: str,
+        document_id: str,
+        offset: int = 0,
+        limit: int = 50,
+        format: str = "markdown",
+        block_id: str | None = None,
+        include_ids: bool = True,
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        result = await original_fns["read_blocks"](
+            graph_id=graph_id,
+            document_id=document_id,
+            offset=offset,
+            limit=min(max(limit, 1), 100),
+            format=format,
+            block_id=block_id,
+            include_ids=include_ids,
+            context=context,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("read_blocks returned unsupported payload")
+        result["graph_id"] = graph_id
+        return result
+
+    @mcp_server.tool(
+        name="get_block",
+        title="Get Block",
+        description="Read one block by ID from one document in one graph.",
+        annotations=read_annotations,
+        meta=meta,
+        structured_output=True,
+    )
+    async def chatgpt_account_get_block_tool(
+        graph_id: str,
+        document_id: str,
+        block_id: str,
+        format: str = "markdown",
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        result = await original_fns["get_block"](
+            graph_id=graph_id,
+            document_id=document_id,
+            block_id=block_id,
+            format=format,
+            context=context,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("get_block returned unsupported payload")
+        result["graph_id"] = graph_id
+        return result
+
+    @mcp_server.tool(
+        name="query_blocks",
+        title="Query Blocks",
+        description="Query one document's blocks by structure or text.",
+        annotations=read_annotations,
+        meta=meta,
+        structured_output=True,
+    )
+    async def chatgpt_account_query_blocks_tool(
+        graph_id: str,
+        document_id: str,
+        block_type: str | None = None,
+        heading_level: int | None = None,
+        indent: int | None = None,
+        indent_gte: int | None = None,
+        indent_lte: int | None = None,
+        list_type: str | None = None,
+        checked: bool | None = None,
+        text_contains: str | None = None,
+        limit: int = 50,
+        queries: list[dict[str, Any]] | None = None,
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        result = await original_fns["query_blocks"](
+            graph_id=graph_id,
+            document_id=document_id,
+            block_type=block_type,
+            heading_level=heading_level,
+            indent=indent,
+            indent_gte=indent_gte,
+            indent_lte=indent_lte,
+            list_type=list_type,
+            checked=checked,
+            text_contains=text_contains,
+            limit=min(max(limit, 1), 100),
+            queries=queries,
+            context=context,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("query_blocks returned unsupported payload")
+        result["graph_id"] = graph_id
+        return result
+
+    logger.info(
+        "ChatGPT account readonly profile applied",
+        extra_context={
+            "tool_count": len(mcp_server._tool_manager._tools),
+        },
+    )
+
+
 def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
     """
     Create an MCP server bound to the local FastAPI backend.
@@ -424,8 +1311,8 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
     http_client = create_http_client()
     set_http_client(http_client)
     mcp_server._http_client = http_client  # type: ignore[attr-defined]
-    auth_mode = (os.getenv("MNEMOSYNE_MCP_AUTH_MODE", "").strip().lower() or "auto")
-    hosted_mode = auth_mode in {"hosted", "sidecar"}
+    auth_mode = _auth_mode()
+    hosted_mode = auth_mode in {"hosted", "sidecar", "public", "demo_noauth"}
 
     if backend_config.has_websocket and not hosted_mode:
         dev_uid = get_dev_user_id()
@@ -513,6 +1400,10 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
             "Hivemind profile applied",
             extra_context={"excluded": len(HIVEMIND_EXCLUDED)},
         )
+    elif active_profile == CHATGPT_ACCOUNT_READONLY_PROFILE:
+        _register_chatgpt_account_readonly_tools(mcp_server)
+    elif active_profile == CHATGPT_DEMO_PROFILE:
+        _register_chatgpt_demo_tools(mcp_server)
 
     # Remove excluded tools based on MCP_EXCLUDED_TOOLS env var.
     # Comma-separated list of tool names, e.g. "export_document,upload_artifact,sparql_update"
@@ -555,7 +1446,7 @@ def run_standalone_mcp_server_sync():
     try:
         import uvicorn
 
-        http_app = mcp_server.streamable_http_app()
+        http_app = build_streamable_http_app(mcp_server)
         uvicorn.run(http_app, host=host, port=port)
     except KeyboardInterrupt:
         logger.info("Received shutdown signal")
