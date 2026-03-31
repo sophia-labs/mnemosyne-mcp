@@ -57,3 +57,23 @@ def test_build_streamable_http_app_exposes_protected_resource_metadata(
         "bearer_methods_supported": ["header"],
         "scopes_supported": ["mnemosyne.mcp.read"],
     }
+
+
+def test_chatgpt_oauth_challenge_uses_configured_https_metadata_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MNEMOSYNE_MCP_AUTH_MODE", "chatgpt_oauth")
+    monkeypatch.setenv("MNEMOSYNE_CHATGPT_OAUTH_AUTH_SERVER_URL", "https://api.example.com/oauth/chatgpt")
+    monkeypatch.setenv("MNEMOSYNE_CHATGPT_OAUTH_RESOURCE_URL", "https://api.example.com/chatgpt-auth/mcp")
+    monkeypatch.setenv("MCP_ROOT_PATH_PREFIX", "/chatgpt-auth")
+
+    app = build_streamable_http_app(FastMCP("test"))
+
+    with TestClient(app) as client:
+        response = client.get("/chatgpt-auth/mcp")
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == (
+        'Bearer realm="mnemosyne", '
+        'resource_metadata="https://api.example.com/chatgpt-auth/.well-known/oauth-protected-resource"'
+    )

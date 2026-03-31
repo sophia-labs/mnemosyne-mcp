@@ -110,6 +110,19 @@ def _resource_url(mount_path: str) -> str:
     )
 
 
+def _protected_resource_metadata_url(mount_path: str) -> str:
+    resource = _resource_url(mount_path)
+    parsed = urlparse(resource)
+    return urlunparse(
+        parsed._replace(
+            path=_protected_resource_metadata_path(mount_path),
+            params="",
+            query="",
+            fragment="",
+        )
+    )
+
+
 async def _oauth_protected_resource_response(request: Request) -> JSONResponse:
     mount_path = getattr(request.app.state, "mcp_mount_path", "")
     auth_server = _chatgpt_oauth_auth_server_url()
@@ -167,17 +180,13 @@ def build_streamable_http_app(mcp_server: FastMCP) -> Starlette:
                 if path.startswith(protected_path):
                     auth_header = request.headers.get("authorization", "")
                     if not auth_header.startswith("Bearer "):
-                        metadata_url = request.url.replace(
-                            path=_protected_resource_metadata_path(mount_path),
-                            query="",
-                        )
                         return JSONResponse(
                             {"error": "authentication_required"},
                             status_code=401,
                             headers={
                                 "WWW-Authenticate": (
                                     'Bearer realm="mnemosyne", '
-                                    f'resource_metadata="{metadata_url}"'
+                                    f'resource_metadata="{_protected_resource_metadata_url(mount_path)}"'
                                 )
                             },
                         )
