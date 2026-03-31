@@ -67,3 +67,49 @@ def test_chatgpt_demo_profile_requires_demo_graph_config(
 
     with pytest.raises(RuntimeError, match="MNEMOSYNE_CHATGPT_DEMO_GRAPH_ID"):
         create_standalone_mcp_server()
+
+
+def test_chatgpt_demo_profile_uses_oauth2_security_in_chatgpt_oauth_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MCP_PROFILE", "chatgpt_demo")
+    monkeypatch.setenv("MNEMOSYNE_MCP_AUTH_MODE", "chatgpt_oauth")
+    monkeypatch.setenv("MNEMOSYNE_CHATGPT_DEMO_GRAPH_ID", "demo-graph")
+    monkeypatch.setenv("MNEMOSYNE_CHATGPT_OAUTH_AUTH_SERVER_URL", "https://api.example.com/oauth/chatgpt")
+    monkeypatch.setenv("MNEMOSYNE_CHATGPT_OAUTH_RESOURCE_URL", "https://api.example.com/chatgpt-demo/mcp")
+
+    server = create_standalone_mcp_server()
+    tools = server._tool_manager._tools
+
+    assert tools["search_documents"].meta == {
+        "securitySchemes": [
+            {
+                "type": "oauth2",
+                "flows": {
+                    "authorizationCode": {
+                        "authorizationUrl": "https://api.example.com/oauth/chatgpt/authorize",
+                        "tokenUrl": "https://api.example.com/oauth/chatgpt/token",
+                        "scopes": {
+                            "mnemosyne.mcp.read": "Read Mnemosyne documents through ChatGPT.",
+                        },
+                    }
+                },
+            }
+        ],
+        "_meta": {
+            "securitySchemes": [
+                {
+                    "type": "oauth2",
+                    "flows": {
+                        "authorizationCode": {
+                            "authorizationUrl": "https://api.example.com/oauth/chatgpt/authorize",
+                            "tokenUrl": "https://api.example.com/oauth/chatgpt/token",
+                            "scopes": {
+                                "mnemosyne.mcp.read": "Read Mnemosyne documents through ChatGPT.",
+                            },
+                        }
+                    },
+                }
+            ]
+        },
+    }

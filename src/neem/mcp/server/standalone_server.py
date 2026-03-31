@@ -24,7 +24,9 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from neem.mcp.auth import get_current_auth_token
@@ -57,6 +59,9 @@ HOST_PORT_ENV_VARS = (
 )
 CHATGPT_DEMO_PROFILE = "chatgpt_demo"
 CHATGPT_DEMO_GRAPH_ID_ENV = "MNEMOSYNE_CHATGPT_DEMO_GRAPH_ID"
+CHATGPT_OAUTH_AUTH_SERVER_URL_ENV = "MNEMOSYNE_CHATGPT_OAUTH_AUTH_SERVER_URL"
+CHATGPT_OAUTH_RESOURCE_URL_ENV = "MNEMOSYNE_CHATGPT_OAUTH_RESOURCE_URL"
+CHATGPT_OAUTH_SCOPE_ENV = "MNEMOSYNE_CHATGPT_OAUTH_SCOPE"
 CHATGPT_DEMO_TOOLS: frozenset[str] = frozenset({
     "search_documents",
     "search_blocks",
@@ -68,6 +73,54 @@ CHATGPT_DEMO_TOOLS: frozenset[str] = frozenset({
 async def _health_response(_request) -> JSONResponse:
     """Lightweight process health for container and ingress probes."""
     return JSONResponse({"status": "ok"})
+
+
+def _auth_mode() -> str:
+    return (os.getenv("MNEMOSYNE_MCP_AUTH_MODE", "").strip().lower() or "auto")
+
+
+def _is_chatgpt_oauth_mode() -> bool:
+    return _auth_mode() == "chatgpt_oauth"
+
+
+def _chatgpt_oauth_scope() -> str:
+    return (os.getenv(CHATGPT_OAUTH_SCOPE_ENV) or "mnemosyne.mcp.read").strip()
+
+
+def _chatgpt_oauth_auth_server_url() -> str:
+    value = (os.getenv(CHATGPT_OAUTH_AUTH_SERVER_URL_ENV) or "").strip().rstrip("/")
+    if not value:
+        raise RuntimeError(
+            f"{CHATGPT_OAUTH_AUTH_SERVER_URL_ENV} must be set when MNEMOSYNE_MCP_AUTH_MODE=chatgpt_oauth."
+        )
+    return value
+
+
+def _protected_resource_metadata_path(mount_path: str) -> str:
+    suffix = "/.well-known/oauth-protected-resource"
+    return f"{mount_path}{suffix}" if mount_path else suffix
+
+
+def _resource_url(mount_path: str) -> str:
+    configured = (os.getenv(CHATGPT_OAUTH_RESOURCE_URL_ENV) or "").strip()
+    if configured:
+        return configured
+    raise RuntimeError(
+        f"{CHATGPT_OAUTH_RESOURCE_URL_ENV} must be set when MNEMOSYNE_MCP_AUTH_MODE=chatgpt_oauth."
+    )
+
+
+async def _oauth_protected_resource_response(request: Request) -> JSONResponse:
+    mount_path = getattr(request.app.state, "mcp_mount_path", "")
+    auth_server = _chatgpt_oauth_auth_server_url()
+    return JSONResponse(
+        {
+            "resource": _resource_url(mount_path),
+            "authorization_servers": [auth_server],
+            "bearer_methods_supported": ["header"],
+            "scopes_supported": [_chatgpt_oauth_scope()],
+        }
+    )
 
 
 def build_streamable_http_app(mcp_server: FastMCP) -> Starlette:
@@ -87,16 +140,51 @@ def build_streamable_http_app(mcp_server: FastMCP) -> Starlette:
 
     routes = [
         Route("/health", endpoint=_health_response),
+        Route("/.well-known/oauth-protected-resource", endpoint=_oauth_protected_resource_response),
     ]
     if mount_path:
+        routes.append(
+            Route(
+                _protected_resource_metadata_path(mount_path),
+                endpoint=_oauth_protected_resource_response,
+            )
+        )
         routes.append(Mount(mount_path, app=transport_app))
     else:
         routes.append(Mount("/", app=transport_app))
 
-    return Starlette(
+    app = Starlette(
         lifespan=lifespan,
         routes=routes,
     )
+    app.state.mcp_mount_path = mount_path
+
+    class _ChatGPTOAuthChallengeMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next) -> Response:
+            if _is_chatgpt_oauth_mode():
+                path = request.url.path
+                protected_path = f"{mount_path}/mcp" if mount_path else "/mcp"
+                if path.startswith(protected_path):
+                    auth_header = request.headers.get("authorization", "")
+                    if not auth_header.startswith("Bearer "):
+                        metadata_url = request.url.replace(
+                            path=_protected_resource_metadata_path(mount_path),
+                            query="",
+                        )
+                        return JSONResponse(
+                            {"error": "authentication_required"},
+                            status_code=401,
+                            headers={
+                                "WWW-Authenticate": (
+                                    'Bearer realm="mnemosyne", '
+                                    f'resource_metadata="{metadata_url}"'
+                                )
+                            },
+                        )
+            return await call_next(request)
+
+    app.add_middleware(_ChatGPTOAuthChallengeMiddleware)
+    return app
 
 
 @dataclass(frozen=True)
@@ -386,10 +474,26 @@ def _chatgpt_demo_annotations() -> ToolAnnotations:
 
 
 def _chatgpt_demo_meta() -> dict[str, Any]:
-    # FastMCP accepts arbitrary per-tool metadata. Include noauth security
-    # schemes now so the ChatGPT-facing profile advertises the intended
-    # connector auth story from the start.
-    security = [{"type": "noauth"}]
+    # FastMCP accepts arbitrary per-tool metadata. Choose the ChatGPT-facing
+    # security scheme based on the deployment auth mode.
+    if _is_chatgpt_oauth_mode():
+        auth_server = _chatgpt_oauth_auth_server_url()
+        security = [
+            {
+                "type": "oauth2",
+                "flows": {
+                    "authorizationCode": {
+                        "authorizationUrl": f"{auth_server}/authorize",
+                        "tokenUrl": f"{auth_server}/token",
+                        "scopes": {
+                            _chatgpt_oauth_scope(): "Read Mnemosyne documents through ChatGPT.",
+                        },
+                    }
+                },
+            }
+        ]
+    else:
+        security = [{"type": "noauth"}]
     return {
         "securitySchemes": security,
         "_meta": {"securitySchemes": security},
@@ -701,7 +805,7 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
     http_client = create_http_client()
     set_http_client(http_client)
     mcp_server._http_client = http_client  # type: ignore[attr-defined]
-    auth_mode = (os.getenv("MNEMOSYNE_MCP_AUTH_MODE", "").strip().lower() or "auto")
+    auth_mode = _auth_mode()
     hosted_mode = auth_mode in {"hosted", "sidecar", "public", "demo_noauth"}
 
     if backend_config.has_websocket and not hosted_mode:

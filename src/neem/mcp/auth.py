@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import contextvars
 from dataclasses import dataclass
+import json
 import os
 from typing import TYPE_CHECKING, Callable, Dict, Optional
+
+import httpx
 
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import (
@@ -32,10 +35,19 @@ _CURRENT_AUTH_CONTEXT: contextvars.ContextVar[Optional["MCPAuthContext"]] = cont
 )
 _INTERNAL_TRUST_AUTH_MODES = frozenset({"hosted", "sidecar"})
 _DEMO_NOAUTH_AUTH_MODES = frozenset({"demo_noauth"})
-_REQUEST_SCOPED_AUTH_MODES = _INTERNAL_TRUST_AUTH_MODES | frozenset({"public", "demo_noauth"})
+_CHATGPT_OAUTH_AUTH_MODES = frozenset({"chatgpt_oauth"})
+_REQUEST_SCOPED_AUTH_MODES = _INTERNAL_TRUST_AUTH_MODES | frozenset({"public", "demo_noauth", "chatgpt_oauth"})
 _AGENT_SESSION_TOKEN_PREFIX = "agsa_"
 _CHATGPT_DEMO_TOKEN_ENV = "MNEMOSYNE_CHATGPT_DEMO_TOKEN"
 _CHATGPT_DEMO_USER_ID_ENV = "MNEMOSYNE_CHATGPT_DEMO_USER_ID"
+_CHATGPT_OAUTH_EXCHANGE_PATH_ENV = "MNEMOSYNE_CHATGPT_OAUTH_EXCHANGE_PATH"
+_CHATGPT_OAUTH_TOOL_PROFILE_ENV = "MNEMOSYNE_CHATGPT_OAUTH_TOOL_PROFILE"
+_CHATGPT_OAUTH_RUNTIME_ENV = "MNEMOSYNE_CHATGPT_OAUTH_RUNTIME"
+_CHATGPT_OAUTH_LABEL_ENV = "MNEMOSYNE_CHATGPT_OAUTH_LABEL"
+_CHATGPT_OAUTH_TIMEOUT_SECONDS_ENV = "MNEMOSYNE_CHATGPT_OAUTH_TIMEOUT_SECONDS"
+_CHATGPT_DEMO_GRAPH_ID_ENV = "MNEMOSYNE_CHATGPT_DEMO_GRAPH_ID"
+_BACKEND_URL_ENV_VARS = ("MNEMOSYNE_FASTAPI_URL", "MNEMOSYNE_API_URL")
+_DEFAULT_BACKEND_URL = "http://127.0.0.1:8080"
 
 
 def _auth_mode() -> str:
@@ -61,6 +73,10 @@ def _is_valid_public_bearer(token: str) -> bool:
 
 def _is_demo_noauth_mode() -> bool:
     return _auth_mode() in _DEMO_NOAUTH_AUTH_MODES
+
+
+def _is_chatgpt_oauth_mode() -> bool:
+    return _auth_mode() in _CHATGPT_OAUTH_AUTH_MODES
 
 
 def _get_demo_auth_token() -> Optional[str]:
@@ -109,6 +125,10 @@ class MCPAuthContext:
         2. MNEMOSYNE_DEV_USER_ID or MNEMOSYNE_DEV_TOKEN env vars
         3. JWT token claims (sub, user_id, uid) - for local CLI users
         """
+        current = _CURRENT_AUTH_CONTEXT.get()
+        if current is not None:
+            return current
+
         token: Optional[str] = None
         user_id: Optional[str] = None
         source = "none"
@@ -170,7 +190,15 @@ class MCPAuthContext:
             if demo_user_id:
                 user_id = demo_user_id
 
-        # 3. Fall back to local/env token (CLI mode).
+        # 3. ChatGPT OAuth mode exchanges the external bearer for an internal
+        # hosted-session token on every request-scoped auth resolution.
+        if _is_chatgpt_oauth_mode() and token:
+            exchanged = _exchange_chatgpt_oauth_token(token)
+            token = exchanged["access_token"]
+            user_id = exchanged["user_id"]
+            source = "chatgpt_oauth_exchange"
+
+        # 4. Fall back to local/env token (CLI mode).
         # In hosted/sidecar mode, avoid global local-token fallback because
         # requests must be scoped to the caller's forwarded auth context.
         if not token and _allow_local_fallbacks():
@@ -178,13 +206,13 @@ class MCPAuthContext:
             if token:
                 source = "local_storage" if source == "none" else source
 
-        # 4. Dev mode user override
+        # 5. Dev mode user override
         if not user_id and _allow_local_fallbacks():
             user_id = get_dev_user_id()
             if user_id and source == "none":
                 source = "dev_env"
 
-        # 5. Extract user_id from JWT token claims (for local CLI users)
+        # 6. Extract user_id from JWT token claims (for local CLI users)
         if not user_id and token:
             user_id = get_user_id_from_token(token)
             if user_id:
@@ -328,3 +356,73 @@ def get_current_auth_token() -> Optional[str]:
     if _allow_local_fallbacks():
         return validate_token_and_load()
     return None
+
+
+def _resolve_backend_base_url() -> str:
+    for env_var in _BACKEND_URL_ENV_VARS:
+        value = (os.getenv(env_var) or "").strip()
+        if value:
+            return value.rstrip("/")
+    return _DEFAULT_BACKEND_URL
+
+
+def _require_chatgpt_demo_graph_id() -> str:
+    graph_id = (os.getenv(_CHATGPT_DEMO_GRAPH_ID_ENV) or "").strip()
+    if not graph_id:
+        raise RuntimeError(
+            f"{_CHATGPT_DEMO_GRAPH_ID_ENV} is required in chatgpt_oauth mode."
+        )
+    return graph_id
+
+
+def _exchange_chatgpt_oauth_token(external_token: str) -> Dict[str, str]:
+    """Exchange a ChatGPT-facing OAuth token for an internal hosted session."""
+    base_url = _resolve_backend_base_url()
+    path = (os.getenv(_CHATGPT_OAUTH_EXCHANGE_PATH_ENV) or "/api/agent/session").strip()
+    if not path.startswith("/"):
+        path = f"/{path}"
+    timeout = float((os.getenv(_CHATGPT_OAUTH_TIMEOUT_SECONDS_ENV) or "10").strip())
+    graph_id = _require_chatgpt_demo_graph_id()
+    request_body = {
+        "runtime": (os.getenv(_CHATGPT_OAUTH_RUNTIME_ENV) or "chatgpt").strip(),
+        "label": (os.getenv(_CHATGPT_OAUTH_LABEL_ENV) or "chatgpt_oauth").strip(),
+        "tool_profile": (os.getenv(_CHATGPT_OAUTH_TOOL_PROFILE_ENV) or "chatgpt_demo").strip(),
+        "capabilities": {
+            "reads": True,
+            "writes": False,
+            "dangerous_ops": False,
+        },
+        "graph_scope": {
+            "mode": "allowlist",
+            "default_graph_id": graph_id,
+            "allowed_graph_ids": [graph_id],
+        },
+        "metadata": {
+            "auth_source": "chatgpt_oauth",
+        },
+    }
+    try:
+        response = httpx.post(
+            f"{base_url}{path}",
+            headers={"Authorization": f"Bearer {external_token}"},
+            json=request_body,
+            timeout=timeout,
+        )
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"ChatGPT OAuth session exchange failed: {exc}") from exc
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"ChatGPT OAuth session exchange failed with {response.status_code}: {response.text}"
+        )
+    try:
+        payload = response.json()
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("ChatGPT OAuth session exchange returned invalid JSON") from exc
+    access_token = str(payload.get("access_token") or "").strip()
+    user_id = str(payload.get("user_id") or "").strip()
+    if not access_token or not user_id:
+        raise RuntimeError("ChatGPT OAuth session exchange response missing access_token or user_id")
+    return {
+        "access_token": access_token,
+        "user_id": user_id,
+    }

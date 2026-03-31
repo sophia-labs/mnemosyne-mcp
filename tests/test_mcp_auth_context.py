@@ -192,3 +192,33 @@ def test_demo_noauth_requires_configured_demo_token(
     assert auth.is_authenticated() is False
     with pytest.raises(RuntimeError, match="MNEMOSYNE_CHATGPT_DEMO_TOKEN"):
         auth.require_auth()
+
+
+def test_chatgpt_oauth_mode_exchanges_external_token_for_hosted_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MNEMOSYNE_MCP_AUTH_MODE", "chatgpt_oauth")
+    monkeypatch.setenv("MNEMOSYNE_CHATGPT_DEMO_GRAPH_ID", "demo-graph")
+    monkeypatch.setattr(
+        "neem.mcp.auth.httpx.post",
+        lambda *args, **kwargs: type(
+            "_Resp",
+            (),
+            {
+                "status_code": 200,
+                "json": staticmethod(lambda: {"access_token": "agsa_exchanged", "user_id": "user-123"}),
+            },
+        )(),
+    )
+
+    auth = MCPAuthContext.from_context(
+        _ctx(
+            {
+                "authorization": "Bearer oauth-access-token",
+            }
+        )
+    )
+
+    assert auth.token == "agsa_exchanged"
+    assert auth.user_id == "user-123"
+    assert auth.source == "chatgpt_oauth_exchange"
