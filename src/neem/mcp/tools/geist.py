@@ -38,6 +38,7 @@ from neem.hocuspocus import (
     WorkspaceWriter,
 )
 from neem.hocuspocus.converters import tiptap_xml_to_markdown
+from neem.mcp.tools.hocuspocus import _normalize_timestamp_to_iso
 from neem.mcp.auth import MCPAuthContext, get_current_auth_token, get_hocuspocus_client_kwargs
 from neem.mcp.http_client import get_http_client
 from neem.mcp.jobs import RealtimeJobClient
@@ -359,12 +360,14 @@ def _build_doc_created_index(ws_doc: pycrdt.Doc) -> Dict[str, str]:
     result: Dict[str, str] = {}
     try:
         reader = WorkspaceReader(ws_doc)
-        for doc_id in reader._documents.keys():
-            entry = reader._documents.get(doc_id)
-            if isinstance(entry, pycrdt.Map):
-                created = entry.get("createdAt")
-                if isinstance(created, str) and created:
-                    result[doc_id] = created
+        doc_keys = list(reader._documents.keys())
+        for doc_id in doc_keys:
+            doc_meta = reader.get_document(doc_id)
+            if doc_meta is not None:
+                raw = doc_meta.get("createdAt") or doc_meta.get("created_at")
+                normalized = _normalize_timestamp_to_iso(raw)
+                if normalized:
+                    result[doc_id] = normalized
     except Exception:
         pass
     return result
