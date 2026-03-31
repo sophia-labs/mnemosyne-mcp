@@ -81,10 +81,43 @@ def _ensure_xml_multiblock(text: str) -> str:
 _LIST_PREFIX_RE = re.compile(r"(?m)^\s*(?:[-+*]|\d+\.)\s+(?:\[[ xX]\]\s+)?")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 _FOOTNOTE_REF_RE = re.compile(r"\[\^[^\]]+\]")
+_ISO_DATETIME_WITH_FRACTION_RE = re.compile(
+    r"^(?P<head>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})"
+    r"(?P<fraction>\.\d+)?"
+    r"(?P<tz>Z|z|[+-]\d{2}:?\d{2})?$"
+)
 
 
 def _collapse_ws(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _normalize_iso_for_fromisoformat(raw: str) -> str:
+    """Normalize ISO-ish timestamp strings for Python 3.10 fromisoformat().
+
+    Python 3.10 is strict about fractional second precision (expects 0/3/6 digits).
+    We normalize to six digits and canonicalize timezone suffixes.
+    """
+    s = raw.strip()
+    match = _ISO_DATETIME_WITH_FRACTION_RE.match(s)
+    if not match:
+        return s.replace("Z", "+00:00").replace("z", "+00:00")
+
+    head = match.group("head")
+    fraction = match.group("fraction") or ""
+    tz = match.group("tz") or ""
+
+    if fraction:
+        digits = fraction[1:]
+        fraction = "." + (digits + "000000")[:6]
+
+    if tz in {"Z", "z"}:
+        tz = "+00:00"
+    elif tz and len(tz) == 5 and tz[3] != ":":
+        # ±HHMM -> ±HH:MM
+        tz = f"{tz[:3]}:{tz[3:]}"
+
+    return f"{head}{fraction}{tz}"
 
 
 def _collapse_ws_with_map(text: str) -> tuple[str, list[int]]:
@@ -248,7 +281,7 @@ def _normalize_timestamp_to_iso(value: Any) -> str | None:
         except ValueError:
             # Try ISO-8601 parsing path
             try:
-                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                dt = datetime.fromisoformat(_normalize_iso_for_fromisoformat(raw))
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
                 return dt.astimezone(timezone.utc).isoformat()
