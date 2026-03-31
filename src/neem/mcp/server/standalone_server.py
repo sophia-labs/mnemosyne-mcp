@@ -73,18 +73,29 @@ async def _health_response(_request) -> JSONResponse:
 def build_streamable_http_app(mcp_server: FastMCP) -> Starlette:
     """Wrap the FastMCP app with a simple health endpoint."""
     transport_app = mcp_server.streamable_http_app()
+    mount_path = os.getenv("MCP_ROOT_PATH_PREFIX", "").strip()
+    if mount_path and not mount_path.startswith("/"):
+        mount_path = f"/{mount_path}"
+    mount_path = mount_path.rstrip("/")
+    if mount_path == "/":
+        mount_path = ""
 
     @asynccontextmanager
     async def lifespan(_app: Starlette):
         async with transport_app.router.lifespan_context(transport_app):
             yield
 
+    routes = [
+        Route("/health", endpoint=_health_response),
+    ]
+    if mount_path:
+        routes.append(Mount(mount_path, app=transport_app))
+    else:
+        routes.append(Mount("/", app=transport_app))
+
     return Starlette(
         lifespan=lifespan,
-        routes=[
-            Route("/health", endpoint=_health_response),
-            Mount("/", app=transport_app),
-        ]
+        routes=routes,
     )
 
 
