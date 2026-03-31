@@ -31,8 +31,11 @@ _CURRENT_AUTH_CONTEXT: contextvars.ContextVar[Optional["MCPAuthContext"]] = cont
     default=None,
 )
 _INTERNAL_TRUST_AUTH_MODES = frozenset({"hosted", "sidecar"})
-_REQUEST_SCOPED_AUTH_MODES = _INTERNAL_TRUST_AUTH_MODES | frozenset({"public"})
+_DEMO_NOAUTH_AUTH_MODES = frozenset({"demo_noauth"})
+_REQUEST_SCOPED_AUTH_MODES = _INTERNAL_TRUST_AUTH_MODES | frozenset({"public", "demo_noauth"})
 _AGENT_SESSION_TOKEN_PREFIX = "agsa_"
+_CHATGPT_DEMO_TOKEN_ENV = "MNEMOSYNE_CHATGPT_DEMO_TOKEN"
+_CHATGPT_DEMO_USER_ID_ENV = "MNEMOSYNE_CHATGPT_DEMO_USER_ID"
 
 
 def _auth_mode() -> str:
@@ -54,6 +57,24 @@ def _allow_internal_service_auth() -> bool:
 
 def _is_valid_public_bearer(token: str) -> bool:
     return token.startswith(_AGENT_SESSION_TOKEN_PREFIX)
+
+
+def _is_demo_noauth_mode() -> bool:
+    return _auth_mode() in _DEMO_NOAUTH_AUTH_MODES
+
+
+def _get_demo_auth_token() -> Optional[str]:
+    token = os.getenv(_CHATGPT_DEMO_TOKEN_ENV, "").strip()
+    return token or None
+
+
+def _get_demo_auth_user_id(token: Optional[str]) -> Optional[str]:
+    configured = os.getenv(_CHATGPT_DEMO_USER_ID_ENV, "").strip()
+    if configured:
+        return configured
+    if token:
+        return get_user_id_from_token(token)
+    return None
 
 
 @dataclass
@@ -108,19 +129,22 @@ class MCPAuthContext:
                     )
                     auth_header = headers.get("authorization", "") or headers.get("Authorization", "")
                     if auth_header.startswith("Bearer "):
-                        candidate = auth_header[7:]
-                        if _auth_mode() == "public" and not _is_valid_public_bearer(candidate):
-                            logger.warning(
-                                "rejecting_non_agent_public_bearer",
-                                extra_context={"auth_mode": _auth_mode()},
-                            )
+                        if _is_demo_noauth_mode():
+                            logger.info("ignoring_request_bearer_in_demo_noauth_mode")
                         else:
-                            token = candidate
-                            source = "http_header"
-                            logger.info(
-                                "auth_from_http_header",
-                                extra_context={"has_token": bool(token)},
-                            )
+                            candidate = auth_header[7:]
+                            if _auth_mode() == "public" and not _is_valid_public_bearer(candidate):
+                                logger.warning(
+                                    "rejecting_non_agent_public_bearer",
+                                    extra_context={"auth_mode": _auth_mode()},
+                                )
+                            else:
+                                token = candidate
+                                source = "http_header"
+                                logger.info(
+                                    "auth_from_http_header",
+                                    extra_context={"has_token": bool(token)},
+                                )
                     # Sidecar deployments may also pass user context explicitly.
                     forwarded_user_id = headers.get("x-user-id") or headers.get("X-User-ID")
                     if forwarded_user_id and _allow_forwarded_user_id_header():
@@ -135,7 +159,18 @@ class MCPAuthContext:
                             extra_context={"auth_mode": _auth_mode()},
                         )
 
-        # 2. Fall back to local/env token (CLI mode).
+        # 2. ChatGPT demo mode uses a dedicated configured backend credential
+        # while remaining noauth at the external MCP edge.
+        if _is_demo_noauth_mode():
+            demo_token = _get_demo_auth_token()
+            if demo_token:
+                token = demo_token
+                source = "demo_env"
+            demo_user_id = _get_demo_auth_user_id(demo_token)
+            if demo_user_id:
+                user_id = demo_user_id
+
+        # 3. Fall back to local/env token (CLI mode).
         # In hosted/sidecar mode, avoid global local-token fallback because
         # requests must be scoped to the caller's forwarded auth context.
         if not token and _allow_local_fallbacks():
@@ -143,13 +178,13 @@ class MCPAuthContext:
             if token:
                 source = "local_storage" if source == "none" else source
 
-        # 3. Dev mode user override
+        # 4. Dev mode user override
         if not user_id and _allow_local_fallbacks():
             user_id = get_dev_user_id()
             if user_id and source == "none":
                 source = "dev_env"
 
-        # 4. Extract user_id from JWT token claims (for local CLI users)
+        # 5. Extract user_id from JWT token claims (for local CLI users)
         if not user_id and token:
             user_id = get_user_id_from_token(token)
             if user_id:
@@ -200,6 +235,9 @@ class MCPAuthContext:
             return ""
 
         raise RuntimeError(
+            f"{_CHATGPT_DEMO_TOKEN_ENV} is required in demo_noauth mode."
+            if _is_demo_noauth_mode()
+            else
             "Hosted session bearer token required."
             if _auth_mode() == "public"
             else "Not authenticated. Either run `neem init` to get a token, "

@@ -153,3 +153,42 @@ def test_public_mode_accepts_agent_session_bearer(
     assert auth.token == "agsa_test_token"
     assert auth.is_authenticated() is True
     assert auth.require_auth() == "agsa_test_token"
+
+
+def test_demo_noauth_uses_configured_demo_credential_and_ignores_request_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MNEMOSYNE_MCP_AUTH_MODE", "demo_noauth")
+    monkeypatch.setenv("MNEMOSYNE_CHATGPT_DEMO_TOKEN", "demo-token")
+    monkeypatch.setenv("MNEMOSYNE_CHATGPT_DEMO_USER_ID", "demo-user")
+    monkeypatch.setattr("neem.mcp.auth.validate_token_and_load", lambda: "local-token")
+
+    auth = MCPAuthContext.from_context(
+        _ctx(
+            {
+                "authorization": "Bearer request-token",
+                "x-user-id": "forwarded-user",
+            }
+        )
+    )
+
+    assert auth.token == "demo-token"
+    assert auth.user_id == "demo-user"
+    assert auth.source == "demo_env"
+    assert auth.http_headers() == {"Authorization": "Bearer demo-token"}
+    assert auth.require_auth() == "demo-token"
+
+
+def test_demo_noauth_requires_configured_demo_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MNEMOSYNE_MCP_AUTH_MODE", "demo_noauth")
+    monkeypatch.delenv("MNEMOSYNE_CHATGPT_DEMO_TOKEN", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_CHATGPT_DEMO_USER_ID", raising=False)
+
+    auth = MCPAuthContext.from_context(_ctx({}))
+
+    assert auth.token is None
+    assert auth.is_authenticated() is False
+    with pytest.raises(RuntimeError, match="MNEMOSYNE_CHATGPT_DEMO_TOKEN"):
+        auth.require_auth()

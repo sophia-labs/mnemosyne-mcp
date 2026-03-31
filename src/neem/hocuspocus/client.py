@@ -30,7 +30,7 @@ logger = LoggerFactory.get_logger("hocuspocus.client")
 
 TokenProvider = Callable[[], Optional[str]]
 _INTERNAL_TRUST_AUTH_MODES = frozenset({"hosted", "sidecar"})
-_REQUEST_SCOPED_AUTH_MODES = _INTERNAL_TRUST_AUTH_MODES | frozenset({"public"})
+_REQUEST_SCOPED_AUTH_MODES = _INTERNAL_TRUST_AUTH_MODES | frozenset({"public", "demo_noauth"})
 
 
 def _mcp_auth_mode() -> str:
