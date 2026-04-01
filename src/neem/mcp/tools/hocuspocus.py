@@ -25,7 +25,17 @@ import pycrdt
 from mcp.server.fastmcp import Context, FastMCP
 
 from neem.hocuspocus import HocuspocusClient, DocumentReader, DocumentWriter, WorkspaceWriter, WorkspaceReader
-from neem.hocuspocus.converters import looks_like_markdown, markdown_to_tiptap_xml, tiptap_xml_to_html, tiptap_xml_to_markdown
+from neem.hocuspocus.converters import (
+    PendingValuation,
+    extract_xml_valuations,
+    looks_like_markdown,
+    map_valuations_to_block_ids,
+    markdown_to_tiptap_xml,
+    postprocess_valuations,
+    preprocess_valuations,
+    tiptap_xml_to_html,
+    tiptap_xml_to_markdown,
+)
 from neem.hocuspocus.document import extract_title_from_xml
 from neem.mcp.auth import MCPAuthContext, get_current_auth_token, get_hocuspocus_client_kwargs
 from neem.mcp.http_client import get_http_client
@@ -1094,6 +1104,82 @@ GROUP BY ?docId
             f"after {attempts} attempts: {last_error}"
         )
 
+    # ------------------------------------------------------------------
+    # Inline valuation helpers
+    # ------------------------------------------------------------------
+    def _prepare_content_with_valuations(
+        content: str,
+        multiblock: bool = True,
+    ) -> tuple[str, list[PendingValuation]]:
+        """Process content, extracting inline valuation markers.
+
+        Returns (clean_xml, pending_valuations). Handles both XML content
+        (data-val-* attributes) and text/markdown ({!N,+M} syntax).
+        """
+        stripped = content.strip()
+        if not stripped:
+            return stripped, []
+
+        if stripped.startswith("<"):
+            # XML path: extract data-val-* attributes
+            return extract_xml_valuations(stripped)
+
+        # Text/markdown path: preprocess markers → convert → postprocess
+        preprocessed = preprocess_valuations(stripped)
+        if multiblock:
+            xml = _ensure_xml_multiblock(preprocessed)
+        else:
+            xml = _ensure_xml(preprocessed)
+        return postprocess_valuations(xml)
+
+    async def _fire_inline_valuations(
+        pending: list[PendingValuation],
+        block_ids: list[str],
+        document_id: str,
+        graph_id: str,
+        auth: MCPAuthContext,
+    ) -> dict | None:
+        """Map pending valuations to block IDs and apply via SPARQL.
+
+        Fire-and-forget: returns results on success, logs and returns
+        error dict on failure. Never raises.
+        """
+        if not pending:
+            return None
+
+        entries = map_valuations_to_block_ids(pending, block_ids, document_id)
+        if not entries:
+            return None
+
+        try:
+            from neem.mcp.tools.geist import _apply_valuations_batch
+            user_id = auth.user_id or (get_user_id_from_token(auth.token) if auth.token else None)
+            if not user_id:
+                return {"error": "Could not resolve user_id for inline valuations"}
+            result = await _apply_valuations_batch(
+                backend_config, job_stream, auth, graph_id, user_id, entries,
+            )
+            logger.info(
+                "inline_valuations_applied",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "valuations_count": len(entries),
+                    "updated_count": result.get("updated_count", 0),
+                },
+            )
+            return result
+        except Exception as e:
+            logger.warning(
+                "inline_valuations_failed",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "error": str(e),
+                },
+            )
+            return {"error": str(e), "valuations_attempted": len(entries)}
+
     @server.tool(
         name="get_user_location",
         title="Get Current Graph and Document",
@@ -1837,6 +1923,8 @@ Returns block_ids: an ordered list of all block IDs in the written document, ena
 
 For modifying parts of an existing document, prefer surgical block tools (edit_block_text, update_blocks, insert_blocks). Use write_document when replacing the full content of a document.
 
+Inline valuations: Add {!N} (importance 0-5), {!,+N} or {!,-N} (valence -5 to +5), or {!N,+M} (both) at the end of any line to automatically valuate that block after writing. For XML content, use data-val-importance="N" and data-val-valence="N" attributes on block elements. Markers are stripped from content before writing. Valuations appear in the response under a "valuations" key.
+
 Read the document first in multi-agent environments (see Write Tool Guidance in server instructions).""",
     )
     async def write_document_tool(
@@ -1858,7 +1946,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             # 1. Write document content and comments (with user context)
             await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
 
-            xml_content = _ensure_xml_multiblock(content)
+            xml_content, pending_valuations = _prepare_content_with_valuations(content)
 
             def write_content_and_comments(doc: Any) -> None:
                 writer = DocumentWriter(doc)
@@ -1948,7 +2036,12 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 user_id=auth.user_id,
             )
 
-            return {
+            # 4. Fire inline valuations if any markers were found
+            val_result = await _fire_inline_valuations(
+                pending_valuations, block_ids, document_id, graph_id, auth,
+            )
+
+            result = {
                 "success": True,
                 "graph_id": graph_id,
                 "document_id": document_id,
@@ -1956,6 +2049,9 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 "block_ids": block_ids,
                 "durability_checked": await_durable,
             }
+            if val_result is not None:
+                result["valuations"] = val_result
+            return result
 
         except Exception as e:
             logger.error(
@@ -3424,7 +3520,10 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "or replace entire block content. Plain text in xml_content is auto-wrapped "
             "in a <paragraph>. Markdown is also accepted and auto-converted.\n\n"
             "Always read the document or block first (read_document or get_block) before updating — "
-            "write tools use a cached channel and need a preceding read to sync latest state."
+            "write tools use a cached channel and need a preceding read to sync latest state.\n\n"
+            "Inline valuations: Add {!N} (importance 0-5), {!,+N} or {!,-N} (valence), "
+            "or {!N,+M} (both) at end of any line in xml_content to auto-valuate that block. "
+            "For XML, use data-val-importance/data-val-valence attributes."
         ),
     )
     async def update_blocks_tool(
@@ -3468,27 +3567,52 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
 
             results: list[Dict[str, Any]] = []
 
+            # Pre-process content to extract inline valuations before transaction
+            all_pending_valuations: list[dict] = []
+            preprocessed_updates: list[dict] = []
+            for update in updates:
+                bid = update.get("block_id")
+                content = update.get("xml_content") or update.get("content")
+                attrs = update.get("attributes")
+                resolved_xml = None
+                if content:
+                    xml, pending = _prepare_content_with_valuations(content, multiblock=False)
+                    resolved_xml = xml
+                    # Block ID is already known — map directly
+                    if pending and bid:
+                        for pv in pending:
+                            entry: dict = {"document_id": document_id.strip(), "block_id": bid.strip()}
+                            if pv.importance is not None:
+                                entry["importance"] = pv.importance
+                            if pv.valence is not None:
+                                entry["valence"] = pv.valence
+                            all_pending_valuations.append(entry)
+                preprocessed_updates.append({
+                    "block_id": bid,
+                    "resolved_xml": resolved_xml,
+                    "attributes": attrs,
+                })
+
             def perform_updates(doc: Any) -> None:
                 writer = DocumentWriter(doc)
-                for update in updates:
+                for update in preprocessed_updates:
                     bid = update.get("block_id")
                     if not bid:
                         results.append({"error": "missing block_id"})
                         continue
 
                     try:
-                        content = update.get("xml_content") or update.get("content")
+                        resolved = update.get("resolved_xml")
                         attrs = update.get("attributes")
 
-                        if content is None and attrs is None:
+                        if resolved is None and attrs is None:
                             results.append({
                                 "block_id": bid,
                                 "error": "No xml_content or attributes provided — nothing to update",
                             })
                             continue
 
-                        if content:
-                            resolved = _ensure_xml(content)
+                        if resolved:
                             writer.replace_block_by_id(bid.strip(), resolved)
                         if attrs:
                             writer.update_block_attributes(bid.strip(), attrs)
@@ -3503,19 +3627,41 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 user_id=auth.user_id,
             )
 
+            # Fire inline valuations if any markers were found
+            val_result = None
+            if all_pending_valuations:
+                try:
+                    from neem.mcp.tools.geist import _apply_valuations_batch
+                    user_id = auth.user_id or (get_user_id_from_token(auth.token) if auth.token else None)
+                    if user_id:
+                        val_result = await _apply_valuations_batch(
+                            backend_config, job_stream, auth, graph_id.strip(), user_id, all_pending_valuations,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "inline_valuations_failed",
+                        extra_context={"graph_id": graph_id, "document_id": document_id, "error": str(e)},
+                    )
+                    val_result = {"error": str(e), "valuations_attempted": len(all_pending_valuations)}
+
             # Single mode: return flat result or raise on error
             if is_single and results:
                 r = results[0]
                 if "error" in r:
                     raise RuntimeError(f"Failed to update block {r.get('block_id', '?')}: {r['error']}")
+                if val_result is not None:
+                    r["valuations"] = val_result
                 return r
 
-            return {
+            output = {
                 "success": all(r.get("success") for r in results),
                 "results": results,
                 "updated_count": sum(1 for r in results if r.get("success")),
                 "error_count": sum(1 for r in results if "error" in r),
             }
+            if val_result is not None:
+                output["valuations"] = val_result
+            return output
 
         except Exception as e:
             logger.error(
@@ -3789,7 +3935,11 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "after it with the old first block's text.\n\n"
             "Read the document first (read_document or get_block) before inserting — "
             "write tools need a preceding read to sync latest state. "
-            "Never call insert_blocks in parallel with other write operations on the same document."
+            "Never call insert_blocks in parallel with other write operations on the same document.\n\n"
+            "Inline valuations: Add {!N} (importance 0-5), {!,+N} or {!,-N} (valence), "
+            "or {!N,+M} (both) at end of any line to auto-valuate that block after writing. "
+            "For XML, use data-val-importance/data-val-valence attributes. "
+            "Markers are stripped from content."
         ),
     )
     async def insert_blocks_tool(
@@ -3832,8 +3982,8 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
 
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
-            # Convert content to XML, handling multiple blocks
-            xml_content = _ensure_xml_multiblock(content)
+            # Convert content to XML, extracting inline valuation markers
+            xml_content, pending_valuations = _prepare_content_with_valuations(content)
 
             # Parse into individual block XML strings
             blocks_xml: list[str] = []
@@ -3895,11 +4045,19 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 user_id=auth.user_id,
             )
 
-            return {
+            # Fire inline valuations if any markers were found
+            val_result = await _fire_inline_valuations(
+                pending_valuations, new_block_ids, document_id.strip(), graph_id.strip(), auth,
+            )
+
+            result = {
                 "success": True,
                 "block_ids": new_block_ids,
                 "blocks_inserted": len(new_block_ids),
             }
+            if val_result is not None:
+                result["valuations"] = val_result
+            return result
 
         except ValueError as ve:
             raise RuntimeError(str(ve))

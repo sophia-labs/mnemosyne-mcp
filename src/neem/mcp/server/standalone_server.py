@@ -1096,6 +1096,12 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
             "(read_document or get_block) to sync the channel before writing. "
             "CRDT merge prevents corruption, but writing without reading first may silently "
             "overwrite another agent's recent changes.\n\n"
+            "**Inline Valuations:**\n"
+            "Embed valuation markers in content — stripped before CRDT write, applied automatically after block IDs assigned. "
+            "Markdown/plain text (end of line): `{!3}` importance, `{!,+2}` valence, `{!4,-3}` both. "
+            "XML: `data-val-importance` and `data-val-valence` attributes on block elements. "
+            "Fire-and-forget (errors never fail the write). Supported in write_document, insert_blocks, update_blocks. "
+            "Markers inside code fences are preserved as literal text. Invalid ranges are ignored.\n\n"
             "When making function calls using tools that accept array or object parameters "
             "ensure those are structured using JSON."
         ),
