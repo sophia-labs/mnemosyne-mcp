@@ -261,8 +261,9 @@ class RealtimeJobClient:
                     self._dev_user_id,
                     bool(self._internal_service_secret),
                 ))
-                # Allow internal service auth without a token (cluster-internal sidecars)
-                if not token and not (self._internal_service_secret and self._dev_user_id):
+                # Require a bearer token for websocket auth. Internal service
+                # secret alone is no longer a valid user-scoped WS credential.
+                if not token:
                     trace("    ws._connect: NO AUTH AVAILABLE")
                     raise RuntimeError(
                         "Authentication token not available; run `neem init` again to refresh credentials."
@@ -273,17 +274,11 @@ class RealtimeJobClient:
                 if token:
                     headers["Authorization"] = f"Bearer {token}"
                 protocols = None
-                if self._internal_service_secret and self._dev_user_id:
-                    # Internal service auth via subprotocol (survives proxies)
-                    protocols = [f"internal.{self._dev_user_id}.{self._internal_service_secret[:8]}..."]
+                # JWT token in subprotocol (required for cognito_jwt through ALB)
+                protocols = [f"Bearer.{token}"]
+                if self._internal_service_secret:
                     headers["X-Internal-Service"] = self._internal_service_secret
-                elif token:
-                    # JWT token in subprotocol (required for cognito_jwt through ALB)
-                    protocols = [f"Bearer.{token}"]
-                elif self._dev_user_id:
-                    # Dev mode fallback
-                    protocols = [f"Bearer.{self._dev_user_id}"]
-                if self._dev_user_id:
+                if self._dev_user_id and not self._internal_service_secret:
                     headers["X-User-ID"] = self._dev_user_id
 
                 trace("    ws._connect: connecting to %s" % self.websocket_url, {

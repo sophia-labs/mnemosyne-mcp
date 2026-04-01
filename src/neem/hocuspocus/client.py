@@ -223,7 +223,9 @@ class HocuspocusClient:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         effective_user_id = user_id or self._dev_user_id
-        if effective_user_id and _allow_forwarded_user_id_header():
+        # Never combine X-User-ID with internal service auth. Platform-side
+        # internal-service auth now rejects caller-asserted user headers.
+        if effective_user_id and _allow_forwarded_user_id_header() and not self._internal_service_secret:
             headers["X-User-ID"] = effective_user_id
         # Add internal service auth header for cluster-internal requests
         if self._internal_service_secret and _allow_internal_service_auth():
@@ -234,20 +236,13 @@ class HocuspocusClient:
         """Build WebSocket subprotocols for auth.
 
         Supported formats:
-        - internal.{user_id}.{secret} - internal service auth (preferred for sidecars)
         - Bearer.{token} - JWT token auth (required for cognito_jwt mode)
         - Bearer.{user_id} - dev mode fallback (dev_no_auth mode)
-
-        Internal service auth via subprotocol is preferred because it survives
-        proxies that may strip custom HTTP headers during WebSocket upgrade.
 
         Args:
             user_id: Override user_id for this connection. If not provided, uses _dev_user_id.
         """
         effective_user_id = user_id or self._dev_user_id
-        # Prefer internal service auth via subprotocol (survives proxies)
-        if self._internal_service_secret and effective_user_id and _allow_internal_service_auth():
-            return [f"internal.{effective_user_id}.{self._internal_service_secret}"]
         # Use JWT token in subprotocol (required for cognito_jwt auth mode)
         token = self._token_provider()
         if token:

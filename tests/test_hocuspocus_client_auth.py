@@ -23,7 +23,7 @@ def test_public_mode_uses_bearer_only(monkeypatch: pytest.MonkeyPatch) -> None:
     assert protocols == ["Bearer.request-token"]
 
 
-def test_hosted_mode_preserves_internal_sidecar_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_hosted_mode_uses_bearer_ws_auth_and_internal_header(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MNEMOSYNE_MCP_AUTH_MODE", "hosted")
     client = HocuspocusClient(
         base_url="http://localhost:8080",
@@ -37,10 +37,9 @@ def test_hosted_mode_preserves_internal_sidecar_auth(monkeypatch: pytest.MonkeyP
 
     assert headers == {
         "Authorization": "Bearer request-token",
-        "X-User-ID": "forwarded-user",
         "X-Internal-Service": "internal-secret",
     }
-    assert protocols == ["internal.forwarded-user.internal-secret"]
+    assert protocols == ["Bearer.request-token"]
 
 
 def test_public_mode_disables_user_id_subprotocol_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
