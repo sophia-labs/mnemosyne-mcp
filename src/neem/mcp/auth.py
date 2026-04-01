@@ -49,6 +49,7 @@ _CHATGPT_DEMO_GRAPH_ID_ENV = "MNEMOSYNE_CHATGPT_DEMO_GRAPH_ID"
 _BACKEND_URL_ENV_VARS = ("MNEMOSYNE_FASTAPI_URL", "MNEMOSYNE_API_URL")
 _DEFAULT_BACKEND_URL = "http://127.0.0.1:8080"
 _CHATGPT_ACCOUNT_READONLY_PROFILE = "chatgpt_account_readonly"
+_CHATGPT_ACCOUNT_PROFILE = "chatgpt_account"
 _CHATGPT_DEMO_PROFILE = "chatgpt_demo"
 
 
@@ -385,7 +386,7 @@ def _exchange_chatgpt_oauth_token(external_token: str) -> Dict[str, str]:
         path = f"/{path}"
     timeout = float((os.getenv(_CHATGPT_OAUTH_TIMEOUT_SECONDS_ENV) or "10").strip())
     tool_profile = (
-        os.getenv(_CHATGPT_OAUTH_TOOL_PROFILE_ENV) or _CHATGPT_ACCOUNT_READONLY_PROFILE
+        os.getenv(_CHATGPT_OAUTH_TOOL_PROFILE_ENV) or _CHATGPT_ACCOUNT_PROFILE
     ).strip()
     graph_scope: Dict[str, object]
     if tool_profile == _CHATGPT_DEMO_PROFILE:
@@ -403,8 +404,8 @@ def _exchange_chatgpt_oauth_token(external_token: str) -> Dict[str, str]:
         "tool_profile": tool_profile,
         "capabilities": {
             "reads": True,
-            "writes": False,
-            "dangerous_ops": False,
+            "writes": True,
+            "dangerous_ops": True,
         },
         "graph_scope": graph_scope,
         "metadata": {
