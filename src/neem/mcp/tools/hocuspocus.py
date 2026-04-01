@@ -1447,8 +1447,7 @@ Always returns fresh content — automatically reconnects if the cached channel 
                 tool_name="read_blocks",
             )
             reader = DocumentReader(document_doc)
-            fragment = reader.get_content_fragment()
-            all_children = list(fragment.children)
+            all_children = reader.get_children_deduped()
             total_blocks = len(all_children)
 
             # Resolve block_id to offset (takes precedence over offset param)

@@ -518,14 +518,17 @@ class DocumentReader:
         """Return document content as TipTap XML.
 
         Properly reconstructs mark elements (strong, em, etc.) from Y.js
-        formatting attributes on XmlText nodes.
+        formatting attributes on XmlText nodes. Deduplicates orphan blocks
+        with the same data-block-id.
 
         Example output:
             <paragraph>Hello <strong>bold</strong> world</paragraph>
             <heading level="2">Section</heading>
         """
-        fragment = self.get_content_fragment()
-        return self._serialize_fragment(fragment)
+        parts = []
+        for child in self.get_children_deduped():
+            parts.append(self._serialize_element(child))
+        return "".join(parts)
 
     def _serialize_fragment(self, fragment: pycrdt.XmlFragment) -> str:
         """Serialize an XmlFragment to TipTap XML string."""
@@ -613,10 +616,33 @@ class DocumentReader:
 
         return "".join(parts)
 
+    def get_children_deduped(self) -> list[Any]:
+        """Get top-level blocks with duplicate block IDs removed.
+
+        CRDT merge can leave orphan XmlElements with the same data-block-id
+        as a live block (e.g., after replace_block_by_id across concurrent
+        clients). TipTap deduplicates by block ID during rendering, so only
+        the first element for a given ID is visible in the browser.
+
+        This method matches TipTap's behavior: keeps the first occurrence of
+        each block ID and drops later duplicates.
+        """
+        fragment = self.get_content_fragment()
+        seen_ids: set[str] = set()
+        result: list[Any] = []
+        for child in fragment.children:
+            if hasattr(child, "attributes"):
+                bid = child.attributes.get("data-block-id")
+                if bid:
+                    if bid in seen_ids:
+                        continue
+                    seen_ids.add(bid)
+            result.append(child)
+        return result
+
     def get_block_count(self) -> int:
         """Get the number of top-level blocks in the document."""
-        fragment = self.get_content_fragment()
-        return len(list(fragment.children))
+        return len(self.get_children_deduped())
 
     def find_block_by_id(self, block_id: str) -> tuple[int, Any] | None:
         """Find a block by its data-block-id attribute.
@@ -643,8 +669,7 @@ class DocumentReader:
         Returns:
             The XmlElement at that index, or None if out of bounds.
         """
-        fragment = self.get_content_fragment()
-        children = list(fragment.children)
+        children = self.get_children_deduped()
         if 0 <= index < len(children):
             return children[index]
         return None
@@ -676,9 +701,13 @@ class DocumentReader:
             return None
 
         index, elem = result
-        fragment = self.get_content_fragment()
-        children = list(fragment.children)
+        children = self.get_children_deduped()
         total = len(children)
+        # Re-resolve index within deduped list (may differ from raw index)
+        for i, child in enumerate(children):
+            if child is elem:
+                index = i
+                break
 
         # Get prev/next block IDs
         prev_id = None
@@ -743,8 +772,7 @@ class DocumentReader:
         Returns:
             List of matching block summaries.
         """
-        fragment = self.get_content_fragment()
-        children_list = list(fragment.children)
+        children_list = self.get_children_deduped()
         total = len(children_list)
         matches = []
         import re
@@ -1453,6 +1481,7 @@ class DocumentWriter:
         """Replace a block's content entirely while preserving its block ID.
 
         The new block will keep the same data-block-id as the original.
+        Any orphan duplicates with the same block ID are cleaned up.
 
         Args:
             block_id: The block ID to replace
@@ -1478,15 +1507,38 @@ class DocumentWriter:
         elem.set("data-block-id", block_id)
 
         with self._doc.transaction():
-            # Delete old block
-            del fragment.children[index]
+            # Delete ALL blocks with this ID (primary + any orphan duplicates).
+            # Collect indices in reverse order so deletions don't shift later indices.
+            indices_to_delete = []
+            for i, child in enumerate(fragment.children):
+                if hasattr(child, "attributes"):
+                    if child.attributes.get("data-block-id") == block_id:
+                        indices_to_delete.append(i)
+
+            if len(indices_to_delete) > 1:
+                logger.warning(
+                    "replace_block_by_id: cleaning up orphan duplicates",
+                    extra_context={
+                        "block_id": block_id,
+                        "duplicate_count": len(indices_to_delete),
+                        "indices": indices_to_delete,
+                    },
+                )
+
+            for idx in reversed(indices_to_delete):
+                del fragment.children[idx]
+
+            # Insert position is the first occurrence's original index,
+            # adjusted for any deletions before it (there are none since
+            # it was the first match).
+            insert_at = indices_to_delete[0]
 
             # Process new element (handles list container flattening)
             blocks = self._process_element(elem)
 
             # Insert new block(s)
             for i, block in enumerate(blocks):
-                fragment.children.insert(index + i, block)
+                fragment.children.insert(insert_at + i, block)
 
             self._apply_pending_formats()
 
