@@ -141,7 +141,9 @@ def _get_all_wires(doc: pycrdt.Doc, include_tombstoned: bool = False) -> List[Di
     for wire_id in wires_map.keys():
         wire = wires_map.get(wire_id)
         if isinstance(wire, pycrdt.Map):
-            if not include_tombstoned and wire.get("_tombstonedAt") is not None:
+            if not include_tombstoned and (
+                wire.get("_tombstonedAt") is not None or wire.get("deletedAt") is not None
+            ):
                 continue
             result.append(_wire_to_dict(wire_id, wire))
     return result

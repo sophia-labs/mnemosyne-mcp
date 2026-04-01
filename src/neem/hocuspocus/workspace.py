@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from typing import Any
 
 import pycrdt
@@ -393,13 +394,18 @@ class WorkspaceWriter:
         return children
 
     def delete_wire(self, wire_id: str) -> list[str]:
-        """Delete a wire by ID, including its inverse if bidirectional.
+        """Soft-delete a wire by ID, including its inverse if bidirectional.
+
+        Sets ``deletedAt`` on the wire entry instead of removing it from the
+        Y.Doc. This makes the deletion a trackable CRDT event — visible to
+        edit history and replayable after RDF materialization. The wire is
+        filtered from all read paths once ``deletedAt`` is set.
 
         Args:
             wire_id: The wire ID to delete (e.g. "w-a3f1b9c20d4e").
 
         Returns:
-            List of wire IDs that were deleted (includes inverse if present).
+            List of wire IDs that were soft-deleted (includes inverse if present).
 
         Raises:
             ValueError: If wire_id not found.
@@ -407,23 +413,27 @@ class WorkspaceWriter:
         if wire_id not in self._wires:
             raise ValueError(f"Wire '{wire_id}' not found")
 
+        now = datetime.now(timezone.utc).isoformat()
         deleted_ids: list[str] = []
 
-        # If this IS an inverse wire, also delete the canonical
+        def _soft_delete(wid: str) -> None:
+            w = self._wires.get(wid)
+            if isinstance(w, pycrdt.Map):
+                w["deletedAt"] = now
+                deleted_ids.append(wid)
+
+        # If this IS an inverse wire, also soft-delete the canonical
         if wire_id.endswith("-inv"):
             canonical_id = wire_id[:-4]
             if canonical_id in self._wires:
-                del self._wires[canonical_id]
-                deleted_ids.append(canonical_id)
+                _soft_delete(canonical_id)
         else:
             # Check if this wire has an inverse (bidirectional)
             inv_id = f"{wire_id}-inv"
             if inv_id in self._wires:
-                del self._wires[inv_id]
-                deleted_ids.append(inv_id)
+                _soft_delete(inv_id)
 
-        del self._wires[wire_id]
-        deleted_ids.append(wire_id)
+        _soft_delete(wire_id)
 
         return deleted_ids
 
@@ -478,10 +488,12 @@ class WorkspaceWriter:
             else:
                 to_delete.add(f"{wire_id}-inv")
 
+        now = datetime.now(timezone.utc).isoformat()
         deleted: list[str] = []
         for wire_id in to_delete:
-            if wire_id in self._wires:
-                del self._wires[wire_id]
+            w = self._wires.get(wire_id)
+            if isinstance(w, pycrdt.Map):
+                w["deletedAt"] = now
                 deleted.append(wire_id)
 
         return deleted
