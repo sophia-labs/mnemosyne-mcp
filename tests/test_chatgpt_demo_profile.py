@@ -138,3 +138,46 @@ def test_chatgpt_demo_profile_uses_oauth2_security_in_chatgpt_oauth_mode(
     assert tools["write_document"].annotations.readOnlyHint is False
     assert tools["insert_blocks"].annotations is not None
     assert tools["insert_blocks"].annotations.readOnlyHint is False
+
+
+def test_chatgpt_oauth_defaults_to_demo_profile_when_mcp_profile_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MCP_PROFILE", raising=False)
+    monkeypatch.setenv("MNEMOSYNE_MCP_AUTH_MODE", "chatgpt_oauth")
+    monkeypatch.setenv("MNEMOSYNE_CHATGPT_DEMO_GRAPH_ID", "demo-graph")
+    monkeypatch.setenv("MNEMOSYNE_CHATGPT_OAUTH_AUTH_SERVER_URL", "https://api.example.com/oauth/chatgpt")
+    monkeypatch.setenv("MNEMOSYNE_CHATGPT_OAUTH_RESOURCE_URL", "https://api.example.com/chatgpt-demo/mcp")
+
+    server = create_standalone_mcp_server()
+    tools = server._tool_manager._tools
+
+    assert set(tools.keys()) == {
+        "get_workspace",
+        "read_blocks",
+        "get_block",
+        "query_blocks",
+        "search_documents",
+        "search_blocks",
+        "read_document",
+        "document_digest",
+        "write_document",
+        "insert_blocks",
+        "update_blocks",
+        "edit_block_text",
+    }
+    assert "delete_graph" not in tools
+    assert "delete_documents" not in tools
+    assert "sparql_update" not in tools
+
+
+def test_chatgpt_oauth_rejects_non_demo_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MCP_PROFILE", "hivemind")
+    monkeypatch.setenv("MNEMOSYNE_MCP_AUTH_MODE", "chatgpt_oauth")
+    monkeypatch.setenv("MNEMOSYNE_CHATGPT_OAUTH_AUTH_SERVER_URL", "https://api.example.com/oauth/chatgpt")
+    monkeypatch.setenv("MNEMOSYNE_CHATGPT_OAUTH_RESOURCE_URL", "https://api.example.com/chatgpt-demo/mcp")
+
+    with pytest.raises(RuntimeError, match="requires MCP_PROFILE=chatgpt_demo"):
+        create_standalone_mcp_server()

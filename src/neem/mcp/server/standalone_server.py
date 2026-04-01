@@ -1016,6 +1016,16 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
                  Falls back to MCP_PROFILE env var if not provided.
     """
     active_profile = profile or os.getenv("MCP_PROFILE", "")
+    if _is_chatgpt_oauth_mode():
+        # Fail closed for ChatGPT OAuth deployments:
+        # - default to chatgpt_demo when unset
+        # - reject conflicting explicit profiles
+        if not active_profile:
+            active_profile = CHATGPT_DEMO_PROFILE
+        elif active_profile != CHATGPT_DEMO_PROFILE:
+            raise RuntimeError(
+                "MNEMOSYNE_MCP_AUTH_MODE=chatgpt_oauth requires MCP_PROFILE=chatgpt_demo"
+            )
     backend_config = resolve_backend_config()
 
     trace_separator("MCP SERVER STARTUP")
