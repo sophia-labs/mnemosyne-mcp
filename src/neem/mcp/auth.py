@@ -382,21 +382,26 @@ def _exchange_chatgpt_oauth_token(external_token: str) -> Dict[str, str]:
     if not path.startswith("/"):
         path = f"/{path}"
     timeout = float((os.getenv(_CHATGPT_OAUTH_TIMEOUT_SECONDS_ENV) or "10").strip())
-    graph_id = _require_chatgpt_demo_graph_id()
+    tool_profile = (os.getenv(_CHATGPT_OAUTH_TOOL_PROFILE_ENV) or "chatgpt_account").strip()
+    demo_graph_id = os.getenv(_CHATGPT_DEMO_GRAPH_ID_ENV, "").strip() or None
+    if demo_graph_id:
+        graph_scope: Dict[str, object] = {
+            "mode": "allowlist",
+            "default_graph_id": demo_graph_id,
+            "allowed_graph_ids": [demo_graph_id],
+        }
+    else:
+        graph_scope = {"mode": "all_user_graphs"}
     request_body = {
         "runtime": (os.getenv(_CHATGPT_OAUTH_RUNTIME_ENV) or "chatgpt").strip(),
         "label": (os.getenv(_CHATGPT_OAUTH_LABEL_ENV) or "chatgpt_oauth").strip(),
-        "tool_profile": (os.getenv(_CHATGPT_OAUTH_TOOL_PROFILE_ENV) or "chatgpt_demo").strip(),
+        "tool_profile": tool_profile,
         "capabilities": {
             "reads": True,
             "writes": True,
-            "dangerous_ops": False,
+            "dangerous_ops": True,
         },
-        "graph_scope": {
-            "mode": "allowlist",
-            "default_graph_id": graph_id,
-            "allowed_graph_ids": [graph_id],
-        },
+        "graph_scope": graph_scope,
         "metadata": {
             "auth_source": "chatgpt_oauth",
         },
