@@ -39,6 +39,7 @@ from neem.mcp.tools.wire_tools import register_wire_tools
 from neem.mcp.tools.geist import register_geist_tools
 from neem.mcp.tools.search import register_search_tools
 from neem.mcp.tools.surface import register_surface_tools
+from neem.mcp.tools.history import register_history_tools
 from neem.mcp.trace import trace, trace_separator
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_dev_user_id, get_internal_service_secret
@@ -427,6 +428,9 @@ LITE_TOOLS: frozenset[str] = frozenset({
     "query_blocks",
     "search_documents",
     "search_blocks",
+    # History
+    "get_document_history",
+    "read_document_at_snapshot",
     # Wires (read-only)
     "get_wires",
     "traverse_wires",
@@ -464,6 +468,9 @@ ANGEL_TOOLS: frozenset[str] = frozenset({
     "query_blocks",
     "search_documents",
     "search_blocks",
+    # History
+    "get_document_history",
+    "read_document_at_snapshot",
     # Wires (read + write)
     "get_wires",
     "traverse_wires",
@@ -1160,6 +1167,7 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
     register_geist_tools(mcp_server)
     register_search_tools(mcp_server)
     register_surface_tools(mcp_server)
+    register_history_tools(mcp_server)
 
     # --- Profile filtering: keep only allowlisted tools for lite profiles ---
     if active_profile == "lite":

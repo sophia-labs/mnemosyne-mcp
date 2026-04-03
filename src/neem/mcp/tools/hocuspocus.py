@@ -1628,7 +1628,7 @@ Always returns fresh content — automatically reconnects if the cached channel 
             "without fetching full content. Includes:\n\n"
             "- **metadata**: title, folder path, readOnly status\n"
             "- **size**: block count, character count, word count\n"
-            "- **freshness**: created_at and updated_at timestamps\n"
+            "- **freshness**: created_at, updated_at timestamps, and snapshot_count (edit history depth)\n"
             "- **headings**: section headings extracted from document structure\n"
             "- **wire_summary**: incoming/outgoing counts, predicate distribution, "
             "top connected documents\n"
@@ -1863,7 +1863,27 @@ LIMIT {top_valued}
                         extra_context={"document_id": document_id, "error": str(e)},
                     )
 
-            # 5. Build result
+            # 5. Snapshot count (non-fatal)
+            snapshot_count: Optional[int] = None
+            try:
+                count_url = (
+                    f"{backend_config.base_url}/v1/documents/{graph_id}"
+                    f"/{document_id}/snapshots/count"
+                )
+                count_resp = await get_http_client().get(
+                    count_url,
+                    headers=auth.http_headers(),
+                    timeout=httpx.Timeout(5.0),
+                )
+                if count_resp.status_code == 200:
+                    snapshot_count = count_resp.json().get("count")
+            except Exception as sc_err:
+                logger.debug(
+                    "Failed to fetch snapshot count for digest (non-fatal)",
+                    extra_context={"document_id": document_id, "error": str(sc_err)},
+                )
+
+            # 6. Build result
             result: Dict[str, Any] = {
                 "metadata": metadata,
                 "size": size,
@@ -1876,6 +1896,8 @@ LIMIT {top_valued}
                     freshness["created_at"] = created_at
                 if last_modified is not None:
                     freshness["updated_at"] = last_modified
+                if snapshot_count is not None:
+                    freshness["snapshot_count"] = snapshot_count
                 if freshness:
                     result["freshness"] = freshness
             except Exception as ts_err:
