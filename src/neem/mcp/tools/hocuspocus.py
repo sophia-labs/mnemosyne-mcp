@@ -4228,8 +4228,9 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         description=(
             "Create, update, or delete a comment on a document. Three operations via the 'action' parameter:\n\n"
             "- **set**: Create a new comment or update an existing one. Requires comment_id and text. "
-            "The comment_id must match a data-comment-id attribute on a <commentMark> span in the document content "
-            "(add the mark via write_document or insert_blocks first). author defaults to 'Sophia'.\n"
+            "If `block_id` + `find` are provided, the tool auto-anchors by applying a commentMark to the matched "
+            "text in that block before writing metadata. Otherwise, comment_id must already match a data-comment-id "
+            "attribute on a <commentMark> span in the document content. author defaults to 'Sophia'.\n"
             "- **resolve**: Mark a comment as resolved (or pass resolved=False to unresolve). Only requires comment_id.\n"
             "- **delete**: Remove a comment entirely. Only requires comment_id.\n\n"
             "Always read the document first — write tools use a cached channel and need a preceding read to sync latest state."
@@ -4244,9 +4245,16 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         author: Optional[str] = None,
         resolved: Optional[bool] = None,
         quoted_text: Optional[str] = None,
+        find: Optional[str] = None,
+        occurrence: int = 1,
+        block_id: Optional[str] = None,
         context: Context | None = None,
     ) -> dict:
-        """Create, update, resolve, or delete a comment."""
+        """Create, update, resolve, or delete a comment.
+
+        Auto-anchor mode (Phase A): provide block_id + find for action='set' to
+        apply commentMark automatically to a matched text range in that block.
+        """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -4257,11 +4265,27 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         if action == "set" and not text:
             raise ValueError("text is required for action='set'")
 
+        has_anchor_inputs = find is not None or block_id is not None
+        if has_anchor_inputs:
+            if action != "set":
+                raise ValueError("find/block_id anchoring is only supported for action='set'")
+            if not find or not find.strip():
+                raise ValueError("find is required and must be non-empty when using anchoring")
+            if not block_id or not block_id.strip():
+                raise ValueError("block_id is required when using anchoring")
+            if occurrence == 0:
+                raise ValueError(
+                    "occurrence=0 is not supported for comment anchoring; choose a single occurrence",
+                )
+        elif occurrence != 1:
+            raise ValueError("occurrence is only used with find+block_id anchoring")
+
         try:
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
             def perform_edit(doc: Any) -> None:
                 writer = DocumentWriter(doc)
+                reader = DocumentReader(doc)
                 if action == "delete":
                     writer.delete_comment(comment_id)
                 elif action == "resolve":
@@ -4276,15 +4300,96 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                         author_id=existing.get("authorId", "mcp-agent"),
                         resolved=resolved if resolved is not None else True,
                         quoted_text=existing.get("quotedText"),
+                        block_id=existing.get("blockId"),
+                        document_position=existing.get("documentPosition"),
                     )
                 else:  # set
+                    effective_quoted_text = quoted_text
+                    anchor_position: Optional[int] = None
+                    if has_anchor_inputs:
+                        block_id_clean = (block_id or "").strip()
+                        requested_find = (find or "").strip()
+                        text_info = reader.get_block_text_info(block_id_clean)
+                        if text_info is None:
+                            raise ValueError(f"Block not found: {block_id_clean}")
+                        if text_info.get("has_inline_nodes"):
+                            raise ValueError(
+                                "Auto-anchor does not support blocks with inline nodes; "
+                                "anchor manually for this block.",
+                            )
+
+                        plain_text = text_info["text"]
+                        matches, matched_find = _find_positions_with_auto_match(
+                            plain_text=plain_text,
+                            requested_find=requested_find,
+                        )
+                        if not matches:
+                            raise _EditMatchError(
+                                f"Text {requested_find!r} not found in block {block_id_clean}",
+                                code="no_match",
+                                diagnostics={
+                                    "requested_find": requested_find,
+                                    "normalized_candidates": _build_find_candidates(requested_find),
+                                    "block_id": block_id_clean,
+                                    "block_text_preview": plain_text[:400],
+                                    "block_text_length": len(plain_text),
+                                    "occurrence": occurrence,
+                                },
+                            )
+
+                        if occurrence > 0:
+                            if occurrence > len(matches):
+                                raise _EditMatchError(
+                                    f"Occurrence {occurrence} requested but only "
+                                    f"{len(matches)} match(es) found",
+                                    code="occurrence_out_of_range",
+                                    diagnostics={
+                                        "requested_find": requested_find,
+                                        "matched_find": matched_find,
+                                        "positions": [pos for pos, _ in matches],
+                                        "occurrence": occurrence,
+                                        "block_id": block_id_clean,
+                                        "block_text_preview": plain_text[:400],
+                                    },
+                                )
+                            selected = matches[occurrence - 1]
+                        else:
+                            if abs(occurrence) > len(matches):
+                                raise _EditMatchError(
+                                    f"Occurrence {occurrence} requested but only "
+                                    f"{len(matches)} match(es) found",
+                                    code="occurrence_out_of_range",
+                                    diagnostics={
+                                        "requested_find": requested_find,
+                                        "matched_find": matched_find,
+                                        "positions": [pos for pos, _ in matches],
+                                        "occurrence": occurrence,
+                                        "block_id": block_id_clean,
+                                        "block_text_preview": plain_text[:400],
+                                    },
+                                )
+                            selected = matches[occurrence]
+
+                        match_start, match_len = selected
+                        writer.add_comment_mark(
+                            block_id=block_id_clean,
+                            start_offset=match_start,
+                            length_cp=match_len,
+                            comment_id=comment_id,
+                        )
+                        anchor_position = match_start
+                        if effective_quoted_text is None:
+                            effective_quoted_text = plain_text[match_start:match_start + match_len]
+
                     writer.set_comment(
                         comment_id=comment_id,
                         text=text,
                         author=author or "Sophia",
                         author_id="mcp-agent",
                         resolved=resolved or False,
-                        quoted_text=quoted_text,
+                        quoted_text=effective_quoted_text,
+                        block_id=(block_id.strip() if (has_anchor_inputs and block_id) else None),
+                        document_position=anchor_position,
                     )
 
             await hp_client.transact_document(
@@ -4296,6 +4401,16 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
 
             return {"success": True, "comment_id": comment_id, "action": action}
 
+        except _EditMatchError as me:
+            diagnostic_payload = {
+                "code": me.code,
+                "message": str(me),
+                "diagnostics": me.diagnostics,
+                "hint": "Read the block again and use a shorter literal fragment for find.",
+            }
+            raise RuntimeError(
+                f"edit_comment anchor match failed: {json.dumps(diagnostic_payload, ensure_ascii=False)}",
+            )
         except Exception as e:
             logger.error(
                 "Failed to edit comment",

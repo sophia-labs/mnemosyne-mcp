@@ -2096,6 +2096,8 @@ class DocumentWriter:
         author_id: str = "mcp-agent",
         resolved: bool = False,
         quoted_text: str | None = None,
+        block_id: str | None = None,
+        document_position: int | None = None,
     ) -> None:
         """Set or update a comment in the Y.Map('comments').
 
@@ -2106,6 +2108,8 @@ class DocumentWriter:
             author_id: User ID of the author
             resolved: Whether the comment has been resolved
             quoted_text: The highlighted/quoted text from the document
+            block_id: Optional block anchor ID (for block-anchored comments)
+            document_position: Optional character position used for anchoring
         """
         import time
 
@@ -2114,24 +2118,112 @@ class DocumentWriter:
 
         existing = comments_map.get(comment_id)
         created_at = existing.get("createdAt", now) if existing else now
-        # Preserve existing quotedText if not provided
-        existing_quoted = existing.get("quotedText") if existing else None
 
-        comment_data: dict[str, Any] = {
+        # Preserve unknown/extended fields (e.g. blockId, documentPosition)
+        # when updating existing comments.
+        comment_data: dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
+        comment_data.update({
             "text": text,
             "author": author,
             "authorId": author_id,
             "createdAt": created_at,
             "updatedAt": now,
             "resolved": resolved,
-        }
-        # Only include quotedText if provided or exists
+        })
+
+        # quotedText: explicit input wins; otherwise preserve existing if present.
         if quoted_text is not None:
             comment_data["quotedText"] = quoted_text
-        elif existing_quoted is not None:
-            comment_data["quotedText"] = existing_quoted
+        elif existing is None:
+            comment_data.pop("quotedText", None)
+
+        # Preserve / set optional block anchors.
+        if block_id is not None:
+            comment_data["blockId"] = block_id
+        if document_position is not None:
+            comment_data["documentPosition"] = int(document_position)
 
         comments_map[comment_id] = comment_data
+
+    def add_comment_mark(
+        self,
+        block_id: str,
+        start_offset: int,
+        length_cp: int,
+        comment_id: str,
+    ) -> None:
+        """Apply a commentMark to a text range in a block.
+
+        Offsets are code-point based and aligned with DocumentReader.get_block_text_info().
+        The method applies mark formatting in-place without changing text content.
+
+        Args:
+            block_id: Target block ID
+            start_offset: Start offset (0-indexed code points)
+            length_cp: Length in code points
+            comment_id: Comment ID for commentMark.commentId
+
+        Raises:
+            ValueError: If block is missing, range is invalid, or range intersects
+                        an inline atom node (footnote, etc.).
+        """
+        if not comment_id or not comment_id.strip():
+            raise ValueError("comment_id is required for comment mark")
+        if length_cp <= 0:
+            raise ValueError("length_cp must be > 0")
+
+        result = self.find_block_by_id(block_id)
+        if result is None:
+            raise ValueError(f"Block not found: {block_id}")
+        _, block = result
+
+        spans, total_cp = self._build_edit_spans(block)
+        if start_offset < 0 or start_offset >= total_cp:
+            raise ValueError(
+                f"Mark start offset {start_offset} is beyond text length {total_cp}"
+            )
+
+        end_offset = min(start_offset + length_cp, total_cp)
+        if end_offset <= start_offset:
+            raise ValueError("Mark range is empty after bounds normalization")
+
+        # Fail closed if the requested range intersects inline atom nodes.
+        for span in spans:
+            overlap_start = max(start_offset, span["start"])
+            overlap_end = min(end_offset, span["end"])
+            if overlap_start >= overlap_end:
+                continue
+            if span["kind"] != "text":
+                tag = span.get("tag", "inline")
+                raise ValueError(
+                    f"Mark range intersects inline element ({tag}) at offset {overlap_start}; "
+                    "anchor to a pure text range instead."
+                )
+
+        with self._doc.transaction():
+            for span in spans:
+                if span["kind"] != "text":
+                    continue
+
+                overlap_start = max(start_offset, span["start"])
+                overlap_end = min(end_offset, span["end"])
+                if overlap_start >= overlap_end:
+                    continue
+
+                local_cp_start = overlap_start - span["start"]
+                local_cp_end = overlap_end - span["start"]
+                plain = span["text"]
+
+                byte_start = len(plain[:local_cp_start].encode("utf-8"))
+                byte_end = len(plain[:local_cp_end].encode("utf-8"))
+                if byte_start >= byte_end:
+                    continue
+
+                span["node"].format(
+                    byte_start,
+                    byte_end,
+                    {"commentMark": {"commentId": comment_id.strip()}},
+                )
 
     def delete_comment(self, comment_id: str) -> None:
         """Delete a comment from the Y.Map('comments').
