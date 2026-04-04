@@ -87,7 +87,7 @@ def register_basic_tools(server: FastMCP) -> None:
         try:
             graphs = await _request_json(method="GET", url=catalog_url, auth=auth)
             if not isinstance(graphs, list):
-                graphs = []
+                raise ValueError(f"Unexpected /graphs/catalog payload type: {type(graphs).__name__}")
             graphs = _filter_deleted_graphs(graphs, include_deleted)
             trace("SUCCESS: Got %d graphs from catalog" % len(graphs))
             return _render_json({"graphs": graphs, "count": len(graphs)})
