@@ -7,8 +7,9 @@ and parameter validation.
 from __future__ import annotations
 
 from functools import wraps
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
+from mcp.server.fastmcp import Context
 from neem.mcp.auth import MCPAuthContext, get_current_auth_token
 
 # Type variables for generic decorator typing
@@ -97,4 +98,70 @@ def strip_params(*params_to_strip: str) -> Callable[[F], F]:
     return decorator
 
 
-__all__ = ["require_auth", "validate_required", "strip_params"]
+# ---------------------------------------------------------------------------
+# Home graph — session-scoped default graph_id
+# ---------------------------------------------------------------------------
+
+_home_graphs: dict[str, str] = {}
+
+
+def set_home_graph(user_id: str, graph_id: str) -> None:
+    """Set the session's default graph for a user."""
+    _home_graphs[user_id] = graph_id
+
+
+def get_home_graph(user_id: str) -> str | None:
+    """Get the session's default graph for a user, or None if not set."""
+    return _home_graphs.get(user_id)
+
+
+def clear_home_graph(user_id: str) -> None:
+    """Clear the session's default graph for a user."""
+    _home_graphs.pop(user_id, None)
+
+
+def resolve_home_graph(func: F) -> F:
+    """Decorator that resolves graph_id from the session's home graph if not provided.
+
+    When graph_id is None or empty, looks up the home graph for the authenticated
+    user. If found, injects it into kwargs. If not found, raises ValueError with
+    instructions to call set_home_graph.
+
+    Usage:
+        @server.tool(name="read_document", ...)
+        @resolve_home_graph
+        async def read_document_tool(graph_id: str | None = None, ...) -> dict:
+            # graph_id is guaranteed non-None here
+            ...
+    """
+
+    @wraps(func)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        graph_id = kwargs.get("graph_id")
+        if not graph_id or not str(graph_id).strip():
+            context = kwargs.get("context")
+            if context is not None:
+                auth = MCPAuthContext.from_context(context)
+                if auth.user_id:
+                    home = get_home_graph(auth.user_id)
+                    if home:
+                        kwargs["graph_id"] = home
+            if not kwargs.get("graph_id") or not str(kwargs.get("graph_id", "")).strip():
+                raise ValueError(
+                    "graph_id is required. Either pass it explicitly or set a home graph "
+                    "via set_home_graph(graph_id='your-graph-id')."
+                )
+        return await func(*args, **kwargs)
+
+    return wrapper  # type: ignore[return-value]
+
+
+__all__ = [
+    "require_auth",
+    "validate_required",
+    "strip_params",
+    "set_home_graph",
+    "get_home_graph",
+    "clear_home_graph",
+    "resolve_home_graph",
+]

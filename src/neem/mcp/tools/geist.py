@@ -38,6 +38,7 @@ from neem.hocuspocus import (
     WorkspaceWriter,
 )
 from neem.hocuspocus.converters import tiptap_xml_to_markdown
+from neem.mcp.tools.decorators import get_home_graph, resolve_home_graph, set_home_graph
 from neem.mcp.tools.hocuspocus import _normalize_timestamp_to_iso
 from neem.mcp.auth import MCPAuthContext, get_current_auth_token, get_hocuspocus_client_kwargs
 from neem.mcp.http_client import get_http_client
@@ -1021,9 +1022,10 @@ def register_geist_tools(server: FastMCP) -> None:
             "Optionally wire the new memory to existing blocks by passing block_ids and predicates."
         ),
     )
+    @resolve_home_graph
     async def store_memory_tool(
-        graph_id: str,
-        content: str,
+        graph_id: str | None = None,
+        content: str = "",
         block_ids: list[str] | None = None,
         predicates: list[str] | None = None,
         context: Context | None = None,
@@ -1091,8 +1093,9 @@ def register_geist_tools(server: FastMCP) -> None:
             "content discovery, or get_block_values for graph-wide valuation scores."
         ),
     )
+    @resolve_home_graph
     async def recall_tool(
-        graph_id: str,
+        graph_id: str | None = None,
         number: Optional[int] = None,
         query: Optional[str] = None,
         limit: int = 5,
@@ -1168,9 +1171,10 @@ def register_geist_tools(server: FastMCP) -> None:
             "within the horizon of concern."
         ),
     )
+    @resolve_home_graph
     async def care_tool(
-        graph_id: str,
-        numbers: List[int],
+        graph_id: str | None = None,
+        numbers: List[int] = [],
         context: Context | None = None,
     ) -> str:
         auth = MCPAuthContext.from_context(context)
@@ -1226,8 +1230,9 @@ def register_geist_tools(server: FastMCP) -> None:
             "Narrative orientation comes before structural orientation."
         ),
     )
+    @resolve_home_graph
     async def music_tool(
-        graph_id: str,
+        graph_id: str | None = None,
         context: Context | None = None,
     ) -> str:
         auth = MCPAuthContext.from_context(context)
@@ -1289,9 +1294,10 @@ def register_geist_tools(server: FastMCP) -> None:
             "Always call music() first to read the current Song before composing."
         ),
     )
+    @resolve_home_graph
     async def sing_tool(
-        graph_id: str,
-        verse: str,
+        graph_id: str | None = None,
+        verse: str = "",
         mode: str = "verse",
         verse_index: Optional[int] = None,
         context: Context | None = None,
@@ -1474,8 +1480,9 @@ def register_geist_tools(server: FastMCP) -> None:
             "judgment about a single thing. Use both."
         ),
     )
+    @resolve_home_graph
     async def value_tool(
-        graph_id: str,
+        graph_id: str | None = None,
         document_id: Optional[str] = None,
         block_id: Optional[str] = None,
         importance: Optional[int] = None,
@@ -1538,8 +1545,9 @@ def register_geist_tools(server: FastMCP) -> None:
             "Composite scores combine importance, valence intensity, temporal decay, and wire connectivity."
         ),
     )
+    @resolve_home_graph
     async def get_block_values_tool(
-        graph_id: str,
+        graph_id: str | None = None,
         block_id: Optional[str] = None,
         document_id: Optional[str] = None,
         limit: int = 20,
@@ -1773,8 +1781,9 @@ LIMIT {min(limit * 10, 500)}
             "valuations, use document_digest instead."
         ),
     )
+    @resolve_home_graph
     async def get_important_blocks_tool(
-        graph_id: str,
+        graph_id: str | None = None,
         document_id: Optional[str] = None,
         limit: int = 5,
         valence: Optional[str] = None,
@@ -1814,12 +1823,28 @@ LIMIT {min(limit * 10, 500)}
                 if not folder_doc_ids:
                     return _render_json({"blocks": [], "count": 0})
 
+        result = await _important_blocks_core(
+            graph_id, user_id, auth, limit, valence, folder_doc_ids,
+        )
+        return _render_json(result)
+
+    async def _important_blocks_core(
+        graph_id: str,
+        user_id: str,
+        auth: MCPAuthContext,
+        limit: int = 5,
+        valence: Optional[str] = None,
+        folder_doc_ids: Optional[list[str]] = None,
+    ) -> Dict[str, Any]:
+        """Core logic for get_important_blocks. Returns dict with 'blocks' and 'count'.
+
+        Shared between get_important_blocks_tool and context_bundle_tool.
+        """
         # Build SPARQL filter
         filters = []
         _folder_filter_in_python = False
         if folder_doc_ids is not None:
             if len(folder_doc_ids) <= 30:
-                # Small folder: SPARQL-level filtering
                 val_prefix = f"urn:mnemosyne:user:{user_id}:graph:{graph_id}:valuation:"
                 strstarts_clauses = " || ".join(
                     f'STRSTARTS(STR(?val), "{val_prefix}{did}:")'
@@ -1827,7 +1852,6 @@ LIMIT {min(limit * 10, 500)}
                 )
                 filters.append(f"FILTER({strstarts_clauses})")
             else:
-                # Large folder: fetch all valuations, filter in Python after
                 _folder_filter_in_python = True
 
         if valence == "positive":
@@ -1919,7 +1943,6 @@ LIMIT {min(limit * 10, 200)}
                 if ":doc:" in pre:
                     parsed_doc_id = pre.rpartition(":doc:")[2]
 
-            # Temporal decay: prefer lastValuatedAt, fall back to document creation time.
             last_val_str = row.get("lastVal", "")
             timestamp_str = last_val_str or doc_created_at.get(parsed_doc_id, "")
             doc_age_days = 0.0
@@ -1967,7 +1990,6 @@ LIMIT {min(limit * 10, 200)}
             _scoped_doc_ids = set(folder_doc_ids)
 
         # Inject unvaluated blocks that have wires.
-        # Temporal decay uses document creation time as fallback.
         for blk_id, bwc in block_wire_counts.items():
             if blk_id in valuated_block_ids:
                 continue
@@ -1985,7 +2007,6 @@ LIMIT {min(limit * 10, 200)}
                     wire_age_days = max(0.0, (now - wire_dt).total_seconds() / 86400.0)
                 except (ValueError, TypeError):
                     pass
-            # Use document creation time for temporal decay
             doc_age = 0.0
             created_str = doc_created_at.get(doc_id, "")
             if created_str:
@@ -2017,7 +2038,6 @@ LIMIT {min(limit * 10, 200)}
         scored = scored[:limit]
 
         # Fetch content and titles for the top blocks
-        # Group by doc_id and connect to all documents concurrently
         doc_groups: Dict[str, list] = {}
         for item in scored:
             doc_groups.setdefault(item["doc_id"], []).append(item)
@@ -2063,11 +2083,9 @@ LIMIT {min(limit * 10, 200)}
             *[_fetch_doc_blocks(did, items) for did, items in doc_groups.items()]
         )
         results = [entry for sublist in doc_result_lists for entry in sublist]
-
-        # Re-sort since concurrent fetch may have scrambled order
         results.sort(key=lambda b: b["score"], reverse=True)
 
-        return _render_json({"blocks": results, "count": len(results)})
+        return {"blocks": results, "count": len(results)}
 
     @server.tool(
         name="get_values",
@@ -2079,8 +2097,9 @@ LIMIT {min(limit * 10, 200)}
             "via the revaluate tool."
         ),
     )
+    @resolve_home_graph
     async def get_values_tool(
-        graph_id: str,
+        graph_id: str | None = None,
         context: Context | None = None,
     ) -> str:
         auth = MCPAuthContext.from_context(context)
@@ -2122,8 +2141,9 @@ LIMIT {min(limit * 10, 200)}
             "prompts, component weights, reference values, and/or temporal half-life."
         ),
     )
+    @resolve_home_graph
     async def revaluate_tool(
-        graph_id: str,
+        graph_id: str | None = None,
         importance_prompt: Optional[str] = None,
         valence_prompt: Optional[str] = None,
         weights: Optional[str] = None,
@@ -2256,8 +2276,9 @@ LIMIT {min(limit * 10, 200)}
             "Returns counts of kept and archived memories, plus the archive document ID."
         ),
     )
+    @resolve_home_graph
     async def archive_memories_tool(
-        graph_id: str,
+        graph_id: str | None = None,
         keep: int = 50,
         context: Context | None = None,
     ) -> str:
@@ -2483,8 +2504,9 @@ LIMIT {min(limit * 10, 200)}
             "recovery after an error, or when token budget is critically low."
         ),
     )
+    @resolve_home_graph
     async def quick_orient_tool(
-        graph_id: str = "default",
+        graph_id: str | None = None,
         recall_limit: int = 5,
         context: Context | None = None,
     ) -> str:
@@ -2578,7 +2600,273 @@ LIMIT {min(limit * 10, 200)}
 
         return _render_json(result)
 
-    logger.info("Registered Geist (Sophia Memory) tools: 13 tools")
+    # ================================================================
+    # CONTEXT BUNDLE — single-call attunement
+    # ================================================================
+
+    @server.tool(
+        name="context_bundle",
+        title="Context Bundle",
+        description=(
+            "Single-call attunement: returns location, Song, recent memories, "
+            "agent identity document, important blocks, and workspace structure "
+            "in one response. Replaces the manual 3-step attunement sequence.\n\n"
+            "**Execution:** Phase 1 resolves location (sequential). Phase 2 runs "
+            "Song, recall, agent document, important blocks, and workspace in "
+            "parallel. Each component is error-isolated — partial results on failure.\n\n"
+            "**Home graph:** By default, auto-sets the resolved graph as the session's "
+            "home graph so subsequent tool calls can omit graph_id. Pass set_home=false "
+            "to skip.\n\n"
+            "**Processing guidance:** The response is structured for staged processing. "
+            "Let the Song land first (narrative identity), then recall and agent document "
+            "(working memory and individuation), then important blocks and workspace "
+            "(judgment and structure). Attunement is a practice, not a data fetch.\n\n"
+            "Parameters:\n"
+            "- graph_id: Graph to attune in (default: resolved from user's current location)\n"
+            "- agent_name: Agent identity document to read, e.g. 'gamma' reads 'agent-gamma'. "
+            "Omit to skip.\n"
+            "- recall_limit: Number of recent memories (default 5)\n"
+            "- important_limit: Number of top-valued blocks (default 5)\n"
+            "- workspace_depth: Folder nesting depth (default 1)\n"
+            "- set_home: Auto-set home graph for the session (default true)"
+        ),
+    )
+    async def context_bundle_tool(
+        graph_id: str | None = None,
+        agent_name: str | None = None,
+        recall_limit: int = 5,
+        important_limit: int = 5,
+        workspace_depth: int = 1,
+        set_home: bool = True,
+        context: Context | None = None,
+    ) -> str:
+        """Single-call attunement returning all orientation data."""
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+        user_id = _resolve_user_id(auth)
+
+        result: Dict[str, Any] = {}
+
+        # --- Phase 1: Resolve graph_id from location if not provided ---
+        if graph_id and graph_id.strip():
+            graph_id = graph_id.strip()
+            result["location"] = {
+                "graph_id": graph_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        else:
+            # REST call to get user's current location
+            try:
+                url = f"{backend_config.base_url}/sessions/location"
+                resp = await get_http_client().get(
+                    url, headers=auth.http_headers(),
+                    timeout=httpx.Timeout(5.0),
+                )
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    graph_id = payload.get("graph_id")
+                    location: Dict[str, Any] = {
+                        "graph_id": graph_id,
+                        "document_id": payload.get("document_id"),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                    display_name = payload.get("display_name")
+                    if display_name:
+                        location["display_name"] = display_name
+                    result["location"] = location
+            except Exception:
+                pass
+
+            if not graph_id:
+                # Fallback: WebSocket session refresh
+                try:
+                    await hp_client.refresh_session(user_id)
+                    graph_id = hp_client.get_active_graph_id()
+                    result["location"] = {
+                        "graph_id": graph_id,
+                        "document_id": hp_client.get_active_document_id(),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                except Exception as e:
+                    result["location"] = {"error": str(e)}
+
+            if not graph_id:
+                raise ValueError(
+                    "Could not resolve graph_id from user location. "
+                    "Pass graph_id explicitly or ensure a browser session is active."
+                )
+
+        # Auto-set home graph
+        if set_home:
+            set_home_graph(user_id, graph_id)
+            result["home_graph"] = graph_id
+        else:
+            current_home = get_home_graph(user_id)
+            if current_home:
+                result["home_graph"] = current_home
+
+        # --- Phase 2: Run all components concurrently ---
+
+        async def _bundle_song() -> Dict[str, Any]:
+            try:
+                await _ensure_scratchpad(hp_client, graph_id, auth)
+                await hp_client.connect_document(graph_id, SONG_DOC_ID, user_id=auth.user_id)
+                channel = hp_client.get_document_channel(graph_id, SONG_DOC_ID, user_id=auth.user_id)
+                reader = DocumentReader(channel.doc)
+                xml = reader.to_xml()
+                markdown = tiptap_xml_to_markdown(xml)
+                markdown = re.sub(
+                    r"^" + re.escape(SONG_META_PREFIX) + r".*$", "", markdown, flags=re.MULTILINE
+                )
+                parts = re.split(r"\n---\n", markdown)
+                verses = [v.strip() for v in parts if v.strip()]
+                song_result: Dict[str, Any] = {"verses": verses, "verse_count": len(verses)}
+                meta, _ = _read_song_meta(reader)
+                if meta:
+                    coda = meta.get("coda")
+                    if coda:
+                        song_result["coda"] = coda["text"]
+                return song_result
+            except Exception as e:
+                return {"error": str(e)}
+
+        async def _bundle_recall() -> Dict[str, Any]:
+            try:
+                await _ensure_scratchpad(hp_client, graph_id, auth)
+                await hp_client.connect_document(graph_id, MEMORY_QUEUE_DOC_ID, user_id=auth.user_id)
+                channel = hp_client.get_document_channel(graph_id, MEMORY_QUEUE_DOC_ID, user_id=auth.user_id)
+                reader = DocumentReader(channel.doc)
+                meta, _ = _read_geist_meta(reader)
+                mem_entries = meta.get("memories", {})
+                memories = []
+                for num_str, entry in mem_entries.items():
+                    if not isinstance(entry, dict) or not entry.get("b"):
+                        continue
+                    block_info = reader.get_block_info(entry["b"])
+                    text = block_info["text_content"] if block_info else "(deleted)"
+                    memories.append({
+                        "number": int(num_str),
+                        "text": text,
+                        "created_at": entry.get("c"),
+                        "last_active": entry.get("a"),
+                    })
+                memories.sort(
+                    key=lambda m: max(m.get("created_at", ""), m.get("last_active", "")),
+                    reverse=True,
+                )
+                memories = memories[:recall_limit]
+                return {"memories": memories, "count": len(memories)}
+            except Exception as e:
+                return {"error": str(e)}
+
+        async def _bundle_agent_doc() -> Optional[Dict[str, Any]]:
+            if not agent_name:
+                return None
+            doc_id = f"agent-{agent_name.strip()}"
+            try:
+                await hp_client.connect_document(graph_id, doc_id, user_id=auth.user_id)
+                channel = hp_client.get_document_channel(graph_id, doc_id, user_id=auth.user_id)
+                if channel is None:
+                    return {"title": doc_id, "error": "document not found"}
+                reader = DocumentReader(channel.doc)
+                xml = reader.to_xml()
+                markdown = tiptap_xml_to_markdown(xml)
+                return {"title": doc_id, "content": markdown}
+            except Exception as e:
+                return {"title": doc_id, "error": str(e)}
+
+        async def _bundle_important() -> Dict[str, Any]:
+            try:
+                return await _important_blocks_core(
+                    graph_id, user_id, auth, important_limit,
+                )
+            except Exception as e:
+                return {"blocks": [], "count": 0, "error": str(e)}
+
+        async def _bundle_workspace() -> Dict[str, Any]:
+            try:
+                await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
+                ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
+                if ws_channel is None:
+                    return {"error": "workspace not available"}
+                ws_reader = WorkspaceReader(ws_channel.doc)
+
+                def _build_tree(parent_id: str | None, depth: int) -> list:
+                    children = ws_reader.get_children_of(parent_id)
+                    tree = []
+                    for entity_type, entity_id, _ in children:
+                        if entity_type == "folder":
+                            folder_info = ws_reader.get_folder(entity_id)
+                            name = folder_info.get("name", entity_id) if folder_info else entity_id
+                            if depth <= 1:
+                                # At depth limit, collapse to count
+                                child_count = len(ws_reader.get_children_of(entity_id))
+                                tree.append({
+                                    "id": entity_id,
+                                    "type": "folder",
+                                    "name": name,
+                                    "collapsed": f"{child_count} documents",
+                                })
+                            else:
+                                subtree = _build_tree(entity_id, depth - 1)
+                                tree.append({
+                                    "id": entity_id,
+                                    "type": "folder",
+                                    "name": name,
+                                    "children": subtree,
+                                })
+                        elif entity_type == "document":
+                            doc_info = ws_reader.get_document(entity_id)
+                            title = doc_info.get("title", entity_id) if doc_info else entity_id
+                            tree.append({
+                                "id": entity_id,
+                                "type": "document",
+                                "title": title,
+                            })
+                    return tree
+
+                tree = _build_tree(None, workspace_depth)
+                ws_result: Dict[str, Any] = {"tree": tree, "graph_id": graph_id}
+                if workspace_depth > 0:
+                    ws_result["depth"] = workspace_depth
+                # Surface dream journal if it exists
+                dj_id = f"{graph_id}-dream-journal"
+                dj_info = ws_reader.get_document(dj_id)
+                if dj_info:
+                    ws_result["dream_journal"] = dj_id
+                return ws_result
+            except Exception as e:
+                return {"error": str(e)}
+
+        # Run all Phase 2 tasks concurrently
+        song, recall, agent_doc, important, workspace = await asyncio.gather(
+            _bundle_song(),
+            _bundle_recall(),
+            _bundle_agent_doc(),
+            _bundle_important(),
+            _bundle_workspace(),
+        )
+
+        result["song"] = song
+        result["recall"] = recall
+        if agent_doc is not None:
+            result["agent_document"] = agent_doc
+        result["important_blocks"] = important
+        result["workspace"] = workspace
+
+        logger.info(
+            "context_bundle",
+            extra_context={
+                "graph_id": graph_id,
+                "agent_name": agent_name,
+                "user_id": user_id,
+                "components": len([v for v in [song, recall, agent_doc, important, workspace] if v]),
+            },
+        )
+
+        return _render_json(result)
+
+    logger.info("Registered Geist (Sophia Memory) tools: 14 tools")
 
 
 # ── Song parsing helpers ────────────────────────────────────────────

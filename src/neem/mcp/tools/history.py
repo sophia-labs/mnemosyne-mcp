@@ -9,6 +9,7 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from neem.mcp.auth import MCPAuthContext
 from neem.mcp.http_client import get_http_client
+from neem.mcp.tools.decorators import resolve_home_graph
 from neem.utils.logging import LoggerFactory
 
 logger = LoggerFactory.get_logger("mcp.tools.history")
@@ -60,9 +61,10 @@ def register_history_tools(server: FastMCP) -> None:
             "specific snapshot_id."
         ),
     )
+    @resolve_home_graph
     async def get_document_history_tool(
-        graph_id: str,
-        document_id: str,
+        graph_id: str | None = None,
+        document_id: str = "",
         limit: int = 20,
         context: Context | None = None,
     ) -> dict:
@@ -146,10 +148,11 @@ def register_history_tools(server: FastMCP) -> None:
             "call this to read the document at a specific point in time."
         ),
     )
+    @resolve_home_graph
     async def read_document_at_snapshot_tool(
-        graph_id: str,
-        document_id: str,
-        snapshot_id: str,
+        graph_id: str | None = None,
+        document_id: str = "",
+        snapshot_id: str = "",
         context: Context | None = None,
     ) -> dict:
         """Return document content at a historical snapshot.

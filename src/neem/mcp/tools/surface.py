@@ -9,6 +9,7 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from neem.hocuspocus import HocuspocusClient, WorkspaceReader
 from neem.mcp.auth import MCPAuthContext, get_current_auth_token, get_hocuspocus_client_kwargs
+from neem.mcp.tools.decorators import resolve_home_graph
 from neem.utils.logging import LoggerFactory
 
 logger = LoggerFactory.get_logger("mcp.tools.surface")
@@ -46,9 +47,10 @@ def register_surface_tools(server: FastMCP) -> None:
             '"block_id": "block-abc", "action": "added timeline section"}])'
         ),
     )
+    @resolve_home_graph
     async def surface(
-        graph_id: str,
-        actions: List[dict[str, Any]],
+        graph_id: str | None = None,
+        actions: List[dict[str, Any]] = [],
         ctx: Context | None = None,
     ) -> str:
         auth = MCPAuthContext.from_context(ctx)

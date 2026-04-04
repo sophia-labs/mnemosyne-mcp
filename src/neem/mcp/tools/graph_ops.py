@@ -14,6 +14,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from neem.mcp.auth import MCPAuthContext
 from neem.mcp.jobs import JobSubmitMetadata, RealtimeJobClient
 from neem.mcp.tools.basic import await_job_completion, submit_job
+from neem.mcp.tools.decorators import resolve_home_graph
 from neem.mcp.trace import trace
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_user_id_from_token
@@ -161,9 +162,10 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             "querying block structure, and counting entities. Document-level metadata may be incomplete in RDF."
         ),
     )
+    @resolve_home_graph
     async def sparql_query_tool(
-        graph_id: str,
-        sparql: str,
+        graph_id: str | None = None,
+        sparql: str = "",
         result_format: str = "json",
         context: Context | None = None,
     ) -> str:
@@ -255,9 +257,10 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             "manual RDF cleanup, orphan removal, or debugging materialization issues."
         ),
     )
+    @resolve_home_graph
     async def sparql_update_tool(
-        graph_id: str,
-        sparql: str,
+        graph_id: str | None = None,
+        sparql: str = "",
         context: Context | None = None,
     ) -> str:
         """Execute a SPARQL INSERT/DELETE/UPDATE operation against a specific graph."""

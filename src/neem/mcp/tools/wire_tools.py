@@ -21,6 +21,7 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from neem.hocuspocus import HocuspocusClient, WorkspaceReader, WorkspaceWriter
 from neem.mcp.auth import MCPAuthContext, get_current_auth_token, get_hocuspocus_client_kwargs
+from neem.mcp.tools.decorators import resolve_home_graph
 from neem.mcp.http_client import get_http_client
 from neem.utils.logging import LoggerFactory
 
@@ -404,8 +405,9 @@ def register_wire_tools(server: FastMCP) -> None:
             "The returned short names can be passed directly to create_wires's predicate parameter."
         ),
     )
+    @resolve_home_graph
     async def list_wire_predicates_tool(
-        graph_id: str,
+        graph_id: str | None = None,
         context: Context | None = None,
     ) -> str:
         """List all wire predicates (built-in + custom in use)."""
@@ -476,8 +478,9 @@ def register_wire_tools(server: FastMCP) -> None:
             "actual relationship — relatedTo is valid when no specific predicate fits."
         ),
     )
+    @resolve_home_graph
     async def create_wires_tool(
-        graph_id: str,
+        graph_id: str | None = None,
         source_document_id: Optional[str] = None,
         target_document_id: Optional[str] = None,
         predicate: Optional[str] = None,
@@ -660,9 +663,10 @@ def register_wire_tools(server: FastMCP) -> None:
             "bidirectional flag, and cached title/snippet previews."
         ),
     )
+    @resolve_home_graph
     async def get_wires_tool(
-        graph_id: str,
-        document_id: str,
+        graph_id: str | None = None,
+        document_id: str = "",
         direction: str = "both",
         predicate: Optional[str] = None,
         context: Context | None = None,
@@ -782,9 +786,10 @@ def register_wire_tools(server: FastMCP) -> None:
             "Optionally filter by predicate to follow only specific relationship types."
         ),
     )
+    @resolve_home_graph
     async def traverse_wires_tool(
-        graph_id: str,
-        document_id: str,
+        graph_id: str | None = None,
+        document_id: str = "",
         max_depth: int = 2,
         predicate: Optional[str] = None,
         direction: str = "both",
@@ -918,8 +923,9 @@ def register_wire_tools(server: FastMCP) -> None:
             "Use get_wires to find wire IDs before deleting."
         ),
     )
+    @resolve_home_graph
     async def delete_wires_tool(
-        graph_id: str,
+        graph_id: str | None = None,
         wire_id: Optional[str] = None,
         wire_ids: list[str] | None = None,
         document_id: Optional[str] = None,

@@ -18,6 +18,7 @@ from neem.hocuspocus import HocuspocusClient
 from neem.mcp.auth import MCPAuthContext
 from neem.mcp.jobs import RealtimeJobClient
 from neem.mcp.tools.basic import await_job_completion, poll_job_until_terminal, submit_job
+from neem.mcp.tools.decorators import resolve_home_graph
 from neem.mcp.trace import trace
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_user_id_from_token
@@ -217,9 +218,10 @@ def register_search_tools(server: FastMCP) -> None:
             "looking for. Much faster than scanning the full workspace tree."
         ),
     )
+    @resolve_home_graph
     async def search_documents_tool(
-        graph_id: str,
-        query: str,
+        graph_id: str | None = None,
+        query: str = "",
         mode: str = "auto",
         limit: int = 20,
         folder_id: Optional[str] = None,
@@ -614,9 +616,10 @@ def register_search_tools(server: FastMCP) -> None:
             "use search_documents instead."
         ),
     )
+    @resolve_home_graph
     async def search_blocks_tool(
-        graph_id: str,
-        query: str,
+        graph_id: str | None = None,
+        query: str = "",
         mode: str = "hybrid",
         limit: int = 30,
         doc_filter: Optional[str] = None,

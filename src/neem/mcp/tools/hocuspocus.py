@@ -41,6 +41,7 @@ from neem.mcp.auth import MCPAuthContext, get_current_auth_token, get_hocuspocus
 from neem.mcp.http_client import get_http_client
 from neem.mcp.jobs import RealtimeJobClient
 from neem.mcp.tools.basic import await_job_completion, submit_job
+from neem.mcp.tools.decorators import clear_home_graph, get_home_graph, resolve_home_graph, set_home_graph
 from neem.mcp.tools.wire_tools import _get_wires_for_document, _get_predicate_short_name
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_user_id_from_token
@@ -1264,11 +1265,15 @@ GROUP BY ?docId
                     f"has not synced yet. Auth source: {auth.source}"
                 )
 
-            return {
+            result = {
                 "graph_id": graph_id,
                 "document_id": document_id,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
+            current_home = get_home_graph(user_id)
+            if current_home:
+                result["home_graph"] = current_home
+            return result
 
         except RuntimeError:
             raise
@@ -1278,6 +1283,32 @@ GROUP BY ?docId
                 extra_context={"error": str(e), "user_id": user_id, "auth_source": auth.source},
             )
             raise RuntimeError(f"Failed to get user location: {e}")
+
+    @server.tool(
+        name="set_home_graph",
+        title="Set Home Graph",
+        description=(
+            "Sets the session's default graph. Once set, all tools that accept "
+            "graph_id will use this graph when graph_id is not explicitly provided. "
+            "Call this during attunement after get_user_location to avoid passing "
+            "graph_id on every subsequent call. Pass a different graph_id to switch. "
+            "Pass empty string to clear the home graph."
+        ),
+    )
+    async def set_home_graph_tool(
+        graph_id: str,
+        context: Context | None = None,
+    ) -> dict:
+        """Set or clear the session's default graph."""
+        auth = MCPAuthContext.from_context(context)
+        token = auth.require_auth()
+        user_id = _resolve_user_id(auth, token, None)
+        if graph_id.strip():
+            set_home_graph(user_id, graph_id.strip())
+            return {"home_graph": graph_id.strip()}
+        else:
+            clear_home_graph(user_id)
+            return {"home_graph": None, "message": "Home graph cleared."}
 
     @server.tool(
         name="get_session_state",
@@ -1335,9 +1366,10 @@ Works for all documents including uploaded files (which are documents with readO
 
 Always returns fresh content — automatically reconnects if the cached channel is older than 2 seconds, and retries once on sync timeout. Safe for multi-agent use where another agent may have written to this document.""",
     )
+    @resolve_home_graph
     async def read_document_tool(
-        graph_id: str,
-        document_id: str,
+        graph_id: str | None = None,
+        document_id: str = "",
         format: Optional[str] = None,
         context: Context | None = None,
     ) -> dict:
@@ -1489,9 +1521,10 @@ Always returns fresh content — automatically reconnects if the cached channel 
             "next_offset for easy pagination."
         ),
     )
+    @resolve_home_graph
     async def read_blocks_tool(
-        graph_id: str,
-        document_id: str,
+        graph_id: str | None = None,
+        document_id: str = "",
         offset: int = 0,
         limit: int = 50,
         format: Optional[str] = None,
@@ -1638,9 +1671,10 @@ Always returns fresh content — automatically reconnects if the cached channel 
             "contains and how it connects."
         ),
     )
+    @resolve_home_graph
     async def document_digest_tool(
-        graph_id: str,
-        document_id: str,
+        graph_id: str | None = None,
+        document_id: str = "",
         top_valued: int = 3,
         context: Context | None = None,
     ) -> dict:
@@ -1949,10 +1983,11 @@ Inline valuations: Add {!N} (importance 0-5), {!,+N} or {!,-N} (valence -5 to +5
 
 Read the document first in multi-agent environments (see Write Tool Guidance in server instructions).""",
     )
+    @resolve_home_graph
     async def write_document_tool(
-        graph_id: str,
-        document_id: str,
-        content: str,
+        graph_id: str | None = None,
+        document_id: str = "",
+        content: str = "",
         comments: Optional[Dict[str, Any]] = None,
         await_durable: bool = True,
         context: Context | None = None,
@@ -2269,8 +2304,9 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "discovering what documents exist."
         ),
     )
+    @resolve_home_graph
     async def get_workspace_tool(
-        graph_id: str,
+        graph_id: str | None = None,
         depth: int = 1,
         folder_id: Optional[str] = None,
         min_score: Optional[float] = None,
@@ -2360,10 +2396,11 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "The section parameter determines which sidebar section the folder appears in."
         ),
     )
+    @resolve_home_graph
     async def create_folder_tool(
-        graph_id: str,
-        folder_id: str,
-        label: str,
+        graph_id: str | None = None,
+        folder_id: str = "",
+        label: str = "",
         parent_id: Optional[str] = None,
         order: Optional[float] = None,
         section: str = "documents",
@@ -2427,9 +2464,10 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "Optionally update the order for positioning among siblings."
         ),
     )
+    @resolve_home_graph
     async def move_folder_tool(
-        graph_id: str,
-        folder_id: str,
+        graph_id: str | None = None,
+        folder_id: str = "",
         new_parent_id: Optional[str] = None,
         new_order: Optional[float] = None,
         context: Context | None = None,
@@ -2504,10 +2542,11 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "For graph, the graph_id itself is renamed — entity_id is not needed."
         ),
     )
+    @resolve_home_graph
     async def rename_tool(
-        graph_id: str,
-        new_name: str,
-        entity_type: str,
+        graph_id: str | None = None,
+        new_name: str = "",
+        entity_type: str = "",
         entity_id: str | None = None,
         context: Context | None = None,
     ) -> dict:
@@ -2632,9 +2671,10 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "Use this on imported or ingested documents that are currently in reader mode."
         ),
     )
+    @resolve_home_graph
     async def make_document_editable_tool(
-        graph_id: str,
-        document_id: str,
+        graph_id: str | None = None,
+        document_id: str = "",
         context: Context | None = None,
     ) -> dict:
         """Remove the readOnly flag from a document."""
@@ -2740,9 +2780,10 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "Set hard=false to only remove from workspace navigation."
         ),
     )
+    @resolve_home_graph
     async def delete_folder_tool(
-        graph_id: str,
-        folder_id: str,
+        graph_id: str | None = None,
+        folder_id: str = "",
         cascade: bool = False,
         hard: bool = True,
         context: Context | None = None,
@@ -2820,9 +2861,10 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "readable/editable document."
         ),
     )
+    @resolve_home_graph
     async def upload_artifact_tool(
-        graph_id: str,
-        file_path: str,
+        graph_id: str | None = None,
+        file_path: str = "",
         parent_id: Optional[str] = None,
         label: Optional[str] = None,
         context: Context | None = None,
@@ -2912,9 +2954,10 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "that were uploaded before auto-ingestion was enabled."
         ),
     )
+    @resolve_home_graph
     async def ingest_artifact_tool(
-        graph_id: str,
-        artifact_id: str,
+        graph_id: str | None = None,
+        artifact_id: str = "",
         mode: str = "ingest",
         title: Optional[str] = None,
         context: Context | None = None,
@@ -3096,8 +3139,9 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "Note: This updates the document's folder assignment in workspace navigation."
         ),
     )
+    @resolve_home_graph
     async def move_documents_tool(
-        graph_id: str,
+        graph_id: str | None = None,
         document_id: Optional[str] = None,
         document_ids: list[str] | None = None,
         new_parent_id: str | None = None,
@@ -3222,8 +3266,9 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "— documents can then be recreated by writing to the same document_id."
         ),
     )
+    @resolve_home_graph
     async def delete_documents_tool(
-        graph_id: str,
+        graph_id: str | None = None,
         document_id: Optional[str] = None,
         document_ids: list[str] | None = None,
         hard: bool = True,
@@ -3325,10 +3370,11 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "- 'text': Plain text only. Most compact — use when you only need the text, not structure."
         ),
     )
+    @resolve_home_graph
     async def get_block_tool(
-        graph_id: str,
-        document_id: str,
-        block_id: str,
+        graph_id: str | None = None,
+        document_id: str = "",
+        block_id: str = "",
         format: Optional[str] = None,
         context: Context | None = None,
     ) -> dict:
@@ -3426,9 +3472,10 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "after reading in markdown format."
         ),
     )
+    @resolve_home_graph
     async def query_blocks_tool(
-        graph_id: str,
-        document_id: str,
+        graph_id: str | None = None,
+        document_id: str = "",
         block_type: Optional[str] = None,
         heading_level: Optional[int] = None,
         indent: Optional[int] = None,
@@ -3548,9 +3595,10 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "For XML, use data-val-importance/data-val-valence attributes."
         ),
     )
+    @resolve_home_graph
     async def update_blocks_tool(
-        graph_id: str,
-        document_id: str,
+        graph_id: str | None = None,
+        document_id: str = "",
         block_id: Optional[str] = None,
         attributes: Optional[Dict[str, Any]] = None,
         xml_content: Optional[str] = None,
@@ -3719,10 +3767,11 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "Response includes updated text for verification."
         ),
     )
+    @resolve_home_graph
     async def edit_block_text_tool(
-        graph_id: str,
-        document_id: str,
-        block_id: str,
+        graph_id: str | None = None,
+        document_id: str = "",
+        block_id: str = "",
         operations: Optional[list[Dict[str, Any]]] = None,
         find: Optional[str] = None,
         replace: Optional[str] = None,
@@ -3964,10 +4013,11 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "Markers are stripped from content."
         ),
     )
+    @resolve_home_graph
     async def insert_blocks_tool(
-        graph_id: str,
-        document_id: str,
-        content: str,
+        graph_id: str | None = None,
+        document_id: str = "",
+        content: str = "",
         block_id: Optional[str] = None,
         index: Optional[int] = None,
         position: str = "after",
@@ -4105,9 +4155,10 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "write tools need a preceding read to sync latest state."
         ),
     )
+    @resolve_home_graph
     async def delete_blocks_tool(
-        graph_id: str,
-        document_id: str,
+        graph_id: str | None = None,
+        document_id: str = "",
         block_id: Optional[str] = None,
         block_ids: Optional[list[str]] = None,
         cascade: bool = False,
@@ -4236,11 +4287,12 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "Always read the document first — write tools use a cached channel and need a preceding read to sync latest state."
         ),
     )
+    @resolve_home_graph
     async def edit_comment_tool(
-        graph_id: str,
-        document_id: str,
-        action: str,
-        comment_id: str,
+        graph_id: str | None = None,
+        document_id: str = "",
+        action: str = "",
+        comment_id: str = "",
         text: Optional[str] = None,
         author: Optional[str] = None,
         resolved: Optional[bool] = None,
@@ -4444,9 +4496,10 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "Creates the Chat Logs folder automatically if it doesn't exist."
         ),
     )
+    @resolve_home_graph
     async def dump_chat_tool(
-        graph_id: str,
-        content: str,
+        graph_id: str | None = None,
+        content: str = "",
         title: Optional[str] = None,
         context: Context | None = None,
     ) -> dict:
