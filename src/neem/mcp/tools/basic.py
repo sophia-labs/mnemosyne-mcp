@@ -78,48 +78,38 @@ def register_basic_tools(server: FastMCP) -> None:
         trace_separator("list_graphs CALLED")
         trace("include_deleted=%s, has_context=%s" % (include_deleted, context is not None))
 
-        trace("Step 1: Resolving auth...")
         auth = MCPAuthContext.from_context(context)
-        trace("Auth resolved", {
-            "source": auth.source,
-            "has_token": bool(auth.token),
-            "token_prefix": (auth.token[:20] + "...") if auth.token else None,
-            "user_id": auth.user_id,
-            "has_internal_secret": bool(auth.internal_service_secret),
-        })
         auth.require_auth()
-        trace("Auth validated OK")
 
-        # Pre-connect WebSocket so subscribe is near-instant after job submit
-        trace("Step 2: Pre-connecting WebSocket...")
+        # Use the synchronous catalog endpoint (no job queue needed).
+        catalog_url = f"{backend_config.base_url.rstrip('/')}/graphs/catalog"
+        trace("GET %s" % catalog_url)
+        try:
+            graphs = await _request_json(method="GET", url=catalog_url, auth=auth)
+            if not isinstance(graphs, list):
+                graphs = []
+            graphs = _filter_deleted_graphs(graphs, include_deleted)
+            trace("SUCCESS: Got %d graphs from catalog" % len(graphs))
+            return _render_json({"graphs": graphs, "count": len(graphs)})
+        except Exception as exc:
+            trace("Catalog endpoint failed, falling back to job queue: %s" % exc)
+
+        # Fallback: job queue path for backward compatibility during rolling deploys.
+        trace("Submitting list_graphs job to %s" % backend_config.base_url)
         if job_stream:
-            try:
+            with contextlib.suppress(Exception):
                 await job_stream.ensure_ready()
-                trace("WebSocket pre-connected OK")
-            except Exception as exc:
-                trace("WebSocket pre-connect failed (will use polling): %s" % exc)
 
-        trace("Step 3: Submitting job to %s" % backend_config.base_url)
         metadata = await submit_job(
             base_url=backend_config.base_url,
             auth=auth,
             task_type="list_graphs",
             payload={},
         )
-        trace("Job submitted", {
-            "job_id": metadata.job_id,
-            "status": metadata.status,
-            "trace_id": metadata.trace_id,
-            "links.status": metadata.links.status,
-            "links.result": metadata.links.result,
-            "links.websocket": metadata.links.websocket,
-        })
 
         if context:
             await context.report_progress(10, 100)
 
-        # Race WS streaming against HTTP polling
-        trace("Step 4: Racing WS + poll concurrently")
         ws_events, poll_payload = await await_job_completion(
             job_stream, metadata, auth, timeout=RACE_TIMEOUT_SECONDS,
         )
@@ -127,27 +117,18 @@ def register_basic_tools(server: FastMCP) -> None:
         if context:
             await context.report_progress(80, 100)
 
-        # Try to extract graphs from WebSocket events first
         if ws_events:
-            trace("Step 5: Extracting graphs from %d WS events" % len(ws_events))
-            for i, ev in enumerate(ws_events):
-                trace("  event[%d]" % i, ev)
             graphs = _extract_graphs_from_events(ws_events)
             if graphs is not None:
                 graphs = _filter_deleted_graphs(graphs, include_deleted)
-                trace("SUCCESS: Got %d graphs from WS events" % len(graphs))
                 if context:
                     await context.report_progress(100, 100)
                 return _render_json({"graphs": graphs, "count": len(graphs)})
-            trace("WARN: Could not extract graphs from WS events")
 
-        # Try poll result
         if poll_payload:
-            trace("Step 5: Extracting graphs from poll response")
             graphs = _extract_graphs_from_status(poll_payload)
             if graphs is not None:
                 graphs = _filter_deleted_graphs(graphs, include_deleted)
-                trace("SUCCESS: Got %d graphs from polling" % len(graphs))
                 if context:
                     await context.report_progress(100, 100)
                 return _render_json({"graphs": graphs, "count": len(graphs)})
@@ -155,8 +136,6 @@ def register_basic_tools(server: FastMCP) -> None:
         if context:
             await context.report_progress(100, 100)
 
-        # Fallback: return error with debug info
-        trace("FAIL: Could not extract graphs from any source")
         return _render_json({
             "error": "Failed to extract graph list from job result",
         })
