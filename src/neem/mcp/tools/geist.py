@@ -44,7 +44,7 @@ from neem.mcp.auth import MCPAuthContext, get_current_auth_token, get_hocuspocus
 from neem.mcp.http_client import get_http_client
 from neem.mcp.jobs import RealtimeJobClient
 from neem.mcp.tools.basic import await_job_completion, submit_job
-from neem.mcp.tools.wire_tools import _get_all_wires, _resolve_title_from_workspace
+from neem.mcp.tools.wire_tools import _resolve_title_from_workspace
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import (
     get_user_id_from_token,
@@ -1492,12 +1492,10 @@ def register_geist_tools(server: FastMCP) -> None:
     ) -> str:
         """Value one or more blocks.
 
-        Uses 3 SPARQL round-trips total (1 read + 1 delete + 1 insert)
-        regardless of batch size.
+        Applies logarithmic accumulation: each call adds to existing scores.
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
-        user_id = _resolve_user_id(auth)
 
         # Resolve single vs batch
         if valuations is not None and (document_id is not None or block_id is not None):
@@ -1519,9 +1517,12 @@ def register_geist_tools(server: FastMCP) -> None:
 
         is_single = valuations is None
 
-        output = await _apply_valuations_batch(
-            backend_config, job_stream, auth, graph_id, user_id, entries_input,
+        url = f"{backend_config.base_url}/salience/{graph_id}/blocks/value"
+        resp = await get_http_client().post(
+            url, json={"valuations": entries_input}, headers=auth.http_headers(),
         )
+        resp.raise_for_status()
+        output = resp.json()
 
         # Single mode: return flat result or raise on error
         if is_single:
@@ -1557,217 +1558,30 @@ def register_geist_tools(server: FastMCP) -> None:
     ) -> str:
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
-        user_id = _resolve_user_id(auth)
 
         graph_id = graph_id.strip()
 
-        # Build SPARQL filter
-        filters = []
-        if block_id and document_id:
-            val_uri = (
-                f"urn:mnemosyne:user:{user_id}:graph:{graph_id}"
-                f":valuation:{document_id.strip()}:{block_id.strip()}"
-            )
-            filters.append(f"FILTER(?val = <{val_uri}>)")
-        elif document_id:
-            doc_prefix = (
-                f"urn:mnemosyne:user:{user_id}:graph:{graph_id}"
-                f":valuation:{document_id.strip()}:"
-            )
-            filters.append(f'FILTER(STRSTARTS(STR(?val), "{doc_prefix}"))')
+        params: dict[str, Any] = {"limit": limit}
+        if document_id:
+            params["document_id"] = document_id.strip()
+        if block_id:
+            params["block_id"] = block_id.strip()
+        if min_score is not None:
+            params["min_score"] = min_score
+        if valence:
+            params["valence"] = valence
 
-        if valence == "positive":
-            filters.append("FILTER(xsd:float(?cumVal) > 0)")
-        elif valence == "negative":
-            filters.append("FILTER(xsd:float(?cumVal) < 0)")
+        url = f"{backend_config.base_url}/salience/{graph_id}/blocks/values"
+        resp = await get_http_client().get(url, params=params, headers=auth.http_headers())
+        resp.raise_for_status()
+        data = resp.json()
 
-        filter_clause = "\n  ".join(filters)
-
-        query = f"""
-PREFIX doc: <http://mnemosyne.dev/doc#>
-PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
-
-SELECT ?val ?blockRef ?cumImp ?cumVal ?rawImp ?rawVal ?impCount ?valCount ?lastVal
-WHERE {{
-  ?val doc:blockRef ?blockRef .
-  ?val doc:cumulativeImportance ?cumImp .
-  ?val doc:cumulativeValence ?cumVal .
-  OPTIONAL {{ ?val doc:rawImportanceSum ?rawImp }}
-  OPTIONAL {{ ?val doc:rawValenceSum ?rawVal }}
-  OPTIONAL {{ ?val doc:importanceCount ?impCount }}
-  OPTIONAL {{ ?val doc:valenceCount ?valCount }}
-  OPTIONAL {{ ?val doc:lastValuatedAt ?lastVal }}
-  {filter_clause}
-}}
-ORDER BY DESC(xsd:float(?cumImp) + ABS(xsd:float(?cumVal)))
-LIMIT {min(limit * 10, 500)}
-"""
-        # Run SPARQL query, weights load, and wire index build concurrently
-        async def _fetch_rows() -> list[dict]:
-            return await _sparql_query(backend_config, job_stream, auth, graph_id, query)
-
-        async def _fetch_weights() -> dict:
-            try:
-                await _ensure_scratchpad(hp_client, graph_id, auth)
-                await hp_client.connect_document(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
-                w_channel = hp_client.get_document_channel(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
-                if w_channel:
-                    w_reader = DocumentReader(w_channel.doc)
-                    w_xml = w_reader.to_xml()
-                    return _parse_weights_text(tiptap_xml_to_markdown(w_xml))
-            except Exception:
-                logger.debug("Could not load weights config, using defaults")
-            return dict(DEFAULT_WEIGHTS)
-
-        _ws_doc = None
-
-        async def _fetch_wires() -> tuple[Dict[str, int], Dict[str, int], Dict[str, str], Dict[str, str]]:
-            nonlocal _ws_doc
-            try:
-                await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
-                ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
-                if ws_channel:
-                    _ws_doc = ws_channel.doc
-                    all_wires = _get_all_wires(_ws_doc)
-                    return _build_wire_indexes(all_wires)
-            except Exception:
-                logger.debug("Could not load wire data for composite scoring")
-            return {}, {}, {}, {}
-
-        rows, weights, (doc_wire_counts, block_wire_counts, doc_newest_wire, block_to_doc) = (
-            await asyncio.gather(_fetch_rows(), _fetch_weights(), _fetch_wires())
-        )
-
-        now = datetime.now(timezone.utc)
-        doc_created_at = _build_doc_created_index(_ws_doc) if _ws_doc else {}
-
-        # Parse results and compute composite scores
-        valuated_block_ids: set[str] = set()
+        # Normalize field name: platform returns last_valuated_at, tool returns last_valuated
+        raw_blocks = data.get("blocks", [])
         blocks = []
-        for row in rows:
-            cum_imp = float(row.get("cumImp", 0))
-            cum_val = float(row.get("cumVal", 0))
-
-            # Extract doc_id and block_id from blockRef URI
-            block_ref = row.get("blockRef", "")
-            parsed_doc_id = ""
-            parsed_block_id = ""
-            if "#block-" in block_ref:
-                pre, _, parsed_block_id = block_ref.rpartition("#block-")
-                if ":doc:" in pre:
-                    parsed_doc_id = pre.rpartition(":doc:")[2]
-
-            # Temporal decay: prefer lastValuatedAt, fall back to document creation time.
-            # Creation itself is attention — a document's birth is its first moment of relevance.
-            last_val_str = row.get("lastVal", "")
-            timestamp_str = last_val_str or doc_created_at.get(parsed_doc_id, "")
-            doc_age_days = 0.0
-            if timestamp_str:
-                try:
-                    ts_dt = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-                    doc_age_days = max(0.0, (now - ts_dt).total_seconds() / 86400.0)
-                except (ValueError, TypeError):
-                    pass
-
-            # Wire counts
-            bwc = block_wire_counts.get(parsed_block_id, 0)
-            dwc = doc_wire_counts.get(parsed_doc_id, 0)
-
-            # Wire freshness
-            wire_age_days = 0.0
-            newest_wire = doc_newest_wire.get(parsed_doc_id, "")
-            if newest_wire:
-                try:
-                    wire_dt = datetime.fromisoformat(newest_wire.replace("Z", "+00:00"))
-                    wire_age_days = max(0.0, (now - wire_dt).total_seconds() / 86400.0)
-                except (ValueError, TypeError):
-                    pass
-
-            composite = _compute_composite_score(
-                importance=cum_imp,
-                valence=cum_val,
-                doc_age_days=doc_age_days,
-                block_wire_count=bwc,
-                doc_wire_count=dwc,
-                wire_age_days=wire_age_days,
-                weights=weights,
-            )
-
-            if min_score is not None and composite < min_score:
-                continue
-
-            valuated_block_ids.add(parsed_block_id)
-
-            entry = {
-                "block_id": parsed_block_id,
-                "document_id": parsed_doc_id,
-                "cumulative_importance": round(cum_imp, 4),
-                "cumulative_valence": round(cum_val, 4),
-                "composite_score": composite,
-                "importance_count": int(row.get("impCount", 0)),
-                "valence_count": int(row.get("valCount", 0)),
-                "last_valuated": last_val_str,
-                "block_wire_count": bwc,
-                "doc_wire_count": dwc,
-            }
-
-            blocks.append(entry)
-
-        # Inject unvaluated blocks that have wires — they score via
-        # DEFAULT_UNVALUATED_IMPORTANCE + wire/temporal signals.
-        # Temporal decay uses document creation time as fallback.
-        for blk_id, bwc in block_wire_counts.items():
-            if blk_id in valuated_block_ids:
-                continue
-            doc_id = block_to_doc.get(blk_id, "")
-            if not doc_id:
-                continue
-            dwc = doc_wire_counts.get(doc_id, 0)
-            wire_age_days = 0.0
-            newest_wire = doc_newest_wire.get(doc_id, "")
-            if newest_wire:
-                try:
-                    wire_dt = datetime.fromisoformat(newest_wire.replace("Z", "+00:00"))
-                    wire_age_days = max(0.0, (now - wire_dt).total_seconds() / 86400.0)
-                except (ValueError, TypeError):
-                    pass
-            # Use document creation time for temporal decay
-            doc_age = 0.0
-            created_str = doc_created_at.get(doc_id, "")
-            if created_str:
-                try:
-                    created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
-                    doc_age = max(0.0, (now - created_dt).total_seconds() / 86400.0)
-                except (ValueError, TypeError):
-                    pass
-            composite = _compute_composite_score(
-                importance=0.0,  # triggers DEFAULT_UNVALUATED_IMPORTANCE
-                valence=0.0,
-                doc_age_days=doc_age,
-                block_wire_count=bwc,
-                doc_wire_count=dwc,
-                wire_age_days=wire_age_days,
-                weights=weights,
-            )
-            if min_score is not None and composite < min_score:
-                continue
-            blocks.append({
-                "block_id": blk_id,
-                "document_id": doc_id,
-                "cumulative_importance": 0.0,
-                "cumulative_valence": 0.0,
-                "composite_score": composite,
-                "importance_count": 0,
-                "valence_count": 0,
-                "last_valuated": "",
-                "block_wire_count": bwc,
-                "doc_wire_count": dwc,
-            })
-
-        # Sort by composite score descending, trim to requested limit
-        blocks.sort(key=lambda b: b["composite_score"], reverse=True)
-        blocks = blocks[:limit]
-
+        for b in raw_blocks:
+            b["last_valuated"] = b.pop("last_valuated_at", "") or ""
+            blocks.append(b)
         return _render_json({"blocks": blocks, "count": len(blocks)})
 
     @server.tool(
@@ -1840,207 +1654,41 @@ LIMIT {min(limit * 10, 500)}
 
         Shared between get_important_blocks_tool and context_bundle_tool.
         """
-        # Build SPARQL filter
-        filters = []
-        _folder_filter_in_python = False
+        params: Dict[str, Any] = {"limit": min(limit * 10, 200)}
+        if valence:
+            params["valence"] = valence
+
+        url = f"{backend_config.base_url}/salience/{graph_id}/blocks/values"
+        resp = await get_http_client().get(url, params=params, headers=auth.http_headers())
+        resp.raise_for_status()
+        data = resp.json()
+
+        raw_blocks = data.get("blocks", [])
+
+        # Python-side folder filtering
         if folder_doc_ids is not None:
-            if len(folder_doc_ids) <= 30:
-                val_prefix = f"urn:mnemosyne:user:{user_id}:graph:{graph_id}:valuation:"
-                strstarts_clauses = " || ".join(
-                    f'STRSTARTS(STR(?val), "{val_prefix}{did}:")'
-                    for did in folder_doc_ids
-                )
-                filters.append(f"FILTER({strstarts_clauses})")
-            else:
-                _folder_filter_in_python = True
-
-        if valence == "positive":
-            filters.append("FILTER(xsd:float(?cumVal) > 0)")
-        elif valence == "negative":
-            filters.append("FILTER(xsd:float(?cumVal) < 0)")
-
-        filter_clause = "\n  ".join(filters)
-
-        query = f"""
-PREFIX doc: <http://mnemosyne.dev/doc#>
-PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
-
-SELECT ?val ?blockRef ?cumImp ?cumVal ?lastVal
-WHERE {{
-  ?val doc:blockRef ?blockRef .
-  ?val doc:cumulativeImportance ?cumImp .
-  ?val doc:cumulativeValence ?cumVal .
-  OPTIONAL {{ ?val doc:lastValuatedAt ?lastVal }}
-  {filter_clause}
-}}
-ORDER BY DESC(xsd:float(?cumImp) + ABS(xsd:float(?cumVal)))
-LIMIT {min(limit * 10, 200)}
-"""
-        # Run SPARQL query, weights load, and wire index build concurrently
-        async def _fetch_rows() -> list[dict]:
-            return await _sparql_query(backend_config, job_stream, auth, graph_id, query)
-
-        async def _fetch_weights() -> dict:
-            try:
-                await _ensure_scratchpad(hp_client, graph_id, auth)
-                await hp_client.connect_document(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
-                w_channel = hp_client.get_document_channel(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
-                if w_channel:
-                    w_reader = DocumentReader(w_channel.doc)
-                    return _parse_weights_text(tiptap_xml_to_markdown(w_reader.to_xml()))
-            except Exception:
-                pass
-            return dict(DEFAULT_WEIGHTS)
-
-        ws_doc = None
-
-        async def _fetch_wires() -> tuple[Dict[str, int], Dict[str, int], Dict[str, str], Dict[str, str]]:
-            nonlocal ws_doc
-            try:
-                await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
-                ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
-                if ws_channel:
-                    ws_doc = ws_channel.doc
-                    all_wires = _get_all_wires(ws_doc)
-                    return _build_wire_indexes(all_wires)
-            except Exception:
-                pass
-            return {}, {}, {}, {}
-
-        rows, weights, (doc_wire_counts, block_wire_counts, doc_newest_wire, block_to_doc) = (
-            await asyncio.gather(_fetch_rows(), _fetch_weights(), _fetch_wires())
-        )
-
-        # Python-side folder filtering for large folders
-        if _folder_filter_in_python and folder_doc_ids is not None:
             folder_doc_set = set(folder_doc_ids)
-            filtered_rows = []
-            for row in rows:
-                block_ref = row.get("blockRef", "")
-                if "#block-" in block_ref:
-                    pre = block_ref.rpartition("#block-")[0]
-                    if ":doc:" in pre:
-                        did = pre.rpartition(":doc:")[2]
-                        if did in folder_doc_set:
-                            filtered_rows.append(row)
-            rows = filtered_rows
+            raw_blocks = [b for b in raw_blocks if b.get("document_id") in folder_doc_set]
 
-        now = datetime.now(timezone.utc)
-        doc_created_at = _build_doc_created_index(ws_doc) if ws_doc else {}
+        scored = raw_blocks[:limit]
 
-        # Score and rank
-        valuated_block_ids: set[str] = set()
-        scored = []
-        for row in rows:
-            cum_imp = float(row.get("cumImp", 0))
-            cum_val = float(row.get("cumVal", 0))
+        if not scored:
+            return {"blocks": [], "count": 0}
 
-            block_ref = row.get("blockRef", "")
-            parsed_doc_id = ""
-            parsed_block_id = ""
-            if "#block-" in block_ref:
-                pre, _, parsed_block_id = block_ref.rpartition("#block-")
-                if ":doc:" in pre:
-                    parsed_doc_id = pre.rpartition(":doc:")[2]
-
-            last_val_str = row.get("lastVal", "")
-            timestamp_str = last_val_str or doc_created_at.get(parsed_doc_id, "")
-            doc_age_days = 0.0
-            if timestamp_str:
-                try:
-                    ts_dt = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-                    doc_age_days = max(0.0, (now - ts_dt).total_seconds() / 86400.0)
-                except (ValueError, TypeError):
-                    pass
-
-            bwc = block_wire_counts.get(parsed_block_id, 0)
-            dwc = doc_wire_counts.get(parsed_doc_id, 0)
-
-            wire_age_days = 0.0
-            newest_wire = doc_newest_wire.get(parsed_doc_id, "")
-            if newest_wire:
-                try:
-                    wire_dt = datetime.fromisoformat(newest_wire.replace("Z", "+00:00"))
-                    wire_age_days = max(0.0, (now - wire_dt).total_seconds() / 86400.0)
-                except (ValueError, TypeError):
-                    pass
-
-            composite = _compute_composite_score(
-                importance=cum_imp, valence=cum_val,
-                doc_age_days=doc_age_days, block_wire_count=bwc,
-                doc_wire_count=dwc, wire_age_days=wire_age_days,
-                weights=weights,
-            )
-
-            valuated_block_ids.add(parsed_block_id)
-
-            scored.append({
-                "doc_id": parsed_doc_id,
-                "block_id": parsed_block_id,
-                "composite": composite,
-                "importance": round(cum_imp, 3),
-                "valence": round(cum_val, 3),
-                "block_wires": bwc,
-                "doc_wires": dwc,
-            })
-
-        # Build scope set for wire injection filtering
-        _scoped_doc_ids: Optional[set[str]] = None
-        if folder_doc_ids is not None:
-            _scoped_doc_ids = set(folder_doc_ids)
-
-        # Inject unvaluated blocks that have wires.
-        for blk_id, bwc in block_wire_counts.items():
-            if blk_id in valuated_block_ids:
-                continue
-            doc_id = block_to_doc.get(blk_id, "")
-            if not doc_id:
-                continue
-            if _scoped_doc_ids is not None and doc_id not in _scoped_doc_ids:
-                continue
-            dwc = doc_wire_counts.get(doc_id, 0)
-            wire_age_days = 0.0
-            newest_wire = doc_newest_wire.get(doc_id, "")
-            if newest_wire:
-                try:
-                    wire_dt = datetime.fromisoformat(newest_wire.replace("Z", "+00:00"))
-                    wire_age_days = max(0.0, (now - wire_dt).total_seconds() / 86400.0)
-                except (ValueError, TypeError):
-                    pass
-            doc_age = 0.0
-            created_str = doc_created_at.get(doc_id, "")
-            if created_str:
-                try:
-                    created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
-                    doc_age = max(0.0, (now - created_dt).total_seconds() / 86400.0)
-                except (ValueError, TypeError):
-                    pass
-            composite = _compute_composite_score(
-                importance=0.0,
-                valence=0.0,
-                doc_age_days=doc_age,
-                block_wire_count=bwc,
-                doc_wire_count=dwc,
-                wire_age_days=wire_age_days,
-                weights=weights,
-            )
-            scored.append({
-                "doc_id": doc_id,
-                "block_id": blk_id,
-                "composite": composite,
-                "importance": 0.0,
-                "valence": 0.0,
-                "block_wires": bwc,
-                "doc_wires": dwc,
-            })
-
-        scored.sort(key=lambda b: b["composite"], reverse=True)
-        scored = scored[:limit]
+        # Connect to workspace for title resolution
+        ws_doc = None
+        try:
+            await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
+            ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
+            if ws_channel:
+                ws_doc = ws_channel.doc
+        except Exception:
+            pass
 
         # Fetch content and titles for the top blocks
         doc_groups: Dict[str, list] = {}
         for item in scored:
-            doc_groups.setdefault(item["doc_id"], []).append(item)
+            doc_groups.setdefault(item["document_id"], []).append(item)
 
         async def _fetch_doc_blocks(did: str, items: list) -> list[dict]:
             title = _resolve_title_from_workspace(ws_doc, did) or did
@@ -2057,26 +1705,26 @@ LIMIT {min(limit * 10, 200)}
                     doc_results.append({
                         "content": content,
                         "document": title,
-                        "score": item["composite"],
-                        "importance": item["importance"],
-                        "valence": item["valence"],
+                        "score": item["composite_score"],
+                        "importance": item["cumulative_importance"],
+                        "valence": item["cumulative_valence"],
                         "block_id": item["block_id"],
-                        "doc_id": item["doc_id"],
-                        "block_wires": item["block_wires"],
-                        "doc_wires": item["doc_wires"],
+                        "doc_id": item["document_id"],
+                        "block_wires": item.get("block_wire_count", 0),
+                        "doc_wires": item.get("doc_wire_count", 0),
                     })
                 return doc_results
             except Exception:
                 return [{
                     "content": "(unavailable)",
                     "document": title,
-                    "score": item["composite"],
-                    "importance": item["importance"],
-                    "valence": item["valence"],
+                    "score": item["composite_score"],
+                    "importance": item["cumulative_importance"],
+                    "valence": item["cumulative_valence"],
                     "block_id": item["block_id"],
-                    "doc_id": item["doc_id"],
-                    "block_wires": item["block_wires"],
-                    "doc_wires": item["doc_wires"],
+                    "doc_id": item["document_id"],
+                    "block_wires": item.get("block_wire_count", 0),
+                    "doc_wires": item.get("doc_wire_count", 0),
                 } for item in items]
 
         doc_result_lists = await asyncio.gather(
@@ -2106,28 +1754,16 @@ LIMIT {min(limit * 10, 200)}
         auth.require_auth()
 
         graph_id = graph_id.strip()
-        await _ensure_scratchpad(hp_client, graph_id, auth)
 
-        # Read config documents
-        config = {}
+        url = f"{backend_config.base_url}/salience/{graph_id}/config"
+        resp = await get_http_client().get(url, headers=auth.http_headers())
+        resp.raise_for_status()
+        config = resp.json()
 
-        for doc_id, key in [
-            (IMPORTANCE_DOC_ID, "importance_prompt"),
-            (VALENCE_DOC_ID, "valence_prompt"),
-            (WEIGHTS_DOC_ID, "weights_raw"),
-        ]:
-            await hp_client.connect_document(graph_id, doc_id, user_id=auth.user_id)
-            channel = hp_client.get_document_channel(graph_id, doc_id, user_id=auth.user_id)
-            reader = DocumentReader(channel.doc)
-            xml = reader.to_xml()
-            config[key] = tiptap_xml_to_markdown(xml)
-
-        # Parse weights into structured config
-        weights = _parse_weights_text(config["weights_raw"])
-
+        weights = {k: v for k, v in config.items() if k not in ("importance_prompt", "valence_prompt")}
         return _render_json({
-            "importance_prompt": config["importance_prompt"],
-            "valence_prompt": config["valence_prompt"],
+            "importance_prompt": config.get("importance_prompt"),
+            "valence_prompt": config.get("valence_prompt"),
             "weights": weights,
         })
 
@@ -2158,21 +1794,19 @@ LIMIT {min(limit * 10, 200)}
         now_label = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         updated = []
 
-        # Helper: archive-then-replace a config document
-        async def _update_config_doc(
-            doc_id: str, past_doc_id: str, new_content: str, label: str
-        ) -> None:
-            # Read current
-            await hp_client.connect_document(graph_id, doc_id, user_id=auth.user_id)
-            channel = hp_client.get_document_channel(graph_id, doc_id, user_id=auth.user_id)
-            reader = DocumentReader(channel.doc)
-            current_xml = reader.to_xml()
-            current_md = tiptap_xml_to_markdown(current_xml)
+        # Read current config from platform
+        cfg_url = f"{backend_config.base_url}/salience/{graph_id}/config"
+        resp = await get_http_client().get(cfg_url, headers=auth.http_headers())
+        resp.raise_for_status()
+        current_config = resp.json()
 
-            # Archive to past/ doc (read existing, append entry, rewrite)
+        patch: Dict[str, Any] = {}
+
+        # Archive old value to HP past/ doc (genealogy preserved)
+        async def _archive_to_hp(past_doc_id: str, old_content: str) -> None:
             archive_entry = (
                 f'<heading level="3">Archived {html_mod.escape(now_label)}</heading>'
-                f"<paragraph>{html_mod.escape(current_md)}</paragraph>"
+                f"<paragraph>{html_mod.escape(old_content or '')}</paragraph>"
                 "<horizontalRule/>"
             )
             await hp_client.connect_document(graph_id, past_doc_id, user_id=auth.user_id)
@@ -2181,7 +1815,6 @@ LIMIT {min(limit * 10, 200)}
             )
             existing_archive = DocumentReader(archive_channel.doc).to_xml()
             new_archive = existing_archive + archive_entry
-
             await hp_client.transact_document(
                 graph_id,
                 past_doc_id,
@@ -2189,45 +1822,29 @@ LIMIT {min(limit * 10, 200)}
                 user_id=auth.user_id,
             )
 
-            # Write new content
-            new_xml = f'<heading level="1">{html_mod.escape(label)}</heading>'
-            for line in new_content.strip().split("\n"):
-                if line.strip():
-                    new_xml += f"<paragraph>{html_mod.escape(line.strip())}</paragraph>"
-
-            await hp_client.transact_document(
-                graph_id,
-                doc_id,
-                lambda doc, nx=new_xml: DocumentWriter(doc).replace_all_content(nx),
-                user_id=auth.user_id,
-            )
-
         if importance_prompt is not None:
-            await _update_config_doc(
-                IMPORTANCE_DOC_ID, PAST_IMPORTANCE_DOC_ID,
-                importance_prompt, "Importance Prompt"
-            )
+            old_value = current_config.get("importance_prompt") or ""
+            await _archive_to_hp(PAST_IMPORTANCE_DOC_ID, old_value)
+            patch["importance_prompt"] = importance_prompt
             updated.append("importance_prompt")
 
         if valence_prompt is not None:
-            await _update_config_doc(
-                VALENCE_DOC_ID, PAST_VALENCE_DOC_ID,
-                valence_prompt, "Valence Prompt"
-            )
+            old_value = current_config.get("valence_prompt") or ""
+            await _archive_to_hp(PAST_VALENCE_DOC_ID, old_value)
+            patch["valence_prompt"] = valence_prompt
             updated.append("valence_prompt")
 
         if weights is not None:
-            # Merge new weights into existing config (don't nuke unchanged values)
-            await hp_client.connect_document(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
-            channel = hp_client.get_document_channel(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id)
-            current_md = tiptap_xml_to_markdown(DocumentReader(channel.doc).to_xml())
-            current_weights = _parse_weights_text(current_md)
+            # Archive current weights as text
+            current_weights = {
+                k: v for k, v in current_config.items()
+                if k not in ("importance_prompt", "valence_prompt")
+            }
+            current_weights_text = "\n".join(f"{k}: {v}" for k, v in current_weights.items())
+            await _archive_to_hp(PAST_WEIGHTS_DOC_ID, current_weights_text)
 
-            # Parse the incoming changes and overlay onto current config
+            # Parse new weights and extract only explicitly specified keys
             new_weights = _parse_weights_text(weights)
-            # _parse_weights_text starts from DEFAULT_WEIGHTS, so we need to detect
-            # which keys the caller actually specified vs which are just defaults.
-            # Parse raw to find only explicitly mentioned keys.
             specified_keys = set()
             for line in weights.strip().split("\n"):
                 line = line.strip()
@@ -2242,18 +1859,13 @@ LIMIT {min(limit * 10, 200)}
                 if key in DEFAULT_WEIGHTS:
                     specified_keys.add(key)
 
-            # Merge: start from current, overlay only specified keys
-            merged = dict(current_weights)
             for key in specified_keys:
-                merged[key] = new_weights[key]
-
-            # Render as canonical "key: value" lines
-            merged_text = "\n".join(f"{k}: {v}" for k, v in merged.items())
-            await _update_config_doc(
-                WEIGHTS_DOC_ID, PAST_WEIGHTS_DOC_ID,
-                merged_text, "Scoring Configuration"
-            )
+                patch[key] = new_weights[key]
             updated.append("weights")
+
+        if patch:
+            resp = await get_http_client().patch(cfg_url, json=patch, headers=auth.http_headers())
+            resp.raise_for_status()
 
         return _render_json({"success": True, "updated": updated})
 
