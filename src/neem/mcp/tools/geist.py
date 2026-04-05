@@ -1754,16 +1754,33 @@ def register_geist_tools(server: FastMCP) -> None:
         auth.require_auth()
 
         graph_id = graph_id.strip()
+        await _ensure_scratchpad(hp_client, graph_id, auth)
 
-        url = f"{backend_config.base_url}/salience/{graph_id}/config"
-        resp = await get_http_client().get(url, headers=auth.http_headers())
-        resp.raise_for_status()
-        config = resp.json()
+        # Read from HP present/* docs — these are the authoritative, user-editable source
+        await asyncio.gather(
+            hp_client.connect_document(graph_id, IMPORTANCE_DOC_ID, user_id=auth.user_id),
+            hp_client.connect_document(graph_id, VALENCE_DOC_ID, user_id=auth.user_id),
+            hp_client.connect_document(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id),
+        )
 
-        weights = {k: v for k, v in config.items() if k not in ("importance_prompt", "valence_prompt")}
+        importance_xml = DocumentReader(
+            hp_client.get_document_channel(graph_id, IMPORTANCE_DOC_ID, user_id=auth.user_id).doc
+        ).to_xml()
+        valence_xml = DocumentReader(
+            hp_client.get_document_channel(graph_id, VALENCE_DOC_ID, user_id=auth.user_id).doc
+        ).to_xml()
+        weights_xml = DocumentReader(
+            hp_client.get_document_channel(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id).doc
+        ).to_xml()
+
+        importance_text = tiptap_xml_to_markdown(importance_xml)
+        valence_text = tiptap_xml_to_markdown(valence_xml)
+        weights_text = tiptap_xml_to_markdown(weights_xml)
+        weights = _parse_weights_text(weights_text)
+
         return _render_json({
-            "importance_prompt": config.get("importance_prompt"),
-            "valence_prompt": config.get("valence_prompt"),
+            "importance_prompt": importance_text,
+            "valence_prompt": valence_text,
             "weights": weights,
         })
 
@@ -1794,11 +1811,22 @@ def register_geist_tools(server: FastMCP) -> None:
         now_label = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         updated = []
 
-        # Read current config from platform
-        cfg_url = f"{backend_config.base_url}/salience/{graph_id}/config"
-        resp = await get_http_client().get(cfg_url, headers=auth.http_headers())
-        resp.raise_for_status()
-        current_config = resp.json()
+        # Read current values from HP present/* docs — these are the authoritative source
+        await asyncio.gather(
+            hp_client.connect_document(graph_id, IMPORTANCE_DOC_ID, user_id=auth.user_id),
+            hp_client.connect_document(graph_id, VALENCE_DOC_ID, user_id=auth.user_id),
+            hp_client.connect_document(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id),
+        )
+        current_importance_text = tiptap_xml_to_markdown(
+            DocumentReader(hp_client.get_document_channel(graph_id, IMPORTANCE_DOC_ID, user_id=auth.user_id).doc).to_xml()
+        )
+        current_valence_text = tiptap_xml_to_markdown(
+            DocumentReader(hp_client.get_document_channel(graph_id, VALENCE_DOC_ID, user_id=auth.user_id).doc).to_xml()
+        )
+        current_weights_text = tiptap_xml_to_markdown(
+            DocumentReader(hp_client.get_document_channel(graph_id, WEIGHTS_DOC_ID, user_id=auth.user_id).doc).to_xml()
+        )
+        current_weights = _parse_weights_text(current_weights_text)
 
         patch: Dict[str, Any] = {}
 
@@ -1823,24 +1851,17 @@ def register_geist_tools(server: FastMCP) -> None:
             )
 
         if importance_prompt is not None:
-            old_value = current_config.get("importance_prompt") or ""
-            await _archive_to_hp(PAST_IMPORTANCE_DOC_ID, old_value)
+            await _archive_to_hp(PAST_IMPORTANCE_DOC_ID, current_importance_text)
             patch["importance_prompt"] = importance_prompt
             updated.append("importance_prompt")
 
         if valence_prompt is not None:
-            old_value = current_config.get("valence_prompt") or ""
-            await _archive_to_hp(PAST_VALENCE_DOC_ID, old_value)
+            await _archive_to_hp(PAST_VALENCE_DOC_ID, current_valence_text)
             patch["valence_prompt"] = valence_prompt
             updated.append("valence_prompt")
 
         if weights is not None:
-            # Archive current weights as text
-            current_weights = {
-                k: v for k, v in current_config.items()
-                if k not in ("importance_prompt", "valence_prompt")
-            }
-            current_weights_text = "\n".join(f"{k}: {v}" for k, v in current_weights.items())
+            # Archive current HP weights text verbatim
             await _archive_to_hp(PAST_WEIGHTS_DOC_ID, current_weights_text)
 
             # Parse new weights and extract only explicitly specified keys
@@ -1864,10 +1885,7 @@ def register_geist_tools(server: FastMCP) -> None:
             updated.append("weights")
 
         if patch:
-            resp = await get_http_client().patch(cfg_url, json=patch, headers=auth.http_headers())
-            resp.raise_for_status()
-
-            # Mirror new values to HP present/ docs so they remain visible in the graph
+            # Write new values to HP present/* docs (AUTHORITATIVE write)
             async def _write_present_doc(doc_id: str, label: str, content: str) -> None:
                 new_xml = f'<heading level="1">{html_mod.escape(label)}</heading>'
                 for line in content.strip().split("\n"):
@@ -1887,14 +1905,20 @@ def register_geist_tools(server: FastMCP) -> None:
             if valence_prompt is not None:
                 write_tasks.append(_write_present_doc(VALENCE_DOC_ID, "Valence Prompt", valence_prompt))
             if weights is not None:
-                # Reconstruct the merged weights text from the patched config
+                # Merge new specified values into current weights
+                merged_weights = dict(current_weights)
+                for key in specified_keys:
+                    merged_weights[key] = new_weights[key]
                 merged_text = "\n".join(
-                    f"{k}: {patch[k]}" if k in patch else f"{k}: {current_weights[k]}"
-                    for k in DEFAULT_WEIGHTS
+                    f"{k}: {merged_weights[k]}" for k in DEFAULT_WEIGHTS if k in merged_weights
                 )
                 write_tasks.append(_write_present_doc(WEIGHTS_DOC_ID, "Scoring Configuration", merged_text))
-            if write_tasks:
-                await asyncio.gather(*write_tasks)
+            await asyncio.gather(*write_tasks)
+
+            # Sync to DynamoDB via platform PATCH (cache — scoring reads from HP, not here)
+            cfg_url = f"{backend_config.base_url}/salience/{graph_id}/config"
+            resp = await get_http_client().patch(cfg_url, json=patch, headers=auth.http_headers())
+            resp.raise_for_status()
 
         return _render_json({"success": True, "updated": updated})
 
