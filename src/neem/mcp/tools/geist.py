@@ -1867,6 +1867,35 @@ def register_geist_tools(server: FastMCP) -> None:
             resp = await get_http_client().patch(cfg_url, json=patch, headers=auth.http_headers())
             resp.raise_for_status()
 
+            # Mirror new values to HP present/ docs so they remain visible in the graph
+            async def _write_present_doc(doc_id: str, label: str, content: str) -> None:
+                new_xml = f'<heading level="1">{html_mod.escape(label)}</heading>'
+                for line in content.strip().split("\n"):
+                    if line.strip():
+                        new_xml += f"<paragraph>{html_mod.escape(line.strip())}</paragraph>"
+                await hp_client.connect_document(graph_id, doc_id, user_id=auth.user_id)
+                await hp_client.transact_document(
+                    graph_id,
+                    doc_id,
+                    lambda doc, nx=new_xml: DocumentWriter(doc).replace_all_content(nx),
+                    user_id=auth.user_id,
+                )
+
+            write_tasks = []
+            if importance_prompt is not None:
+                write_tasks.append(_write_present_doc(IMPORTANCE_DOC_ID, "Importance Prompt", importance_prompt))
+            if valence_prompt is not None:
+                write_tasks.append(_write_present_doc(VALENCE_DOC_ID, "Valence Prompt", valence_prompt))
+            if weights is not None:
+                # Reconstruct the merged weights text from the patched config
+                merged_text = "\n".join(
+                    f"{k}: {patch[k]}" if k in patch else f"{k}: {current_weights[k]}"
+                    for k in DEFAULT_WEIGHTS
+                )
+                write_tasks.append(_write_present_doc(WEIGHTS_DOC_ID, "Scoring Configuration", merged_text))
+            if write_tasks:
+                await asyncio.gather(*write_tasks)
+
         return _render_json({"success": True, "updated": updated})
 
     # ================================================================
