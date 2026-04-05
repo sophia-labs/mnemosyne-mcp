@@ -1916,9 +1916,13 @@ def register_geist_tools(server: FastMCP) -> None:
             await asyncio.gather(*write_tasks)
 
             # Sync to DynamoDB via platform PATCH (cache — scoring reads from HP, not here)
-            cfg_url = f"{backend_config.base_url}/salience/{graph_id}/config"
-            resp = await get_http_client().patch(cfg_url, json=patch, headers=auth.http_headers())
-            resp.raise_for_status()
+            # Fire-and-forget: HP write already succeeded; DynamoDB failure shouldn't surface as error
+            try:
+                cfg_url = f"{backend_config.base_url}/salience/{graph_id}/config"
+                resp = await get_http_client().patch(cfg_url, json=patch, headers=auth.http_headers())
+                resp.raise_for_status()
+            except Exception as exc:
+                logger.warning("revaluate_dynamodb_sync_failed", graph_id=graph_id, error=str(exc))
 
         return _render_json({"success": True, "updated": updated})
 
