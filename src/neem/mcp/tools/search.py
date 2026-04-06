@@ -16,6 +16,7 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from neem.hocuspocus import HocuspocusClient
 from neem.mcp.auth import MCPAuthContext
+from neem.mcp.http_client import get_http_client
 from neem.mcp.jobs import RealtimeJobClient
 from neem.mcp.tools.basic import await_job_completion, poll_job_until_terminal, submit_job
 from neem.mcp.tools.decorators import resolve_home_graph
@@ -719,11 +720,38 @@ def register_search_tools(server: FastMCP) -> None:
             else:
                 merged[key] = {**r, "match_source": "semantic"}
 
-        # Sort: both > lexical > semantic
+        # Enrich with composite salience scores (best-effort)
+        composite_scores: dict[str, float] = {}
+        block_ids = [r["block_id"] for r in merged.values() if r.get("block_id")]
+        if block_ids and backend_config:
+            try:
+                score_url = f"{backend_config.base_url}/salience/{graph_id}/blocks/values"
+                score_resp = await get_http_client().get(
+                    score_url,
+                    params={"block_ids": ",".join(block_ids), "limit": len(block_ids)},
+                    headers=auth.http_headers(),
+                )
+                if score_resp.status_code == 200:
+                    for b in score_resp.json().get("blocks", []):
+                        composite_scores[b["block_id"]] = b.get("composite_score", 0)
+            except Exception:
+                pass  # Salience enrichment is best-effort
+
+        # Annotate results with composite_score
+        for r in merged.values():
+            score = composite_scores.get(r.get("block_id", ""))
+            if score is not None:
+                r["composite_score"] = round(score, 4)
+
+        # Sort: match_source primary (both > lexical > semantic),
+        # composite_score secondary (descending within each tier)
         source_order = {"both": 0, "lexical": 1, "semantic": 2}
         sorted_results = sorted(
             merged.values(),
-            key=lambda x: source_order.get(x.get("match_source", "semantic"), 3),
+            key=lambda x: (
+                source_order.get(x.get("match_source", "semantic"), 3),
+                -(x.get("composite_score", 0)),
+            ),
         )
 
         # Post-filter: exclude deleted docs + per-document cap
