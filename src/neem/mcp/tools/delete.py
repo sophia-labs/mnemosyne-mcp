@@ -10,6 +10,7 @@ from typing import Optional
 
 from mcp.server.fastmcp import Context, FastMCP
 
+from neem.mcp.tools.decorators import resolve_home_graph
 from neem.utils.logging import LoggerFactory
 
 logger = LoggerFactory.get_logger("mcp.tools.delete")
@@ -44,6 +45,7 @@ def register_delete_tool(server: FastMCP) -> None:
             "- `graph`: Delete an entire graph. `hard=true` permanently deletes (cannot be undone)."
         ),
     )
+    @resolve_home_graph
     async def delete_tool(
         type: str = "",
         graph_id: str | None = None,
