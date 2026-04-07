@@ -1659,7 +1659,7 @@ Always returns fresh content — automatically reconnects if the cached channel 
         description=(
             "Returns a compact summary of a document for orientation and triage, "
             "without fetching full content. Includes:\n\n"
-            "- **metadata**: title, folder path, readOnly status\n"
+            "- **metadata**: title, folder path, readOnly status, description (if generated)\n"
             "- **size**: block count, character count, word count\n"
             "- **freshness**: created_at, updated_at timestamps, and snapshot_count (edit history depth)\n"
             "- **headings**: section headings extracted from document structure\n"
@@ -1730,6 +1730,8 @@ Always returns fresh content — automatically reconnects if the cached channel 
             }
             if doc_meta.get("fileType"):
                 metadata["fileType"] = doc_meta["fileType"]
+            if doc_meta.get("description"):
+                metadata["description"] = doc_meta["description"]
 
             # 2. Read document and extract size + headings
             document_doc, _ = await _load_document_doc_for_read(
