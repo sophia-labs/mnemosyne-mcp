@@ -215,6 +215,8 @@ def register_search_tools(server: FastMCP) -> None:
             "- `exact`: Case-insensitive exact title match only.\n"
             "- `substring`: Case-insensitive substring match on title and folder path.\n"
             "- `regex`: Regex pattern match on title and folder path.\n\n"
+            "**Batch mode:** Pass `queries` (list of strings) instead of `query` to search "
+            "multiple terms in a single call. Results are merged and deduplicated.\n\n"
             "Use this instead of get_workspace when you know roughly what you're "
             "looking for. Much faster than scanning the full workspace tree."
         ),
@@ -223,6 +225,7 @@ def register_search_tools(server: FastMCP) -> None:
     async def search_documents_tool(
         graph_id: str | None = None,
         query: str = "",
+        queries: Optional[list[str]] = None,
         mode: str = "auto",
         limit: int = 20,
         folder_id: Optional[str] = None,
@@ -235,13 +238,21 @@ def register_search_tools(server: FastMCP) -> None:
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required")
-        if not query or not query.strip():
-            raise ValueError("query is required")
+
+        # Resolve query list: batch mode (queries) or single mode (query)
+        if queries and len(queries) > 0:
+            query_list = [q.strip() for q in queries if q and q.strip()]
+        elif query and query.strip():
+            query_list = [query.strip()]
+        else:
+            raise ValueError("query or queries is required")
+
+        if not query_list:
+            raise ValueError("at least one non-empty query is required")
         if mode not in ("auto", "exact", "substring", "regex"):
             raise ValueError("mode must be one of: auto, exact, substring, regex")
 
         graph_id = graph_id.strip()
-        query = query.strip()
         limit = min(max(limit, 1), 100)
 
         if hp_client is None:
@@ -324,20 +335,20 @@ def register_search_tools(server: FastMCP) -> None:
                     "_searchable_norm": _normalize(f"{name} {fpath}"),
                 })
 
-        # Search based on mode
-        def _search_exact_id() -> list[dict]:
-            return [e for e in entries if e["document_id"] == query]
+        # Search helpers — parameterized by query string
+        def _search_exact_id(q: str) -> list[dict]:
+            return [e for e in entries if e["document_id"] == q]
 
-        def _search_exact_title() -> list[dict]:
-            q = query.lower()
-            q_norm = _normalize(query)
-            results = [e for e in entries if e["_title_lower"] == q]
+        def _search_exact_title(q: str) -> list[dict]:
+            q_low = q.lower()
+            q_norm = _normalize(q)
+            results = [e for e in entries if e["_title_lower"] == q_low]
             if not results and q_norm:
                 results = [e for e in entries if e["_title_norm"] == q_norm]
             return results
 
-        def _search_substring() -> list[dict]:
-            terms = query.lower().split()
+        def _search_substring(q: str) -> list[dict]:
+            terms = q.lower().split()
             if not terms:
                 return []
             q_norm_terms = [_normalize(t) for t in terms]
@@ -354,9 +365,9 @@ def register_search_tools(server: FastMCP) -> None:
                     path_hits.append({**e, "match_type": "path_substring"})
             return title_hits + path_hits
 
-        def _search_regex() -> list[dict]:
+        def _search_regex(q: str) -> list[dict]:
             try:
-                pattern = re_mod.compile(query, re_mod.IGNORECASE)
+                pattern = re_mod.compile(q, re_mod.IGNORECASE)
             except re_mod.error as exc:
                 raise ValueError(f"Invalid regex pattern: {exc}")
             title_hits = []
@@ -368,8 +379,8 @@ def register_search_tools(server: FastMCP) -> None:
                     path_hits.append({**e, "match_type": "regex_path"})
             return title_hits + path_hits
 
-        def _search_fuzzy() -> list[dict]:
-            q_tokens = _tokenize(query)
+        def _search_fuzzy(q: str) -> list[dict]:
+            q_tokens = _tokenize(q)
             scored = []
             for e in entries:
                 t_tokens = _tokenize(e["_searchable"])
@@ -379,39 +390,49 @@ def register_search_tools(server: FastMCP) -> None:
             scored.sort(key=lambda x: x[1], reverse=True)
             return [s[0] for s in scored]
 
-        results: list[dict] = []
+        def _search_single(q: str) -> tuple[list[dict], str]:
+            """Run search cascade for a single query. Returns (results, effective_mode)."""
+            if mode == "auto":
+                r = _search_exact_id(q)
+                if r:
+                    return r, "id"
+                r = _search_exact_title(q)
+                if r:
+                    for item in r:
+                        item["match_type"] = "exact_title"
+                    return r, "exact"
+                r = _search_substring(q)
+                if r:
+                    return r, "substring"
+                return _search_fuzzy(q), "fuzzy"
+            elif mode == "exact":
+                r = _search_exact_title(q)
+                for item in r:
+                    item["match_type"] = "exact_title"
+                return r, "exact"
+            elif mode == "substring":
+                return _search_substring(q), "substring"
+            elif mode == "regex":
+                return _search_regex(q), "regex"
+            return [], mode
+
+        # Run all queries and merge results, deduplicating by document_id
+        seen_ids: set[str] = set()
+        all_results: list[dict] = []
         effective_mode = mode
 
-        if mode == "auto":
-            # Cascade: ID → exact title → substring → fuzzy
-            results = _search_exact_id()
-            if results:
-                effective_mode = "id"
-            else:
-                results = _search_exact_title()
-                if results:
-                    effective_mode = "exact"
-                    for r in results:
-                        r["match_type"] = "exact_title"
-                else:
-                    results = _search_substring()
-                    if results:
-                        effective_mode = "substring"
-                    else:
-                        results = _search_fuzzy()
-                        effective_mode = "fuzzy"
-        elif mode == "exact":
-            results = _search_exact_title()
-            for r in results:
-                r["match_type"] = "exact_title"
-        elif mode == "substring":
-            results = _search_substring()
-        elif mode == "regex":
-            results = _search_regex()
+        for q in query_list:
+            q_results, q_mode = _search_single(q)
+            effective_mode = q_mode  # last query's mode wins (fine for response metadata)
+            for r in q_results:
+                doc_id = r["document_id"]
+                if doc_id not in seen_ids:
+                    seen_ids.add(doc_id)
+                    all_results.append(r)
 
         # Clean internal keys and apply limit
         clean_results = []
-        for r in results[:limit]:
+        for r in all_results[:limit]:
             entry: dict[str, Any] = {
                 "document_id": r["document_id"],
                 "title": r["title"],
@@ -427,6 +448,7 @@ def register_search_tools(server: FastMCP) -> None:
         return _render_json({
             "results": clean_results,
             "count": len(clean_results),
+            "queries": query_list,
         })
 
     # ==================================================================
@@ -613,6 +635,9 @@ def register_search_tools(server: FastMCP) -> None:
             "No vector embeddings needed.\n"
             "- `semantic`: Vector similarity search only. Finds content by meaning rather "
             "than exact text.\n\n"
+            "**Batch mode:** Pass `queries` (list of strings) instead of `query` to search "
+            "multiple terms in a single call. Results are merged and deduplicated across all "
+            "queries. Much more efficient than multiple individual calls.\n\n"
             "Use this for finding content across documents. For finding documents by title, "
             "use search_documents instead."
         ),
@@ -621,6 +646,7 @@ def register_search_tools(server: FastMCP) -> None:
     async def search_blocks_tool(
         graph_id: str | None = None,
         query: str = "",
+        queries: Optional[list[str]] = None,
         mode: str = "hybrid",
         limit: int = 30,
         doc_filter: Optional[str] = None,
@@ -632,13 +658,22 @@ def register_search_tools(server: FastMCP) -> None:
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required")
-        if not query or not query.strip():
-            raise ValueError("query is required")
+
+        # Resolve query list: batch mode (queries) or single mode (query)
+        if queries and len(queries) > 0:
+            query_list = [q.strip() for q in queries if q and q.strip()]
+        elif query and query.strip():
+            query_list = [query.strip()]
+        else:
+            raise ValueError("query or queries is required")
+
+        if not query_list:
+            raise ValueError("at least one non-empty query is required")
+
         if mode not in ("hybrid", "lexical", "semantic"):
             raise ValueError("mode must be one of: hybrid, lexical, semantic")
 
         graph_id = graph_id.strip()
-        query = query.strip()
         limit = min(max(limit, 1), 100)
         doc_filter = doc_filter.strip() if doc_filter else None
 
@@ -659,43 +694,42 @@ def register_search_tools(server: FastMCP) -> None:
         if context:
             await context.report_progress(10, 100)
 
-        # Detect if query looks like a regex (has special chars)
-        use_regex = bool(re_mod.search(r'[.*+?^${}()|[\]\\]', query)) and mode != "semantic"
+        # Fire all queries in parallel — each query gets its own lex + sem pair
+        all_tasks: list[asyncio.Task] = []
+        task_labels: list[tuple[str, str]] = []  # (query, "lexical"|"semantic")
 
+        for q in query_list:
+            use_regex = bool(re_mod.search(r'[.*+?^${}()|[\]\\]', q)) and mode != "semantic"
+
+            if mode in ("hybrid", "lexical"):
+                task = asyncio.create_task(_run_lexical_search(
+                    graph_id, q, limit, doc_filter, auth, None, doc_titles, use_regex,
+                ))
+                all_tasks.append(task)
+                task_labels.append((q, "lexical"))
+
+            if mode in ("hybrid", "semantic"):
+                task = asyncio.create_task(_run_semantic_search(
+                    graph_id, q, limit, doc_filter, auth, None,
+                ))
+                all_tasks.append(task)
+                task_labels.append((q, "semantic"))
+
+        raw_results = await asyncio.gather(*all_tasks, return_exceptions=True)
+
+        # Collect results by type across all queries
         lexical_results: list[dict] = []
         semantic_results: list[dict] = []
-        lexical_count = 0
-        semantic_count = 0
 
-        if mode == "hybrid":
-            # Fire both in parallel
-            lex_task = _run_lexical_search(
-                graph_id, query, limit, doc_filter, auth, None, doc_titles, use_regex,
-            )
-            sem_task = _run_semantic_search(
-                graph_id, query, limit, doc_filter, auth, None,
-            )
-            raw = await asyncio.gather(lex_task, sem_task, return_exceptions=True)
-
-            if isinstance(raw[0], list):
-                lexical_results = raw[0]
+        for i, result in enumerate(raw_results):
+            _q, search_type = task_labels[i]
+            if isinstance(result, list):
+                if search_type == "lexical":
+                    lexical_results.extend(result)
+                else:
+                    semantic_results.extend(result)
             else:
-                logger.warning("lexical_search_exception", extra_context={"error": str(raw[0])})
-
-            if isinstance(raw[1], list):
-                semantic_results = raw[1]
-            else:
-                logger.warning("semantic_search_exception", extra_context={"error": str(raw[1])})
-
-        elif mode == "lexical":
-            lexical_results = await _run_lexical_search(
-                graph_id, query, limit, doc_filter, auth, context, doc_titles, use_regex,
-            )
-
-        elif mode == "semantic":
-            semantic_results = await _run_semantic_search(
-                graph_id, query, limit, doc_filter, auth, context,
-            )
+                logger.warning(f"{search_type}_search_exception", extra_context={"error": str(result), "query": _q[:50]})
 
         # Merge results — keyed by doc_id:block_id to avoid cross-doc collisions
         merged: dict[str, dict] = {}
@@ -765,7 +799,7 @@ def register_search_tools(server: FastMCP) -> None:
         if post_filter_removed > 0:
             logger.info(
                 "search_blocks_deleted_docs_filtered",
-                extra_context={"removed": post_filter_removed, "query": query[:50]},
+                extra_context={"removed": post_filter_removed, "query": str(query_list)[:50]},
             )
 
         lexical_count = sum(1 for r in final_results if r.get("match_source") in ("lexical", "both"))
@@ -777,6 +811,7 @@ def register_search_tools(server: FastMCP) -> None:
         return _render_json({
             "results": final_results,
             "count": len(final_results),
+            "queries": query_list,
             "lexical_count": lexical_count,
             "semantic_count": semantic_count,
             "post_filter_removed": post_filter_removed,
