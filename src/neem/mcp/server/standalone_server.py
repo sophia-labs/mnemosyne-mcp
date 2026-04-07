@@ -40,6 +40,7 @@ from neem.mcp.tools.geist import register_geist_tools
 from neem.mcp.tools.search import register_search_tools
 from neem.mcp.tools.surface import register_surface_tools
 from neem.mcp.tools.history import register_history_tools
+from neem.mcp.tools.delete import register_delete_tool
 from neem.mcp.trace import trace, trace_separator
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_dev_user_id, get_internal_service_secret
@@ -1174,6 +1175,7 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
     register_search_tools(mcp_server)
     register_surface_tools(mcp_server)
     register_history_tools(mcp_server)
+    register_delete_tool(mcp_server)  # unified delete — must be after other registrations
 
     # --- Profile filtering: keep only allowlisted tools for lite profiles ---
     if active_profile == "lite":

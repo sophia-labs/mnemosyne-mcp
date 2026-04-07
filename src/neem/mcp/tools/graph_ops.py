@@ -91,14 +91,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             "title": title.strip(),
         })
 
-    @server.tool(
-        name="delete_graph",
-        title="Delete Knowledge Graph",
-        description=(
-            "Deletes a knowledge graph. By default, performs a soft delete (marks as deleted but retains data). "
-            "Set hard=True to permanently delete the graph and all its contents. Hard delete cannot be undone."
-        ),
-    )
+    # delete_graph — registered via unified delete tool
     async def delete_graph_tool(
         graph_id: str,
         hard: bool = False,
@@ -421,6 +414,11 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             "source_graph_id": source_graph_id.strip(),
             "new_graph_id": new_graph_id.strip(),
         })
+
+    # Store delete handler for unified delete tool
+    if not hasattr(server, "_delete_handlers"):
+        server._delete_handlers = {}  # type: ignore[attr-defined]
+    server._delete_handlers["graph"] = delete_graph_tool  # type: ignore[attr-defined]
 
     logger.info("Registered graph operations tools (create, delete, duplicate, query, update)")
 

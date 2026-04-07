@@ -2771,17 +2771,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 doc_ids.extend(_collect_document_ids_recursive(reader, entity_id))
         return doc_ids
 
-    @server.tool(
-        name="delete_folder",
-        title="Delete Folder",
-        description=(
-            "Delete a folder from the workspace. "
-            "Set cascade=true to delete all contents (subfolders, documents, artifacts). "
-            "Without cascade, deletion fails if the folder has children. "
-            "By default, permanently deletes document data (RDF, S3, Redis). "
-            "Set hard=false to only remove from workspace navigation."
-        ),
-    )
+    # delete_folder — registered via unified delete tool
     @resolve_home_graph
     async def delete_folder_tool(
         graph_id: str | None = None,
@@ -3257,17 +3247,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             )
             raise RuntimeError(f"Failed to move documents: {e}")
 
-    @server.tool(
-        name="delete_documents",
-        title="Delete Document(s)",
-        description=(
-            "Delete document(s). For a single document, pass document_id. "
-            "For multiple documents, pass a document_ids list. "
-            "By default, permanently deletes including content, RDF triples, and stored data. "
-            "Set hard=false to only remove from workspace navigation (soft delete) "
-            "— documents can then be recreated by writing to the same document_id."
-        ),
-    )
+    # delete_documents — registered via unified delete tool
     @resolve_home_graph
     async def delete_documents_tool(
         graph_id: str | None = None,
@@ -4146,17 +4126,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             )
             raise RuntimeError(f"Failed to insert blocks: {e}")
 
-    @server.tool(
-        name="delete_blocks",
-        title="Delete Blocks",
-        description=(
-            "Delete block(s) by ID. Supports single delete via block_id or batch delete via "
-            "block_ids. Use cascade=true to also delete all subsequent blocks with higher indent "
-            "(indent-based children). Returns deleted and skipped block IDs.\n\n"
-            "Read the document first (read_document) before deleting — "
-            "write tools need a preceding read to sync latest state."
-        ),
-    )
+    # delete_blocks — registered via unified delete tool
     @resolve_home_graph
     async def delete_blocks_tool(
         graph_id: str | None = None,
@@ -4589,5 +4559,12 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 },
             )
             raise RuntimeError(f"Failed to save chat log: {e}")
+
+    # Store delete handlers for unified delete tool
+    if not hasattr(server, "_delete_handlers"):
+        server._delete_handlers = {}  # type: ignore[attr-defined]
+    server._delete_handlers["folder"] = delete_folder_tool  # type: ignore[attr-defined]
+    server._delete_handlers["documents"] = delete_documents_tool  # type: ignore[attr-defined]
+    server._delete_handlers["blocks"] = delete_blocks_tool  # type: ignore[attr-defined]
 
     logger.info("Registered hocuspocus tools (documents, navigation, and block operations)")

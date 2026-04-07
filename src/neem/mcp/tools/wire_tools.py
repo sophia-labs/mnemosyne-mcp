@@ -910,19 +910,7 @@ def register_wire_tools(server: FastMCP) -> None:
     # delete_wires
     # ─────────────────────────────────────────────────────────────────────────
 
-    @server.tool(
-        name="delete_wires",
-        title="Delete Wires",
-        description=(
-            "Delete semantic wires. Three modes:\n"
-            "1. By ID: pass wire_id (single) or wire_ids (batch) to delete specific wires.\n"
-            "2. By document: pass document_id to delete ALL wires connected to that document.\n"
-            "3. By block: pass document_id + block_id to delete wires connected to that specific block.\n\n"
-            "Bidirectional wires are automatically cleaned up — deleting either "
-            "the canonical or inverse wire removes both.\n"
-            "Use get_wires to find wire IDs before deleting."
-        ),
-    )
+    # delete_wires — registered via unified delete tool
     @resolve_home_graph
     async def delete_wires_tool(
         graph_id: str | None = None,
@@ -1034,3 +1022,8 @@ def register_wire_tools(server: FastMCP) -> None:
 
         except Exception as e:
             raise RuntimeError(f"Failed to delete wires: {e}")
+
+    # Store delete handler for unified delete tool
+    if not hasattr(server, "_delete_handlers"):
+        server._delete_handlers = {}  # type: ignore[attr-defined]
+    server._delete_handlers["wires"] = delete_wires_tool  # type: ignore[attr-defined]
