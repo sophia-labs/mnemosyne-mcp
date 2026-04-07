@@ -729,7 +729,10 @@ def register_search_tools(server: FastMCP) -> None:
                 else:
                     semantic_results.extend(result)
             else:
-                logger.warning(f"{search_type}_search_exception", extra_context={"error": str(result), "query": _q[:50]})
+                if search_type == "lexical":
+                    logger.warning("lexical_search_exception", extra_context={"error": str(result), "query": _q[:50]})
+                else:
+                    logger.warning("semantic_search_exception", extra_context={"error": str(result), "query": _q[:50]})
 
         # Merge results — keyed by doc_id:block_id to avoid cross-doc collisions
         merged: dict[str, dict] = {}
