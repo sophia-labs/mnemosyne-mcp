@@ -26,12 +26,17 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from neem.hocuspocus import HocuspocusClient, DocumentReader, DocumentWriter, WorkspaceWriter, WorkspaceReader
 from neem.hocuspocus.converters import (
+    PendingTag,
     PendingValuation,
+    extract_xml_tags,
     extract_xml_valuations,
     looks_like_markdown,
+    map_tags_to_block_ids,
     map_valuations_to_block_ids,
     markdown_to_tiptap_xml,
+    postprocess_tags,
     postprocess_valuations,
+    preprocess_tags,
     preprocess_valuations,
     tiptap_xml_to_html,
     tiptap_xml_to_markdown,
@@ -1106,32 +1111,47 @@ GROUP BY ?docId
         )
 
     # ------------------------------------------------------------------
-    # Inline valuation helpers
+    # Inline valuation + tag helpers
     # ------------------------------------------------------------------
-    def _prepare_content_with_valuations(
+    def _prepare_content_with_markers(
         content: str,
         multiblock: bool = True,
-    ) -> tuple[str, list[PendingValuation]]:
-        """Process content, extracting inline valuation markers.
+    ) -> tuple[str, list[PendingValuation], list[PendingTag]]:
+        """Process content, extracting inline valuation and tag markers.
 
-        Returns (clean_xml, pending_valuations). Handles both XML content
-        (data-val-* attributes) and text/markdown ({!N,+M} syntax).
+        Returns (clean_xml, pending_valuations, pending_tags). Handles both
+        XML content (data-val-*/data-tags attributes) and text/markdown
+        ({!N,+M} and {#tag} syntax).
         """
         stripped = content.strip()
         if not stripped:
-            return stripped, []
+            return stripped, [], []
 
         if stripped.startswith("<"):
-            # XML path: extract data-val-* attributes
-            return extract_xml_valuations(stripped)
+            # XML path: extract data-val-* and data-tags attributes
+            xml_v, valuations = extract_xml_valuations(stripped)
+            xml_clean, tags = extract_xml_tags(xml_v)
+            return xml_clean, valuations, tags
 
         # Text/markdown path: preprocess markers → convert → postprocess
         preprocessed = preprocess_valuations(stripped)
+        preprocessed = preprocess_tags(preprocessed)
         if multiblock:
             xml = _ensure_xml_multiblock(preprocessed)
         else:
             xml = _ensure_xml(preprocessed)
-        return postprocess_valuations(xml)
+        xml_v, valuations = postprocess_valuations(xml)
+        xml_clean, tags = postprocess_tags(xml_v)
+        return xml_clean, valuations, tags
+
+    # Keep old name as alias for backward compatibility in case anything calls it
+    def _prepare_content_with_valuations(
+        content: str,
+        multiblock: bool = True,
+    ) -> tuple[str, list[PendingValuation]]:
+        """Legacy wrapper — returns only valuations (no tags)."""
+        xml, valuations, _tags = _prepare_content_with_markers(content, multiblock)
+        return xml, valuations
 
     async def _fire_inline_valuations(
         pending: list[PendingValuation],
@@ -1180,6 +1200,83 @@ GROUP BY ?docId
                 },
             )
             return {"error": str(e), "valuations_attempted": len(entries)}
+
+    async def _fire_inline_tags(
+        pending: list[PendingTag],
+        block_ids: list[str],
+        document_id: str,
+        graph_id: str,
+        auth: MCPAuthContext,
+    ) -> dict | None:
+        """Apply pending tags as CRDT data-tags attributes on blocks.
+
+        Fire-and-forget: returns results on success, logs and returns
+        error dict on failure. Never raises.
+        """
+        if not pending:
+            return None
+
+        entries = map_tags_to_block_ids(pending, block_ids)
+        if not entries:
+            return None
+
+        try:
+            import json as _json
+            user_id = auth.user_id or (get_user_id_from_token(auth.token) if auth.token else None)
+            if not user_id:
+                return {"error": "Could not resolve user_id for inline tags"}
+
+            channel = hp_client.get_document_channel(graph_id, document_id, user_id=user_id)
+            if not channel:
+                return {"error": f"No channel for {document_id}"}
+
+            writer = DocumentWriter(channel.doc)
+            applied = 0
+            for entry in entries:
+                block_id = entry["block_id"]
+                new_tags = entry["tags"]
+
+                # Read existing tags and merge
+                result = writer.find_block_by_id(block_id)
+                if result is None:
+                    continue
+
+                _idx, elem = result
+                existing_raw = elem.attributes.get("data-tags")
+                existing_tags: list[str] = []
+                if existing_raw:
+                    try:
+                        parsed = _json.loads(existing_raw)
+                        if isinstance(parsed, list):
+                            existing_tags = [str(t) for t in parsed if t]
+                    except (_json.JSONDecodeError, TypeError):
+                        pass
+
+                # Merge: union of existing and new, preserving order
+                merged = list(dict.fromkeys(existing_tags + new_tags))
+                writer.update_block_attributes(block_id, {"data-tags": _json.dumps(merged)})
+                applied += 1
+
+            logger.info(
+                "inline_tags_applied",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "tags_count": sum(len(e["tags"]) for e in entries),
+                    "blocks_updated": applied,
+                },
+            )
+            return {"applied": applied, "entries": len(entries)}
+        except Exception as e:
+            logger.warning(
+                "inline_tags_failed",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "error": str(e),
+                },
+            )
+            return {"error": str(e), "tags_attempted": len(entries)}
 
     @server.tool(
         name="get_user_location",
@@ -1983,6 +2080,8 @@ For modifying parts of an existing document, prefer surgical block tools (edit_b
 
 Inline valuations: Add {!N} (importance 0-5), {!,+N} or {!,-N} (valence -5 to +5), or {!N,+M} (both) at the end of any line to automatically valuate that block after writing. For XML content, use data-val-importance="N" and data-val-valence="N" attributes on block elements. Markers are stripped from content before writing. Valuations appear in the response under a "valuations" key.
 
+Inline tags: Add {#tagname} at the end of any line to tag that block (e.g. {#decision}, {#pragma}, {#todo:7d}). Multiple tags: {#decision}{#pragma}. Combined with valuations: {!4,+2}{#decision}. For XML, use data-tags='["decision","pragma"]' attribute. Tags are applied as block metadata after writing.
+
 Read the document first in multi-agent environments (see Write Tool Guidance in server instructions).""",
     )
     @resolve_home_graph
@@ -2005,7 +2104,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             # 1. Write document content and comments (with user context)
             await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
 
-            xml_content, pending_valuations = _prepare_content_with_valuations(content)
+            xml_content, pending_valuations, pending_tags = _prepare_content_with_markers(content)
 
             def write_content_and_comments(doc: Any) -> None:
                 writer = DocumentWriter(doc)
@@ -2095,9 +2194,12 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 user_id=auth.user_id,
             )
 
-            # 4. Fire inline valuations if any markers were found
+            # 4. Fire inline valuations and tags if any markers were found
             val_result = await _fire_inline_valuations(
                 pending_valuations, block_ids, document_id, graph_id, auth,
+            )
+            tag_result = await _fire_inline_tags(
+                pending_tags, block_ids, document_id, graph_id, auth,
             )
 
             result = {
@@ -2110,6 +2212,8 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             }
             if val_result is not None:
                 result["valuations"] = val_result
+            if tag_result is not None:
+                result["tags"] = tag_result
             return result
 
         except Exception as e:
@@ -3619,8 +3723,9 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
 
             results: list[Dict[str, Any]] = []
 
-            # Pre-process content to extract inline valuations before transaction
+            # Pre-process content to extract inline valuations and tags before transaction
             all_pending_valuations: list[dict] = []
+            all_pending_tag_entries: list[dict] = []  # {"block_id": str, "tags": list[str]}
             preprocessed_updates: list[dict] = []
             for update in updates:
                 bid = update.get("block_id")
@@ -3628,17 +3733,24 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 attrs = update.get("attributes")
                 resolved_xml = None
                 if content:
-                    xml, pending = _prepare_content_with_valuations(content, multiblock=False)
+                    xml, pending_vals, pending_tags = _prepare_content_with_markers(content, multiblock=False)
                     resolved_xml = xml
-                    # Block ID is already known — map directly
-                    if pending and bid:
-                        for pv in pending:
+                    # Block ID is already known — map valuations directly
+                    if pending_vals and bid:
+                        for pv in pending_vals:
                             entry: dict = {"document_id": document_id.strip(), "block_id": bid.strip()}
                             if pv.importance is not None:
                                 entry["importance"] = pv.importance
                             if pv.valence is not None:
                                 entry["valence"] = pv.valence
                             all_pending_valuations.append(entry)
+                    # Block ID is already known — map tags directly
+                    if pending_tags and bid:
+                        for pt in pending_tags:
+                            all_pending_tag_entries.append({
+                                "block_id": bid.strip(),
+                                "tags": pt.tags,
+                            })
                 preprocessed_updates.append({
                     "block_id": bid,
                     "resolved_xml": resolved_xml,
@@ -3696,6 +3808,43 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                     )
                     val_result = {"error": str(e), "valuations_attempted": len(all_pending_valuations)}
 
+            # Fire inline tags if any markers were found
+            tag_result = None
+            if all_pending_tag_entries:
+                try:
+                    import json as _json
+                    user_id = auth.user_id or (get_user_id_from_token(auth.token) if auth.token else None)
+                    if user_id:
+                        channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip(), user_id=user_id)
+                        if channel:
+                            writer = DocumentWriter(channel.doc)
+                            applied = 0
+                            for te in all_pending_tag_entries:
+                                bid = te["block_id"]
+                                result_find = writer.find_block_by_id(bid)
+                                if result_find is None:
+                                    continue
+                                _idx, elem = result_find
+                                existing_raw = elem.attributes.get("data-tags")
+                                existing_tags: list[str] = []
+                                if existing_raw:
+                                    try:
+                                        parsed = _json.loads(existing_raw)
+                                        if isinstance(parsed, list):
+                                            existing_tags = [str(t) for t in parsed if t]
+                                    except (_json.JSONDecodeError, TypeError):
+                                        pass
+                                merged = list(dict.fromkeys(existing_tags + te["tags"]))
+                                writer.update_block_attributes(bid, {"data-tags": _json.dumps(merged)})
+                                applied += 1
+                            tag_result = {"applied": applied, "entries": len(all_pending_tag_entries)}
+                except Exception as e:
+                    logger.warning(
+                        "inline_tags_failed",
+                        extra_context={"graph_id": graph_id, "document_id": document_id, "error": str(e)},
+                    )
+                    tag_result = {"error": str(e), "tags_attempted": len(all_pending_tag_entries)}
+
             # Single mode: return flat result or raise on error
             if is_single and results:
                 r = results[0]
@@ -3703,6 +3852,8 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                     raise RuntimeError(f"Failed to update block {r.get('block_id', '?')}: {r['error']}")
                 if val_result is not None:
                     r["valuations"] = val_result
+                if tag_result is not None:
+                    r["tags"] = tag_result
                 return r
 
             output = {
@@ -3713,6 +3864,8 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             }
             if val_result is not None:
                 output["valuations"] = val_result
+            if tag_result is not None:
+                output["tags"] = tag_result
             return output
 
         except Exception as e:
@@ -4036,8 +4189,8 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
 
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
-            # Convert content to XML, extracting inline valuation markers
-            xml_content, pending_valuations = _prepare_content_with_valuations(content)
+            # Convert content to XML, extracting inline valuation and tag markers
+            xml_content, pending_valuations, pending_tags = _prepare_content_with_markers(content)
 
             # Parse into individual block XML strings
             blocks_xml: list[str] = []
@@ -4099,9 +4252,12 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 user_id=auth.user_id,
             )
 
-            # Fire inline valuations if any markers were found
+            # Fire inline valuations and tags if any markers were found
             val_result = await _fire_inline_valuations(
                 pending_valuations, new_block_ids, document_id.strip(), graph_id.strip(), auth,
+            )
+            tag_result = await _fire_inline_tags(
+                pending_tags, new_block_ids, document_id.strip(), graph_id.strip(), auth,
             )
 
             result = {
@@ -4111,6 +4267,8 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             }
             if val_result is not None:
                 result["valuations"] = val_result
+            if tag_result is not None:
+                result["tags"] = tag_result
             return result
 
         except ValueError as ve:

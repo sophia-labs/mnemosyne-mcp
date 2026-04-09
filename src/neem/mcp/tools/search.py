@@ -462,6 +462,7 @@ def register_search_tools(server: FastMCP) -> None:
         doc_filter: Optional[str],
         auth: MCPAuthContext,
         ctx: Optional[Context],
+        tags_filter: Optional[list[str]] = None,
     ) -> list[dict]:
         """Run semantic search via Qdrant job queue."""
         payload: JsonDict = {
@@ -471,6 +472,8 @@ def register_search_tools(server: FastMCP) -> None:
         }
         if doc_filter:
             payload["doc_filter"] = doc_filter
+        if tags_filter:
+            payload["tags_filter"] = tags_filter
 
         if job_stream:
             try:
@@ -495,13 +498,17 @@ def register_search_tools(server: FastMCP) -> None:
             raw_results = inline.get("results", [])
             out = []
             for r in raw_results:
-                out.append({
+                entry = {
                     "block_id": r.get("block_id", ""),
                     "document_id": r.get("doc_id", ""),
                     "document_title": r.get("doc_title", ""),
                     "text": r.get("text_preview", ""),
                     "similarity_score": r.get("score"),
-                })
+                }
+                r_tags = r.get("tags", [])
+                if r_tags:
+                    entry["tags"] = r_tags
+                out.append(entry)
             return out
 
         if result.get("status") == "failed":
@@ -517,6 +524,7 @@ def register_search_tools(server: FastMCP) -> None:
         ctx: Optional[Context],
         doc_titles: dict[str, str],
         use_regex: bool = False,
+        tags_filter: Optional[list[str]] = None,
     ) -> list[dict]:
         """Run lexical content search via SPARQL job queue.
 
@@ -546,6 +554,12 @@ def register_search_tools(server: FastMCP) -> None:
             doc_uri_prefix = f"{graph_uri}:doc:{safe_doc_filter}"
             doc_filter_clause = f'\n    FILTER(STRSTARTS(STR(?block), "{doc_uri_prefix}"))'
 
+        # Optional tag filter — require blocks to have at least one matching tag
+        tag_filter_clause = ""
+        if tags_filter:
+            tag_values = " ".join(f'"{_escape_sparql_string(t)}"' for t in tags_filter)
+            tag_filter_clause = f'\n    ?block doc:hasTag ?tag .\n    FILTER(?tag IN ({tag_values}))'
+
         # Join TextNodes → parent block (via doc:childNode+) to get
         # the addressable block ID (doc:nodeId) alongside content.
         sparql = (
@@ -556,7 +570,7 @@ def register_search_tools(server: FastMCP) -> None:
             '    ?block doc:nodeId ?blockId .\n'
             '    ?block doc:childNode+ ?textNode .\n'
             '    ?textNode doc:content ?text .\n'
-            f'    {filter_clause}{doc_filter_clause}\n'
+            f'    {filter_clause}{doc_filter_clause}{tag_filter_clause}\n'
             '}\n'
             f'LIMIT {limit}'
         )
@@ -638,6 +652,9 @@ def register_search_tools(server: FastMCP) -> None:
             "**Batch mode:** Pass `queries` (list of strings) instead of `query` to search "
             "multiple terms in a single call. Results are merged and deduplicated across all "
             "queries. Much more efficient than multiple individual calls.\n\n"
+            "**Tag filtering:** Pass `tags` (list of strings) to filter results to blocks "
+            "that have at least one matching tag. Tags are categorical metadata on blocks "
+            "(e.g. decision, tension, todo, pragma, or custom tags).\n\n"
             "Use this for finding content across documents. For finding documents by title, "
             "use search_documents instead."
         ),
@@ -650,6 +667,7 @@ def register_search_tools(server: FastMCP) -> None:
         mode: str = "hybrid",
         limit: int = 30,
         doc_filter: Optional[str] = None,
+        tags: Optional[list[str]] = None,
         context: Context | None = None,
     ) -> str:
         """Search for content blocks across documents."""
@@ -676,6 +694,7 @@ def register_search_tools(server: FastMCP) -> None:
         graph_id = graph_id.strip()
         limit = min(max(limit, 1), 100)
         doc_filter = doc_filter.strip() if doc_filter else None
+        tags_filter = [t.strip().lstrip("#") for t in tags if t and t.strip()] if tags else None
 
         # Build doc title lookup + known doc IDs from workspace
         doc_titles: dict[str, str] = {}
@@ -704,6 +723,7 @@ def register_search_tools(server: FastMCP) -> None:
             if mode in ("hybrid", "lexical"):
                 task = asyncio.create_task(_run_lexical_search(
                     graph_id, q, limit, doc_filter, auth, None, doc_titles, use_regex,
+                    tags_filter=tags_filter,
                 ))
                 all_tasks.append(task)
                 task_labels.append((q, "lexical"))
@@ -711,6 +731,7 @@ def register_search_tools(server: FastMCP) -> None:
             if mode in ("hybrid", "semantic"):
                 task = asyncio.create_task(_run_semantic_search(
                     graph_id, q, limit, doc_filter, auth, None,
+                    tags_filter=tags_filter,
                 ))
                 all_tasks.append(task)
                 task_labels.append((q, "semantic"))
