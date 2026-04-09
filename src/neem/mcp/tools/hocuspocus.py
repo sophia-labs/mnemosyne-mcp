@@ -2464,6 +2464,62 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             if folder_id:
                 result["folder_id"] = folder_id
 
+            # Tag counts (root-level only, best-effort)
+            if not folder_id and backend_config and job_stream:
+                try:
+                    user_id = auth.user_id or (get_user_id_from_token(auth.token) if auth.token else None)
+                    if user_id:
+                        graph_uri = f"urn:mnemosyne:user:{user_id}:graph:{graph_id}"
+                        tag_sparql = (
+                            'PREFIX doc: <http://mnemosyne.dev/doc#>\n'
+                            f'SELECT ?tag (COUNT(DISTINCT ?block) AS ?count)\n'
+                            f'FROM <{graph_uri}>\n'
+                            'WHERE { ?block doc:hasTag ?tag }\n'
+                            'GROUP BY ?tag\n'
+                            'ORDER BY DESC(?count)\n'
+                            'LIMIT 50'
+                        )
+                        tag_job_meta = await submit_job(
+                            base_url=backend_config.base_url,
+                            auth=auth,
+                            task_type="run_query",
+                            payload={"sparql": tag_sparql, "result_format": "json", "graph_id": graph_id},
+                        )
+                        ws_events, poll_payload = await await_job_completion(
+                            job_stream, tag_job_meta, auth, timeout=10.0,
+                        )
+                        # Extract inline result from events or poll
+                        tag_inline = None
+                        if ws_events:
+                            for event in reversed(ws_events):
+                                payload = event.get("payload", {})
+                                if isinstance(payload, dict):
+                                    detail = payload.get("detail", {})
+                                    if isinstance(detail, dict):
+                                        tag_inline = detail.get("result_inline")
+                                        if tag_inline:
+                                            break
+                        if not tag_inline and isinstance(poll_payload, dict):
+                            tag_inline = poll_payload.get("result_inline")
+
+                        if tag_inline and isinstance(tag_inline, dict):
+                            bindings = tag_inline.get("results", {}).get("bindings", [])
+                            tag_counts = {}
+                            for b in bindings:
+                                tag_val = b.get("tag", {})
+                                count_val = b.get("count", {})
+                                tag = tag_val.get("value", "") if isinstance(tag_val, dict) else str(tag_val or "")
+                                count = count_val.get("value", "0") if isinstance(count_val, dict) else str(count_val or "0")
+                                if tag:
+                                    try:
+                                        tag_counts[tag] = int(count)
+                                    except (ValueError, TypeError):
+                                        tag_counts[tag] = 0
+                            if tag_counts:
+                                result["tags"] = tag_counts
+                except Exception:
+                    pass  # Tag counts are best-effort
+
             # Surface dream journal if it exists (root-level only)
             if not folder_id:
                 dj_id = f"{graph_id}-dream-journal"

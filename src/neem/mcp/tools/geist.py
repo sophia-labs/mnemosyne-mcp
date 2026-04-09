@@ -1477,7 +1477,10 @@ def register_geist_tools(server: FastMCP) -> None:
             "Scoring criteria are defined in the graph's valuation config (see get_values). "
             "The importance and valence prompts can evolve over time.\n\n"
             "Wires express relationships between things; valuation expresses the agent's "
-            "judgment about a single thing. Use both."
+            "judgment about a single thing. Use both.\n\n"
+            "**Tags:** Pass `tags` (list of strings) to tag the block in the same gesture as "
+            "valuing it. Tags are categorical metadata (e.g. decision, tension, todo, pragma). "
+            "In batch mode, include tags in each entry dict."
         ),
     )
     @resolve_home_graph
@@ -1487,6 +1490,7 @@ def register_geist_tools(server: FastMCP) -> None:
         block_id: Optional[str] = None,
         importance: Optional[int] = None,
         valence: Optional[int] = None,
+        tags: Optional[list[str]] = None,
         valuations: list[dict[str, Any]] | None = None,
         context: Context | None = None,
     ) -> str:
@@ -1508,21 +1512,83 @@ def register_geist_tools(server: FastMCP) -> None:
                 raise ValueError("valuations list must not be empty")
             entries_input = valuations
         elif document_id is not None and block_id is not None:
-            if importance is None and valence is None:
-                raise ValueError("At least one of importance (0-5) or valence (-5 to +5) must be provided")
-            entries_input = [{"document_id": document_id, "block_id": block_id,
-                             "importance": importance, "valence": valence}]
+            if importance is None and valence is None and not tags:
+                raise ValueError("At least one of importance (0-5), valence (-5 to +5), or tags must be provided")
+            entry: dict = {"document_id": document_id, "block_id": block_id,
+                           "importance": importance, "valence": valence}
+            if tags:
+                entry["tags"] = [t.strip().lstrip("#").lower() for t in tags if t and t.strip()]
+            entries_input = [entry]
         else:
             raise ValueError("Either 'document_id' and 'block_id' (single) or 'valuations' (batch) is required")
 
         is_single = valuations is None
 
-        url = f"{backend_config.base_url}/salience/{graph_id}/blocks/value"
-        resp = await get_http_client().post(
-            url, json={"valuations": entries_input}, headers=auth.http_headers(),
-        )
-        resp.raise_for_status()
-        output = resp.json()
+        # Separate tag entries from valuation entries
+        tag_entries: list[dict] = []
+        valuation_entries: list[dict] = []
+        for e in entries_input:
+            entry_tags = e.pop("tags", None)
+            if entry_tags:
+                tag_entries.append({
+                    "document_id": e.get("document_id", ""),
+                    "block_id": e.get("block_id", ""),
+                    "tags": [t.strip().lstrip("#").lower() for t in entry_tags if t] if isinstance(entry_tags, list) else [],
+                })
+            # Only send to valuation API if importance or valence is set
+            if e.get("importance") is not None or e.get("valence") is not None:
+                valuation_entries.append(e)
+
+        # Apply valuations via backend API
+        output: dict = {}
+        if valuation_entries:
+            url = f"{backend_config.base_url}/salience/{graph_id}/blocks/value"
+            resp = await get_http_client().post(
+                url, json={"valuations": valuation_entries}, headers=auth.http_headers(),
+            )
+            resp.raise_for_status()
+            output = resp.json()
+
+        # Apply tags via CRDT attributes
+        if tag_entries and hp_client:
+            import json as _json
+            user_id = auth.user_id or None
+            tags_applied = 0
+            for te in tag_entries:
+                doc_id = te["document_id"]
+                bid = te["block_id"]
+                new_tags = te["tags"]
+                if not doc_id or not bid or not new_tags:
+                    continue
+                try:
+                    await hp_client.connect_document(graph_id, doc_id, user_id=user_id)
+                    channel = hp_client.get_document_channel(graph_id, doc_id, user_id=user_id)
+                    if not channel:
+                        continue
+                    from neem.hocuspocus import DocumentWriter
+                    writer = DocumentWriter(channel.doc)
+                    result_find = writer.find_block_by_id(bid)
+                    if result_find is None:
+                        continue
+                    _idx, elem = result_find
+                    existing_raw = elem.attributes.get("data-tags")
+                    existing_tags: list[str] = []
+                    if existing_raw:
+                        try:
+                            parsed = _json.loads(existing_raw)
+                            if isinstance(parsed, list):
+                                existing_tags = [str(t) for t in parsed if t]
+                        except (_json.JSONDecodeError, TypeError):
+                            pass
+                    merged = list(dict.fromkeys(existing_tags + new_tags))
+                    writer.update_block_attributes(bid, {"data-tags": _json.dumps(merged)})
+                    tags_applied += 1
+                except Exception as e:
+                    logger.warning("value_tool_tag_failed", extra_context={
+                        "block_id": bid, "document_id": doc_id, "error": str(e),
+                    })
+            if tags_applied:
+                output["tags_applied"] = tags_applied
 
         # Single mode: return flat result or raise on error
         if is_single:
@@ -1531,6 +1597,9 @@ def register_geist_tools(server: FastMCP) -> None:
             results = output.get("results", [])
             if results:
                 return _render_json(results[0])
+            # Tags-only call (no valuation) — return tag result
+            if not valuation_entries and output.get("tags_applied"):
+                return _render_json(output)
 
         return _render_json(output)
 
