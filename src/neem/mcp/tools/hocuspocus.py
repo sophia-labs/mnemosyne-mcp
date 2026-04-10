@@ -3631,6 +3631,8 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         context: Context | None = None,
     ) -> dict:
         """Query blocks matching specific criteria, with optional batch mode."""
+        if os.environ.get("DISABLE_QUERY_BLOCKS", "").lower() in ("1", "true", "yes"):
+            raise RuntimeError("query_blocks is currently disabled")
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
