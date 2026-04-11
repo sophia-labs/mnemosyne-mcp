@@ -223,9 +223,10 @@ class HocuspocusClient:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         effective_user_id = user_id or self._dev_user_id
-        # Never combine X-User-ID with internal service auth. Platform-side
-        # internal-service auth now rejects caller-asserted user headers.
-        if effective_user_id and _allow_forwarded_user_id_header() and not self._internal_service_secret:
+        # Forward X-User-ID for sidecar/hosted modes so the API knows which
+        # user to act as. Combined with internal service secret, this is a
+        # trusted in-cluster identity assertion.
+        if effective_user_id and _allow_forwarded_user_id_header():
             headers["X-User-ID"] = effective_user_id
         # Add internal service auth header for cluster-internal requests
         if self._internal_service_secret and _allow_internal_service_auth():
