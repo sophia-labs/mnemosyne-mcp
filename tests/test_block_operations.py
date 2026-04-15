@@ -427,12 +427,13 @@ class TestEdgeCases:
         reader = DocumentReader(empty_doc)
 
         # Add block without explicit ID
-        writer.append_block('<paragraph>Test</paragraph>')
+        returned_id = writer.append_block('<paragraph>Test</paragraph>')
 
         block = reader.get_block_at(0)
         block_id = block.attributes.get("data-block-id")
 
         assert block_id is not None
+        assert returned_id == block_id
         assert block_id.startswith("block-")
         assert len(block_id) == 14  # "block-" + 8 hex chars
 
@@ -465,6 +466,42 @@ class TestEdgeCases:
 
         assert len(results) == 1
         assert results[0]["attributes"]["listType"] == "bullet"
+
+    def test_get_block_info_for_query_block_uses_query_text(self):
+        """Query blocks should expose their SPARQL as readable text."""
+        doc = pycrdt.Doc()
+        writer = DocumentWriter(doc)
+        writer.replace_all_content(
+            '<queryBlock query="SELECT ?s WHERE {&#10;  ?s ?p ?o .&#10;}&#10;LIMIT 5" '
+            'visualization="network" comment="Neighbors"/>'
+        )
+
+        reader = DocumentReader(doc)
+        block = reader.get_block_at(0)
+        block_id = block.attributes.get("data-block-id")
+
+        info = reader.get_block_info(block_id)
+        assert info is not None
+        assert info["type"] == "queryBlock"
+        assert "SELECT ?s WHERE {" in info["text_content"]
+        assert "LIMIT 5" in info["text_content"]
+        assert info["text_length"] == len(info["text_content"])
+
+    def test_query_blocks_matches_query_block_text_preview(self):
+        """query_blocks text filters should work for query blocks."""
+        doc = pycrdt.Doc()
+        writer = DocumentWriter(doc)
+        writer.replace_all_content(
+            '<paragraph>Intro</paragraph>'
+            '<queryBlock query="SELECT ?friend WHERE { ?person &lt;http://example.com/friend&gt; ?friend . }" '
+            'visualization="network"/>'
+        )
+
+        reader = DocumentReader(doc)
+        matches = reader.query_blocks(block_type="queryBlock", text_contains="friend")
+        assert len(matches) == 1
+        assert matches[0]["type"] == "queryBlock"
+        assert "friend" in matches[0]["text_preview"]
 
 
 if __name__ == "__main__":

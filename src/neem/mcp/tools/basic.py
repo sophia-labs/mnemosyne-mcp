@@ -18,6 +18,7 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from neem.mcp.auth import MCPAuthContext
 from neem.mcp.jobs import JobSubmitMetadata, RealtimeJobClient, WebSocketConnectionError
+from neem.mcp.progress import safe_report_progress
 from neem.mcp.trace import trace, trace_separator
 from neem.utils.logging import LoggerFactory
 
@@ -114,8 +115,7 @@ def register_basic_tools(server: FastMCP) -> None:
             "links.websocket": metadata.links.websocket,
         })
 
-        if context:
-            await context.report_progress(10, 100)
+        await safe_report_progress(context, 10, 100)
 
         # Race WS streaming against HTTP polling
         trace("Step 4: Racing WS + poll concurrently")
@@ -123,8 +123,7 @@ def register_basic_tools(server: FastMCP) -> None:
             job_stream, metadata, auth, timeout=RACE_TIMEOUT_SECONDS,
         )
 
-        if context:
-            await context.report_progress(80, 100)
+        await safe_report_progress(context, 80, 100)
 
         # Try to extract graphs from WebSocket events first
         if ws_events:
@@ -135,8 +134,7 @@ def register_basic_tools(server: FastMCP) -> None:
             if graphs is not None:
                 graphs = _filter_deleted_graphs(graphs, include_deleted)
                 trace("SUCCESS: Got %d graphs from WS events" % len(graphs))
-                if context:
-                    await context.report_progress(100, 100)
+                await safe_report_progress(context, 100, 100)
                 return _render_json({"graphs": graphs, "count": len(graphs)})
             trace("WARN: Could not extract graphs from WS events")
 
@@ -147,12 +145,10 @@ def register_basic_tools(server: FastMCP) -> None:
             if graphs is not None:
                 graphs = _filter_deleted_graphs(graphs, include_deleted)
                 trace("SUCCESS: Got %d graphs from polling" % len(graphs))
-                if context:
-                    await context.report_progress(100, 100)
+                await safe_report_progress(context, 100, 100)
                 return _render_json({"graphs": graphs, "count": len(graphs)})
 
-        if context:
-            await context.report_progress(100, 100)
+        await safe_report_progress(context, 100, 100)
 
         # Fallback: return error with debug info
         trace("FAIL: Could not extract graphs from any source")

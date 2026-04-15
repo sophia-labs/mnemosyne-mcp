@@ -65,7 +65,12 @@ class MCPAuthContext:
         # 1. Try HTTP request context (sidecar mode)
         # When OpenCode calls MCP via HTTP with mcpAuth, headers are available
         if ctx is not None:
-            request_context = getattr(ctx, "request_context", None)
+            try:
+                request_context = getattr(ctx, "request_context", None)
+            except ValueError:
+                # FastMCP exposes a Context object even for direct in-process tool
+                # calls, but request_context is unavailable outside a live request.
+                request_context = None
             if request_context is not None:
                 request = getattr(request_context, "request", None)
                 if request is not None:

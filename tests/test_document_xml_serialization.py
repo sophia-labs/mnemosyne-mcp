@@ -34,3 +34,23 @@ def test_block_indent_serializes_back_to_data_indent() -> None:
     out = _roundtrip(xml)
     assert 'data-indent="2"' in out
     assert "<paragraph" in out
+
+
+def test_query_block_attributes_roundtrip_with_escaping() -> None:
+    xml = (
+        '<queryBlock '
+        'query="SELECT ?s WHERE {&#10;  FILTER(?label = &quot;garden&quot;)&#10;}&#10;LIMIT 5" '
+        'visualization="network" '
+        'displayMode="agent" '
+        'maxRows="25" '
+        'comment="Preview the graph"'
+        '/>'
+    )
+    out = _roundtrip(xml)
+    assert "<queryBlock" in out
+    assert 'visualization="network"' in out
+    assert 'displayMode="agent"' in out
+    assert 'maxRows="25"' in out
+    assert 'comment="Preview the graph"' in out
+    assert "&#10;" in out
+    assert "&quot;garden&quot;" in out

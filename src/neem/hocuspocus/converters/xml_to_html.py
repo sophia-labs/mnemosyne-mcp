@@ -41,6 +41,7 @@ HORIZONTAL_RULE_TAG = "horizontalRule"
 BULLET_LIST_TAG = "bulletList"
 ORDERED_LIST_TAG = "orderedList"
 TASK_LIST_TAG = "taskList"
+QUERY_BLOCK_TAG = "queryBlock"
 TABLE_TAG = "table"
 TABLE_ROW_TAG = "tableRow"
 TABLE_HEADER_TAG = "tableHeader"
@@ -415,6 +416,9 @@ def _convert_block(
     if tag == HORIZONTAL_RULE_TAG:
         return f"<hr{bid} />"
 
+    if tag == QUERY_BLOCK_TAG:
+        return _convert_query_block(elem, include_ids)
+
     if tag in (BULLET_LIST_TAG, ORDERED_LIST_TAG, TASK_LIST_TAG):
         # Wrapper list element — convert children
         items = "\n".join(
@@ -459,6 +463,30 @@ def _convert_block(
     if content:
         return f"<p{bid}>{content}</p>"
     return ""
+
+
+def _convert_query_block(elem: ET.Element, include_ids: bool) -> str:
+    """Render a queryBlock as a structured read-only HTML block."""
+    bid = _block_id_attr(elem, include_ids)
+    comment = (elem.get("comment") or "").strip()
+    query = html.escape(elem.get("query") or "")
+    visualization = html.escape(elem.get("visualization") or "table")
+    display_mode = html.escape(elem.get("displayMode") or "auto")
+
+    comment_html = (
+        f'<p class="query-block-comment">{html.escape(comment)}</p>\n'
+        if comment else ""
+    )
+
+    return (
+        f'<section class="query-block" data-visualization="{visualization}" '
+        f'data-display-mode="{display_mode}"{bid}>\n'
+        f"{comment_html}"
+        '<pre class="query-block-query"><code class="language-sparql">'
+        f"{query}"
+        "</code></pre>\n"
+        "</section>"
+    )
 
 
 # ---------------------------------------------------------------------------

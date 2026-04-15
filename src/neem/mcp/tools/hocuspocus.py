@@ -28,6 +28,21 @@ from neem.hocuspocus.converters import looks_like_markdown, markdown_to_tiptap_x
 from neem.hocuspocus.document import extract_title_from_xml
 from neem.mcp.auth import MCPAuthContext
 from neem.mcp.jobs import RealtimeJobClient
+from neem.mcp.progress import safe_report_progress
+from neem.mcp.query_blocks import (
+    available_query_block_visualizations,
+    build_query_block_xml,
+    extract_query_block_network_data,
+    extract_query_block_stat_value,
+    extract_query_block_triples,
+    generate_auto_vega_spec,
+    infer_query_block_query_kind,
+    normalize_query_block_attrs,
+    normalize_query_result,
+    preferred_query_block_result_format,
+    profile_query_block_result,
+    resolve_query_block_display,
+)
 from neem.mcp.tools.basic import await_job_completion, submit_job
 from neem.mcp.tools.wire_tools import _get_wires_for_document, _get_predicate_short_name
 from neem.utils.logging import LoggerFactory
@@ -662,6 +677,165 @@ GROUP BY ?docId
                 f"Document '{title}' ({document_id}) is read-only. "
                 f"Use make_document_editable to remove the read-only flag before editing."
             )
+
+    def _extract_query_result_from_completion(
+        ws_events: Optional[list[Dict[str, Any]]],
+        poll_payload: Optional[Dict[str, Any]],
+    ) -> Any:
+        """Extract a query result payload from a completed run_query job."""
+        failure_error: Optional[str] = None
+
+        if ws_events:
+            for event in reversed(ws_events):
+                event_type = event.get("type", "")
+                payload = event.get("payload", {})
+                payload_status = payload.get("status", "") if isinstance(payload, dict) else ""
+
+                is_success = (
+                    event_type in ("job_completed", "completed", "succeeded")
+                    or (event_type == "job_update" and payload_status == "succeeded")
+                )
+                is_failure = (
+                    event_type in ("failed", "error")
+                    or (event_type == "job_update" and payload_status == "failed")
+                )
+
+                if is_failure:
+                    if isinstance(payload, dict):
+                        failure_error = payload.get("error") or failure_error
+                    failure_error = event.get("error") or failure_error or "Query job failed"
+                    continue
+
+                if not is_success:
+                    continue
+
+                inline: Any = None
+                if isinstance(payload, dict):
+                    detail = payload.get("detail")
+                    if isinstance(detail, dict) and detail.get("result_inline") is not None:
+                        inline = detail.get("result_inline")
+                    elif payload.get("result_inline") is not None:
+                        inline = payload.get("result_inline")
+                if inline is None and event.get("result_inline") is not None:
+                    inline = event.get("result_inline")
+
+                if isinstance(inline, dict) and "raw" in inline:
+                    return inline["raw"]
+                if inline is not None:
+                    return inline
+
+        if poll_payload:
+            status = str(poll_payload.get("status", "")).lower()
+            if status == "failed":
+                detail = poll_payload.get("detail")
+                detail_error = detail.get("error") if isinstance(detail, dict) else None
+                raise RuntimeError(str(poll_payload.get("error") or detail_error or failure_error or "Query job failed"))
+
+            detail = poll_payload.get("detail")
+            if isinstance(detail, dict):
+                inline = detail.get("result_inline")
+                if isinstance(inline, dict) and "raw" in inline:
+                    return inline["raw"]
+                if inline is not None:
+                    return inline
+
+        if failure_error:
+            raise RuntimeError(failure_error)
+
+        raise RuntimeError("Query job completed without a usable result")
+
+    async def _execute_query_block_preview(
+        graph_id: str,
+        query: str,
+        max_rows: int,
+        auth: MCPAuthContext,
+        *,
+        context: Context | None = None,
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Run a query block through the backend query path and shape the result."""
+        graph_id = graph_id.strip()
+        query = query.strip()
+        query_kind = infer_query_block_query_kind(query)
+        result_format = preferred_query_block_result_format(query_kind)
+        payload: Dict[str, Any] = {
+            "sparql": query,
+            "result_format": result_format,
+            "graph_id": graph_id,
+        }
+        if query_kind == "select":
+            payload["max_rows"] = max_rows
+
+        if job_stream:
+            try:
+                await job_stream.ensure_ready()
+            except Exception:
+                pass
+
+        started_at = datetime.now(timezone.utc)
+        metadata = await submit_job(
+            base_url=backend_config.base_url,
+            auth=auth,
+            task_type="run_query",
+            payload=payload,
+        )
+
+        await safe_report_progress(context, 15, 100)
+
+        ws_events, poll_payload = await await_job_completion(
+            job_stream, metadata, auth, timeout=30.0,
+        )
+
+        raw = _extract_query_result_from_completion(ws_events, poll_payload)
+        duration_ms = max(
+            0,
+            int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000),
+        )
+        media_type = "application/n-quads" if result_format == "nq" else "application/sparql-results+json"
+        result = normalize_query_result(raw, query_kind, duration_ms, media_type)
+        profile = profile_query_block_result(result)
+
+        await safe_report_progress(context, 100, 100)
+
+        return result, profile
+
+    async def _read_query_block_state(
+        graph_id: str,
+        document_id: str,
+        block_id: str,
+        auth: MCPAuthContext,
+        *,
+        tool_name: str,
+    ) -> Dict[str, Any]:
+        """Read and normalize a queryBlock from a document."""
+        await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id, auth=auth)
+
+        document_doc, _ = await _load_document_doc_for_read(
+            graph_id.strip(),
+            document_id.strip(),
+            auth.user_id,
+            auth=auth,
+            tool_name=tool_name,
+        )
+        reader = DocumentReader(document_doc)
+        block_info = reader.get_block_info(block_id.strip())
+        if block_info is None:
+            raise RuntimeError(f"Block '{block_id}' not found in document '{document_id}'.")
+        if block_info.get("type") != "queryBlock":
+            raise RuntimeError(
+                f"Block '{block_id}' is type '{block_info.get('type')}', not 'queryBlock'."
+            )
+
+        raw_attributes = block_info.get("attributes", {})
+        return {
+            "graph_id": graph_id.strip(),
+            "document_id": document_id.strip(),
+            "block_id": block_id.strip(),
+            "type": "queryBlock",
+            "attrs": normalize_query_block_attrs(raw_attributes if isinstance(raw_attributes, dict) else {}),
+            "raw_attributes": raw_attributes,
+            "xml": block_info.get("xml"),
+            "context": block_info.get("context"),
+        }
 
     # ------------------------------------------------------------------
     # Helper: connect a document for reading (with TTL + retry)
@@ -3627,6 +3801,318 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 },
             )
             raise RuntimeError(f"Failed to insert blocks: {e}")
+
+    @server.tool(
+        name="get_query_block",
+        title="Get Query Block",
+        description=(
+            "Read a queryBlock by block ID and return its normalized attrs, XML, and "
+            "document context. Use this instead of get_block when you want a query-block-"
+            "specific response shape."
+        ),
+    )
+    async def get_query_block_tool(
+        graph_id: str,
+        document_id: str,
+        block_id: str,
+        context: Context | None = None,
+    ) -> dict:
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        try:
+            query_block = await _read_query_block_state(
+                graph_id,
+                document_id,
+                block_id,
+                auth,
+                tool_name="get_query_block",
+            )
+            return {"query_block": query_block}
+        except Exception as e:
+            logger.error(
+                "Failed to get query block",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "block_id": block_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to get query block: {e}")
+
+    @server.tool(
+        name="insert_query_block",
+        title="Insert Query Block",
+        description=(
+            "Insert a queryBlock into a document. The block stores query attrs only; results "
+            "are not persisted. Use block_id/index/position to place it, or omit positioning "
+            "to append at the end."
+        ),
+    )
+    async def insert_query_block_tool(
+        graph_id: str,
+        document_id: str,
+        query: str,
+        comment: str = "",
+        display_mode: str = "auto",
+        visualization: str = "table",
+        max_rows: int = 100,
+        vega_lite_spec: str = "",
+        collapsed: bool = False,
+        block_id: Optional[str] = None,
+        index: Optional[int] = None,
+        position: str = "after",
+        context: Context | None = None,
+    ) -> dict:
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        try:
+            attrs = normalize_query_block_attrs({
+                "query": query,
+                "comment": comment,
+                "displayMode": display_mode,
+                "visualization": visualization,
+                "maxRows": max_rows,
+                "vegaLiteSpec": vega_lite_spec,
+                "collapsed": collapsed,
+            })
+            xml = build_query_block_xml(attrs)
+            inserted = await insert_blocks_tool(
+                graph_id=graph_id,
+                document_id=document_id,
+                content=xml,
+                block_id=block_id,
+                index=index,
+                position=position,
+                context=context,
+            )
+            block_ids = inserted.get("block_ids", [])
+            if len(block_ids) != 1:
+                raise RuntimeError(f"Expected one inserted query block, got {len(block_ids)}")
+
+            query_block = await _read_query_block_state(
+                graph_id,
+                document_id,
+                block_ids[0],
+                auth,
+                tool_name="insert_query_block",
+            )
+            return {
+                "success": True,
+                "block_id": block_ids[0],
+                "query_block": query_block,
+            }
+        except Exception as e:
+            logger.error(
+                "Failed to insert query block",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to insert query block: {e}")
+
+    @server.tool(
+        name="update_query_block",
+        title="Update Query Block",
+        description=(
+            "Patch a queryBlock's attrs by block ID. Only provided fields are changed. "
+            "This replaces the block's XML atomically while preserving the existing block ID."
+        ),
+    )
+    async def update_query_block_tool(
+        graph_id: str,
+        document_id: str,
+        block_id: str,
+        query: Optional[str] = None,
+        comment: Optional[str] = None,
+        display_mode: Optional[str] = None,
+        visualization: Optional[str] = None,
+        max_rows: Optional[int] = None,
+        vega_lite_spec: Optional[str] = None,
+        collapsed: Optional[bool] = None,
+        context: Context | None = None,
+    ) -> dict:
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        patch: Dict[str, Any] = {}
+        if query is not None:
+            patch["query"] = query
+        if comment is not None:
+            patch["comment"] = comment
+        if display_mode is not None:
+            patch["displayMode"] = display_mode
+        if visualization is not None:
+            patch["visualization"] = visualization
+        if max_rows is not None:
+            patch["maxRows"] = max_rows
+        if vega_lite_spec is not None:
+            patch["vegaLiteSpec"] = vega_lite_spec
+        if collapsed is not None:
+            patch["collapsed"] = collapsed
+
+        if not patch:
+            raise RuntimeError("Provide at least one query block field to update")
+
+        try:
+            current = await _read_query_block_state(
+                graph_id,
+                document_id,
+                block_id,
+                auth,
+                tool_name="update_query_block",
+            )
+            next_attrs = normalize_query_block_attrs({**current["attrs"], **patch})
+            xml = build_query_block_xml(next_attrs, block_id=block_id)
+
+            await update_blocks_tool(
+                graph_id=graph_id,
+                document_id=document_id,
+                block_id=block_id,
+                xml_content=xml,
+                context=context,
+            )
+
+            query_block = await _read_query_block_state(
+                graph_id,
+                document_id,
+                block_id,
+                auth,
+                tool_name="update_query_block",
+            )
+            return {
+                "success": True,
+                "block_id": block_id,
+                "query_block": query_block,
+            }
+        except Exception as e:
+            logger.error(
+                "Failed to update query block",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "block_id": block_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to update query block: {e}")
+
+    @server.tool(
+        name="preview_query_block",
+        title="Preview Query Block",
+        description=(
+            "Run a queryBlock's query without persisting results. You can preview an existing "
+            "block via block_id, or preview an ad hoc query by passing query directly. Returns "
+            "normalized query results, profile heuristics, resolved display, and derived network/"
+            "Vega suggestions."
+        ),
+    )
+    async def preview_query_block_tool(
+        graph_id: str,
+        document_id: Optional[str] = None,
+        block_id: Optional[str] = None,
+        query: Optional[str] = None,
+        comment: Optional[str] = None,
+        display_mode: Optional[str] = None,
+        visualization: Optional[str] = None,
+        max_rows: Optional[int] = None,
+        vega_lite_spec: Optional[str] = None,
+        collapsed: Optional[bool] = None,
+        context: Context | None = None,
+    ) -> dict:
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        if block_id is None and query is None:
+            raise RuntimeError("Provide either block_id or query")
+        if block_id is not None and not document_id:
+            raise RuntimeError("document_id is required when previewing an existing query block")
+
+        try:
+            base_attrs: Dict[str, Any]
+            existing_block: Optional[Dict[str, Any]] = None
+            if block_id is not None:
+                existing_block = await _read_query_block_state(
+                    graph_id,
+                    document_id or "",
+                    block_id,
+                    auth,
+                    tool_name="preview_query_block",
+                )
+                base_attrs = dict(existing_block["attrs"])
+            else:
+                base_attrs = normalize_query_block_attrs()
+
+            overrides: Dict[str, Any] = {}
+            if query is not None:
+                overrides["query"] = query
+            if comment is not None:
+                overrides["comment"] = comment
+            if display_mode is not None:
+                overrides["displayMode"] = display_mode
+            if visualization is not None:
+                overrides["visualization"] = visualization
+            if max_rows is not None:
+                overrides["maxRows"] = max_rows
+            if vega_lite_spec is not None:
+                overrides["vegaLiteSpec"] = vega_lite_spec
+            if collapsed is not None:
+                overrides["collapsed"] = collapsed
+
+            attrs = normalize_query_block_attrs({**base_attrs, **overrides})
+            result, profile = await _execute_query_block_preview(
+                graph_id,
+                attrs["query"],
+                attrs["maxRows"],
+                auth,
+                context=context,
+            )
+
+            resolved_display = resolve_query_block_display(
+                attrs["visualization"],
+                result,
+                display_mode=attrs["displayMode"],
+                profile=profile,
+            )
+            auto_vega_spec = generate_auto_vega_spec(result, profile)
+            effective_vega_spec = attrs["vegaLiteSpec"] or auto_vega_spec
+            network_data = extract_query_block_network_data(result, profile)
+            triples = extract_query_block_triples(result, profile)
+            stat = extract_query_block_stat_value(result, profile)
+
+            return {
+                "query_block": {
+                    "graph_id": graph_id.strip(),
+                    **({"document_id": document_id.strip()} if document_id else {}),
+                    **({"block_id": block_id.strip()} if block_id else {}),
+                    "attrs": attrs,
+                },
+                **({"existing_block": existing_block} if existing_block is not None else {}),
+                "result": result,
+                "profile": profile,
+                "resolved_display": resolved_display,
+                "available_visualizations": available_query_block_visualizations(result, profile),
+                "stat": stat,
+                "triples": triples,
+                "network_data": network_data,
+                "auto_vega_spec": auto_vega_spec,
+                "effective_vega_spec": effective_vega_spec,
+            }
+        except Exception as e:
+            logger.error(
+                "Failed to preview query block",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "block_id": block_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to preview query block: {e}")
 
     @server.tool(
         name="delete_blocks",

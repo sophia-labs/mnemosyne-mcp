@@ -135,6 +135,15 @@ BLOCK_ATTR_MAP: dict[str, dict[str, str]] = {
         "checked": "checked",     # Pass through (for task items)
         "collapsed": "collapsed", # Pass through
     },
+    "queryBlock": {
+        "comment": "comment",
+        "query": "query",
+        "displayMode": "displayMode",
+        "visualization": "visualization",
+        "maxRows": "maxRows",
+        "vegaLiteSpec": "vegaLiteSpec",
+        "collapsed": "collapsed",
+    },
 }
 
 # Default attributes that TipTap/y-prosemirror expects on block elements.
@@ -150,6 +159,15 @@ BLOCK_DEFAULTS: dict[str, dict[str, Any]] = {
         "collapsed": False,
         "indent": 0,
         "checked": False,
+    },
+    "queryBlock": {
+        "comment": "",
+        "query": "SELECT ?s ?p ?o WHERE {\n  ?s ?p ?o .\n}\nLIMIT 25",
+        "displayMode": "auto",
+        "visualization": "table",
+        "maxRows": 100,
+        "vegaLiteSpec": "",
+        "collapsed": False,
     },
 }
 
@@ -169,6 +187,7 @@ BLOCK_TYPES = frozenset({
     "blockquote",
     "codeBlock",
     "horizontalRule",
+    "queryBlock",
     "table",
     "tableRow",
     "tableHeader",
@@ -279,6 +298,20 @@ def _escape_xml(text: str) -> str:
     )
 
 
+def _escape_xml_attr(value: Any) -> str:
+    """Escape XML attribute values, preserving newlines and tabs."""
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("\t", "&#9;")
+        .replace("\n", "&#10;")
+        .replace("\r", "&#13;")
+    )
+
+
 def _mark_name_to_xml_tag(mark_name: str) -> str | None:
     """Convert TipTap internal mark name to XML element tag.
 
@@ -315,7 +348,7 @@ def _build_mark_attrs_string(xml_tag: str, mark_attrs: dict[str, Any] | None) ->
         # Map internal name to XML name
         xml_key = attr_map.get(key, key)
         # Escape attribute value
-        escaped_value = str(value).replace('"', "&quot;")
+        escaped_value = _escape_xml_attr(value)
         parts.append(f'{xml_key}="{escaped_value}"')
 
     return " " + " ".join(parts) if parts else ""
@@ -346,7 +379,7 @@ def _map_block_attrs(tag: str, attrs: dict[str, Any]) -> dict[str, Any]:
         # Map the attribute name if there's a mapping, otherwise keep original
         mapped_key = attr_map.get(key, key)
         # Convert numeric attributes from XML strings to integers
-        if mapped_key in ("indent", "level") and value is not None:
+        if mapped_key in ("indent", "level", "maxRows") and value is not None:
             try:
                 value = int(value)
             except (ValueError, TypeError):
@@ -488,7 +521,7 @@ class DocumentReader:
             # Convert floats to ints if they're whole numbers (pycrdt stores ints as floats)
             elif isinstance(value, float) and value == int(value):
                 value = int(value)
-            attrs_parts.append(f'{key}="{value}"')
+            attrs_parts.append(f'{key}="{_escape_xml_attr(value)}"')
 
         attrs_str = " " + " ".join(attrs_parts) if attrs_parts else ""
 
@@ -623,10 +656,8 @@ class DocumentReader:
         attrs = dict(elem.attributes) if hasattr(elem, "attributes") else {}
 
         # Get text content
-        text_content = str(elem) if elem else ""
-        # Strip XML tags for plain text (simple extraction)
-        import re
-        plain_text = re.sub(r"<[^>]+>", "", text_content)
+        serialized_xml = self._serialize_element(elem)
+        plain_text = self._plain_text_for_block(elem, attrs)
 
         # Compute text_length from XmlText children
         text_length = self._compute_text_length(elem)
@@ -635,9 +666,9 @@ class DocumentReader:
             "block_id": block_id,
             "index": index,
             "type": elem.tag if hasattr(elem, "tag") else "unknown",
-            "xml": str(elem),
+            "xml": serialized_xml,
             "attributes": attrs,
-            "text_content": plain_text.strip(),
+            "text_content": plain_text,
             "text_length": text_length,
             "context": {
                 "total_blocks": total,
@@ -735,8 +766,7 @@ class DocumentReader:
                     continue
 
             # Filter by text content
-            text = str(child)
-            plain_text = re.sub(r"<[^>]+>", "", text).strip()
+            plain_text = self._plain_text_for_block(child, attrs)
             if text_contains and text_contains.lower() not in plain_text.lower():
                 continue
 
@@ -780,6 +810,10 @@ class DocumentReader:
         Returns:
             Total character count in the offset space.
         """
+        if hasattr(elem, "tag") and elem.tag == "queryBlock" and hasattr(elem, "attributes"):
+            query = elem.attributes.get("query")
+            return len(query) if isinstance(query, str) else 0
+
         total = 0
         if not hasattr(elem, "children"):
             return 0
@@ -867,6 +901,22 @@ class DocumentReader:
             "has_inline_nodes": has_inline_nodes,
         }
 
+    def _plain_text_for_block(self, elem: Any, attrs: dict[str, Any] | None = None) -> str:
+        """Return the readable text for a block, including custom atom nodes."""
+        import re
+
+        attrs = attrs or (dict(elem.attributes) if hasattr(elem, "attributes") else {})
+        tag = elem.tag if hasattr(elem, "tag") else "unknown"
+
+        if tag == "queryBlock":
+            query = attrs.get("query")
+            if isinstance(query, str):
+                return query.strip()
+            return ""
+
+        serialized = self._serialize_element(elem)
+        return re.sub(r"<[^>]+>", "", serialized).strip()
+
     def get_comments_map(self) -> "pycrdt.Map[dict[str, Any]]":
         """Get the comments Y.Map for this document."""
         return self._doc.get("comments", type=pycrdt.Map)
@@ -920,7 +970,7 @@ class DocumentWriter:
     # Surgical Edit Methods (collaborative-safe)
     # -------------------------------------------------------------------------
 
-    def append_block(self, xml_str: str) -> None:
+    def append_block(self, xml_str: str) -> str:
         """Append a block element to the end of the document.
 
         This is collaborative-safe - it only adds content, never removes.
@@ -961,6 +1011,11 @@ class DocumentWriter:
             },
         )
 
+        new_block_id = elem.get("data-block-id")
+        if not new_block_id:
+            new_block_id = _generate_block_id()
+            elem.set("data-block-id", new_block_id)
+
         with self._doc.transaction():
             # Process element - may return multiple blocks for list containers
             blocks = self._process_element(elem)
@@ -984,6 +1039,7 @@ class DocumentWriter:
                 "content_after": str(fragment)[:500],
             },
         )
+        return new_block_id
 
     # -------------------------------------------------------------------------
     # Character-Level Edit Methods (CRDT-native, collaborative-safe)

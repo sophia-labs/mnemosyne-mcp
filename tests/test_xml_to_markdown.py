@@ -80,6 +80,18 @@ def test_multiple_paragraphs() -> None:
     assert "First\n\nSecond" in result
 
 
+def test_query_block_renders_as_sparql_fence() -> None:
+    xml = (
+        '<queryBlock comment="Show the neighborhood" '
+        'query="SELECT ?s WHERE {&#10;  ?s ?p ?o .&#10;}&#10;LIMIT 5"/>'
+    )
+    result = tiptap_xml_to_markdown(xml)
+    assert "Show the neighborhood" in result
+    assert "```sparql" in result
+    assert "SELECT ?s WHERE {" in result
+    assert "LIMIT 5" in result
+
+
 # ---------------------------------------------------------------------------
 # Inline Marks: Bold
 # ---------------------------------------------------------------------------

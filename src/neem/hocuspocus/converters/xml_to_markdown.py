@@ -38,6 +38,7 @@ HORIZONTAL_RULE_TAG = "horizontalRule"
 BULLET_LIST_TAG = "bulletList"
 ORDERED_LIST_TAG = "orderedList"
 TASK_LIST_TAG = "taskList"
+QUERY_BLOCK_TAG = "queryBlock"
 
 # Inline elements
 FOOTNOTE_TAG = "footnote"
@@ -113,6 +114,9 @@ def _convert_children(
 
         elif tag == HORIZONTAL_RULE_TAG:
             lines.extend(["", "---", ""])
+
+        elif tag == QUERY_BLOCK_TAG:
+            lines.extend(_convert_query_block(elem))
 
         elif tag in (BULLET_LIST_TAG, ORDERED_LIST_TAG, TASK_LIST_TAG):
             # Wrapper elements — descend into children
@@ -205,6 +209,19 @@ def _convert_blockquote(
             quoted.append(f"> {line}")
     quoted.append("")
     return quoted
+
+
+def _convert_query_block(elem: ET.Element) -> list[str]:
+    """Convert a queryBlock to a readable markdown fallback."""
+    lines: list[str] = []
+
+    comment = (elem.get("comment") or "").strip()
+    if comment:
+        lines.extend([comment, ""])
+
+    query = elem.get("query") or ""
+    lines.extend(["```sparql", query, "```", ""])
+    return lines
 
 
 def _list_item_content(

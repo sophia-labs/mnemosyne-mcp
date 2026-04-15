@@ -13,7 +13,8 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from neem.mcp.auth import MCPAuthContext
 from neem.mcp.jobs import JobSubmitMetadata, RealtimeJobClient
-from neem.mcp.tools.basic import await_job_completion, submit_job
+from neem.mcp.progress import safe_report_progress
+from neem.mcp.tools.basic import await_job_completion, poll_job_until_terminal, submit_job
 from neem.mcp.trace import trace
 from neem.utils.logging import LoggerFactory
 from neem.utils.token_storage import get_user_id_from_token
@@ -77,8 +78,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             payload=payload,
         )
 
-        if context:
-            await context.report_progress(10, 100)
+        await safe_report_progress(context, 10, 100)
 
         result = await _wait_for_job_result(
             job_stream, metadata, context, auth
@@ -129,8 +129,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             payload={"graph_id": graph_id.strip(), "hard": hard},
         )
 
-        if context:
-            await context.report_progress(10, 100)
+        await safe_report_progress(context, 10, 100)
 
         result = await _wait_for_job_result(
             job_stream, metadata, context, auth
@@ -223,8 +222,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             },
         )
 
-        if context:
-            await context.report_progress(10, 100)
+        await safe_report_progress(context, 10, 100)
 
         result = await _wait_for_job_result(
             job_stream, metadata, context, auth
@@ -343,8 +341,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             payload={"sparql": sparql, "graph_id": graph_id},
         )
 
-        if context:
-            await context.report_progress(10, 100)
+        await safe_report_progress(context, 10, 100)
 
         result = await _wait_for_job_result(
             job_stream, metadata, context, auth
@@ -400,8 +397,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
             payload=payload,
         )
 
-        if context:
-            await context.report_progress(10, 100)
+        await safe_report_progress(context, 10, 100)
 
         result = await _wait_for_job_result(
             job_stream, metadata, context, auth
@@ -436,8 +432,7 @@ async def _wait_for_job_result(
 
     # Try WS events first
     if ws_events:
-        if context:
-            await context.report_progress(80, 100)
+        await safe_report_progress(context, 80, 100)
         for event in reversed(ws_events):
             event_type = event.get("type", "")
             payload = event.get("payload", {})
@@ -453,8 +448,7 @@ async def _wait_for_job_result(
             )
 
             if is_success:
-                if context:
-                    await context.report_progress(100, 100)
+                await safe_report_progress(context, 100, 100)
                 result: JsonDict = {"status": "succeeded", "events": len(ws_events)}
                 if isinstance(payload, dict):
                     detail = payload.get("detail")
@@ -467,15 +461,24 @@ async def _wait_for_job_result(
         # No terminal event in WS — fall through to poll result
 
     # Try poll result
-    if context:
-        await context.report_progress(100, 100)
+    await safe_report_progress(context, 100, 100)
 
     if poll_payload:
-        status = poll_payload.get("status", "unknown")
+        status = str(poll_payload.get("status", "unknown")).lower()
+        if status not in {"succeeded", "failed"} and metadata.links.status:
+            refreshed = await poll_job_until_terminal(metadata.links.status, auth)
+            if refreshed:
+                poll_payload = refreshed
+                status = str(poll_payload.get("status", "unknown")).lower()
+
         detail = poll_payload.get("detail")
         if status == "failed":
             error = poll_payload.get("error") or (detail.get("error") if isinstance(detail, dict) else None)
             return {"status": "failed", "error": error}
+        if status != "succeeded":
+            raise RuntimeError(
+                f"Job {metadata.job_id} did not reach a terminal success state; last status was '{status}'."
+            )
         result: JsonDict = {"status": status}
         if detail:
             result["detail"] = detail

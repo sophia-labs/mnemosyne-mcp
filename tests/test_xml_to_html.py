@@ -136,6 +136,20 @@ class TestParagraphs:
         )
         assert "<p>A &amp; B &lt; C</p>" in html
 
+    def test_query_block_renders_as_read_only_section(self):
+        html = tiptap_xml_to_html(
+            '<queryBlock comment="Show the graph" '
+            'query="SELECT ?s WHERE {&#10;  ?s ?p ?o .&#10;}&#10;LIMIT 5" '
+            'visualization="network" displayMode="agent"/>',
+            full_document=False,
+        )
+        assert 'class="query-block"' in html
+        assert 'data-visualization="network"' in html
+        assert 'data-display-mode="agent"' in html
+        assert 'class="query-block-comment"' in html
+        assert 'class="query-block-query"' in html
+        assert "SELECT ?s WHERE {" in html
+
 
 class TestCodeBlocks:
     def test_code_block_with_language(self):
