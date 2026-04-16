@@ -1930,13 +1930,28 @@ def register_geist_tools(server: FastMCP) -> None:
             updated.append("valence_prompt")
 
         if weights is not None:
-            # Archive current HP weights text verbatim
-            await _archive_to_hp(PAST_WEIGHTS_DOC_ID, current_weights_text)
+            # Accept both JSON object form '{"half_life_days": 60.0}' and
+            # line-based form 'half_life_days: 60.0\nother_key: value'.
+            # Normalize to line-based text before parsing.
+            normalized_weights_text = weights.strip()
+            if normalized_weights_text.startswith("{"):
+                try:
+                    parsed_json = json.loads(normalized_weights_text)
+                    if not isinstance(parsed_json, dict):
+                        raise ValueError("weights JSON must be an object")
+                    normalized_weights_text = "\n".join(
+                        f"{k}: {v}" for k, v in parsed_json.items()
+                    )
+                except (ValueError, json.JSONDecodeError) as exc:
+                    return json.dumps({
+                        "error": f"weights looks like JSON but failed to parse: {exc}",
+                        "success": False,
+                    })
 
             # Parse new weights and extract only explicitly specified keys
-            new_weights = _parse_weights_text(weights)
+            new_weights = _parse_weights_text(normalized_weights_text)
             specified_keys = set()
-            for line in weights.strip().split("\n"):
+            for line in normalized_weights_text.split("\n"):
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
@@ -1948,6 +1963,19 @@ def register_geist_tools(server: FastMCP) -> None:
                     continue
                 if key in DEFAULT_WEIGHTS:
                     specified_keys.add(key)
+
+            if not specified_keys:
+                return json.dumps({
+                    "error": (
+                        "No valid weight keys found in input. Expected either "
+                        "JSON like '{\"half_life_days\": 60.0}' or lines like "
+                        f"'half_life_days: 60.0'. Valid keys: {sorted(DEFAULT_WEIGHTS.keys())}"
+                    ),
+                    "success": False,
+                })
+
+            # Archive current HP weights text verbatim (only after validation)
+            await _archive_to_hp(PAST_WEIGHTS_DOC_ID, current_weights_text)
 
             for key in specified_keys:
                 patch[key] = new_weights[key]
