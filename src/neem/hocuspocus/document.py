@@ -1500,13 +1500,23 @@ class DocumentWriter:
         index, _ = result
         fragment = self.get_content_fragment()
 
-        # Parse new content
+        # Parse and validate replacement content first so malformed input never
+        # triggers a destructive delete-before-fail path.
         elem = ET.fromstring(xml_str)
+        self._validate_replacement_shape(elem)
 
         # Override the block ID in the XML so _process_element uses it
         elem.set("data-block-id", block_id)
 
         with self._doc.transaction():
+            # Process new element (handles list container flattening)
+            blocks = self._process_element(elem)
+            if not blocks:
+                raise ValueError(
+                    f"Replacement XML produced no blocks for '{block_id}'; "
+                    "refusing destructive replacement"
+                )
+
             # Delete ALL blocks with this ID (primary + any orphan duplicates).
             # Collect indices in reverse order so deletions don't shift later indices.
             indices_to_delete = []
@@ -1533,16 +1543,58 @@ class DocumentWriter:
             # it was the first match).
             insert_at = indices_to_delete[0]
 
-            # Process new element (handles list container flattening)
-            blocks = self._process_element(elem)
-
             # Insert new block(s)
             for i, block in enumerate(blocks):
                 fragment.children.insert(insert_at + i, block)
 
+            # Preserve original block identity on the first inserted block.
+            # This must happen after insertion because detached pycrdt elements
+            # cannot mutate attributes until integrated into a document.
+            inserted_first = fragment.children[insert_at]
+            if hasattr(inserted_first, "attributes"):
+                inserted_first.attributes["data-block-id"] = block_id
+
             self._apply_pending_formats()
 
         return block_id
+
+    def _validate_replacement_shape(self, elem: ET.Element) -> None:
+        """Validate replacement XML shape before destructive updates.
+
+        We require canonical listItem content shape for replacements:
+        listItem content must be wrapped in paragraph children. This catches
+        common malformed payloads like `<listItem>plain text</listItem>` and
+        fails with an actionable error instead of deleting the original block.
+        """
+        if elem.tag != "listItem":
+            return
+
+        if elem.text and elem.text.strip():
+            raise ValueError(
+                "listItem content must be wrapped in <paragraph>; got plain text."
+            )
+
+        has_valid_content = False
+        for child in elem:
+            if child.tag == "paragraph":
+                has_valid_content = True
+                if child.tail and child.tail.strip():
+                    raise ValueError(
+                        "listItem content must be wrapped in <paragraph>; got trailing plain text."
+                    )
+                continue
+            if child.tag in LIST_CONTAINER_TYPES:
+                has_valid_content = True
+                continue
+            raise ValueError(
+                "listItem content must be wrapped in <paragraph>; "
+                f"unsupported child element <{child.tag}>."
+            )
+
+        if not has_valid_content:
+            raise ValueError(
+                "listItem content must be wrapped in <paragraph>; got empty or non-block content."
+            )
 
     def insert_block_after_id(self, after_block_id: str, xml_str: str) -> str:
         """Insert a new block after the specified block.

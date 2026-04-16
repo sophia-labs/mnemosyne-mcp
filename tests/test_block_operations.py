@@ -339,6 +339,49 @@ class TestDocumentWriter:
         # Level attribute should be updated (stored as numeric, pycrdt returns float)
         assert info["attributes"].get("level") in (2, 2.0)
 
+    def test_replace_block_by_id_task_list_container_preserves_block_id(self, populated_doc):
+        """Replacing with a list container should still preserve the target block ID."""
+        writer = DocumentWriter(populated_doc)
+        reader = DocumentReader(populated_doc)
+
+        task = reader.query_blocks(list_type="task", checked=False)[0]
+        task_id = task["block_id"]
+
+        returned_id = writer.replace_block_by_id(
+            task_id,
+            '<taskList><taskItem checked="false"><paragraph>Updated task</paragraph></taskItem></taskList>',
+        )
+
+        assert returned_id == task_id
+        result = reader.find_block_by_id(task_id)
+        assert result is not None
+        info = reader.get_block_info(task_id)
+        assert info is not None
+        assert "Updated task" in info["text_content"]
+
+    def test_replace_block_by_id_rejects_malformed_listitem_without_paragraph(self, populated_doc):
+        """Malformed listItem replacement should fail closed and keep original content."""
+        writer = DocumentWriter(populated_doc)
+        reader = DocumentReader(populated_doc)
+
+        task = reader.query_blocks(list_type="task", checked=False)[0]
+        task_id = task["block_id"]
+        before = reader.get_block_info(task_id)
+        assert before is not None
+
+        with pytest.raises(
+            ValueError,
+            match="listItem content must be wrapped in <paragraph>",
+        ):
+            writer.replace_block_by_id(
+                task_id,
+                '<listItem listType="task" checked="false">Malformed task item</listItem>',
+            )
+
+        after = reader.get_block_info(task_id)
+        assert after is not None
+        assert after["text_content"] == before["text_content"]
+
     def test_insert_block_after_id(self, populated_doc):
         """Test inserting a block after another."""
         writer = DocumentWriter(populated_doc)

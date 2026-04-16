@@ -22,7 +22,9 @@ from urllib.parse import urlparse, urlunparse
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
 from mcp.types import ToolAnnotations
+from pydantic import ConfigDict
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -106,6 +108,20 @@ def _chatgpt_oauth_auth_server_url() -> str:
             f"{CHATGPT_OAUTH_AUTH_SERVER_URL_ENV} must be set when MNEMOSYNE_MCP_AUTH_MODE=chatgpt_oauth."
         )
     return value
+
+
+def _enforce_strict_tool_argument_validation() -> None:
+    """Fail closed on unknown MCP tool arguments.
+
+    FastMCP argument models default to ignoring extra fields, which can silently
+    drop misspelled or stale parameter names (e.g., after tool schema changes).
+    Override ArgModelBase to forbid extras so callers get explicit validation
+    errors instead of accidental fallback behavior.
+    """
+    ArgModelBase.model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        extra="forbid",
+    )
 
 
 def _protected_resource_metadata_path(mount_path: str) -> str:
@@ -1024,6 +1040,7 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
                  Falls back to MCP_PROFILE env var if not provided.
     """
     active_profile = profile or os.getenv("MCP_PROFILE", "")
+    _enforce_strict_tool_argument_validation()
     if _is_chatgpt_oauth_mode():
         # Fail closed for ChatGPT OAuth deployments:
         # - default to chatgpt_demo when unset
