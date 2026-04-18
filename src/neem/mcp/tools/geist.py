@@ -1087,7 +1087,7 @@ def register_geist_tools(server: FastMCP) -> None:
         name="recall",
         title="Recall Memories",
         description=(
-            "Read from the memory queue. Default: return the 5 most-recently-active memories. "
+            "Read from the memory queue. Default: return the 8 most-recently-active memories. "
             "Optionally recall a specific memory by number, or search by text query.\n\n"
             "recall only searches the memory queue — use search_blocks for cross-document "
             "content discovery, or get_block_values for graph-wide valuation scores."
@@ -1098,7 +1098,7 @@ def register_geist_tools(server: FastMCP) -> None:
         graph_id: str | None = None,
         number: Optional[int] = None,
         query: Optional[str] = None,
-        limit: int = 5,
+        limit: int = 8,
         context: Context | None = None,
     ) -> str:
         auth = MCPAuthContext.from_context(context)
