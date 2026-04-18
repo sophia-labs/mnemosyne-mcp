@@ -1668,7 +1668,7 @@ def register_geist_tools(server: FastMCP) -> None:
     async def get_important_blocks_tool(
         graph_id: str | None = None,
         document_id: Optional[str] = None,
-        limit: int = 5,
+        limit: int = 8,
         valence: Optional[str] = None,
         context: Context | None = None,
     ) -> str:
@@ -1715,7 +1715,7 @@ def register_geist_tools(server: FastMCP) -> None:
         graph_id: str,
         user_id: str,
         auth: MCPAuthContext,
-        limit: int = 5,
+        limit: int = 8,
         valence: Optional[str] = None,
         folder_doc_ids: Optional[list[str]] = None,
     ) -> Dict[str, Any]:
@@ -2273,14 +2273,14 @@ def register_geist_tools(server: FastMCP) -> None:
     @resolve_home_graph
     async def quick_orient_tool(
         graph_id: str | None = None,
-        recall_limit: int = 5,
+        recall_limit: int = 8,
         context: Context | None = None,
     ) -> str:
         """Return a lightweight orientation bundle (location + song + recall).
 
         Args:
             graph_id: The graph to orient in (default: "default")
-            recall_limit: Number of recent memories to include (default: 5)
+            recall_limit: Number of recent memories to include (default: 8)
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
@@ -2391,8 +2391,8 @@ def register_geist_tools(server: FastMCP) -> None:
             "- graph_id: Graph to attune in (default: resolved from user's current location)\n"
             "- agent_name: Agent identity document to read, e.g. 'gamma' reads 'agent-gamma'. "
             "Omit to skip.\n"
-            "- recall_limit: Number of recent memories (default 5)\n"
-            "- important_limit: Number of top-valued blocks (default 5)\n"
+            "- recall_limit: Number of recent memories (default 8)\n"
+            "- important_limit: Number of top-valued blocks (default 8)\n"
             "- workspace_depth: Folder nesting depth (default 1)\n"
             "- set_home: Auto-set home graph for the session (default true)"
         ),
@@ -2400,8 +2400,8 @@ def register_geist_tools(server: FastMCP) -> None:
     async def context_bundle_tool(
         graph_id: str | None = None,
         agent_name: str | None = None,
-        recall_limit: int = 5,
-        important_limit: int = 5,
+        recall_limit: int = 8,
+        important_limit: int = 8,
         workspace_depth: int = 1,
         set_home: bool = True,
         context: Context | None = None,
