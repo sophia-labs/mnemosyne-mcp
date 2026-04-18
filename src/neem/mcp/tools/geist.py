@@ -63,6 +63,7 @@ SONG_DOC_ID = "geist-song"
 IMPORTANCE_DOC_ID = "geist-importance"
 VALENCE_DOC_ID = "geist-valence"
 WEIGHTS_DOC_ID = "geist-weights"
+USER_PROMPT_ADDITION_DOC_ID = "user-prompt-addition"
 PAST_SONGS_DOC_ID = "geist-past-songs"
 PAST_IMPORTANCE_DOC_ID = "geist-past-importance"
 PAST_VALENCE_DOC_ID = "geist-past-valence"
@@ -77,6 +78,11 @@ MAX_SONG_VOICES = 3  # Total voices per verse (original + counterpoints)
 CODA_EJECTION_LIFETIME = 8  # Coda survives this many verse ejections
 
 # ── Seed content for new scratchpads ────────────────────────────────
+
+# Blank paragraph for the user-authored custom-instructions doc. Stays out of
+# the agent's way by default; user can fill it with personal guidance that
+# Gardener reads during attunement and treats as a prompt extension.
+SEED_USER_PROMPT_ADDITION = "<paragraph></paragraph>"
 
 SEED_SONG = (
     '<heading level="1">The Song</heading>'
@@ -390,8 +396,13 @@ async def _ensure_scratchpad(
 
     reader = WorkspaceReader(channel.doc)
 
-    # Fast check: if memory-queue doc exists, scratchpad is initialized
-    if reader.get_document(MEMORY_QUEUE_DOC_ID) is not None:
+    # Fast check: if all required scratchpad docs exist, we're done. Checking
+    # both memory-queue and user-prompt-addition so scratchpads created before
+    # user-prompt-addition landed get backfilled on the next Geist call.
+    if (
+        reader.get_document(MEMORY_QUEUE_DOC_ID) is not None
+        and reader.get_document(USER_PROMPT_ADDITION_DOC_ID) is not None
+    ):
         return
 
     logger.info("Initializing Geist scratchpad", extra_context={"graph_id": graph_id})
@@ -403,6 +414,14 @@ async def _ensure_scratchpad(
         ws.upsert_folder(SCRATCHPAD_FOLDER_ID, "_sophia")
         # Memory queue at scratchpad root
         ws.upsert_document(MEMORY_QUEUE_DOC_ID, "Memory Queue", parent_id=SCRATCHPAD_FOLDER_ID)
+        # User's own custom-instructions doc at scratchpad root. Blank by
+        # default; Gardener reads it during attunement and treats any content
+        # as a prompt extension.
+        ws.upsert_document(
+            USER_PROMPT_ADDITION_DOC_ID,
+            "Custom Instructions",
+            parent_id=SCRATCHPAD_FOLDER_ID,
+        )
         # present/ folder
         ws.upsert_folder(PRESENT_FOLDER_ID, "present", parent_id=SCRATCHPAD_FOLDER_ID)
         ws.upsert_document(SONG_DOC_ID, "Song", parent_id=PRESENT_FOLDER_ID)
@@ -430,6 +449,7 @@ async def _ensure_scratchpad(
         IMPORTANCE_DOC_ID: SEED_IMPORTANCE_PROMPT,
         VALENCE_DOC_ID: SEED_VALENCE_PROMPT,
         WEIGHTS_DOC_ID: SEED_WEIGHTS,
+        USER_PROMPT_ADDITION_DOC_ID: SEED_USER_PROMPT_ADDITION,
     }
 
     for doc_id, content in seed_docs.items():
