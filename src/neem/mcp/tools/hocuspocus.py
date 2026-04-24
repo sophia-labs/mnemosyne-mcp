@@ -4342,6 +4342,158 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             )
             raise RuntimeError(f"Failed to insert blocks: {e}")
 
+    @server.tool(
+        name="insert_calendar_event",
+        title="Insert Calendar Event",
+        description=(
+            "Inserts a calendar event block into a document. Matches the Daily "
+            "Notes event specimen (title, time range, location, annotation, "
+            "source). Use this rather than insert_blocks when the intent is "
+            "'capture an event' — agents get a structured tool, the document "
+            "gets a well-formed atom block that renders in the UI with the "
+            "correct visual treatment.\n\n"
+            "**Args:**\n"
+            "- `title` (required): event name.\n"
+            "- `time_start` / `time_end`: ISO datetime-local strings "
+            "`YYYY-MM-DDTHH:mm` (no timezone — interpreted in the user's "
+            "wallclock). Omit both for all-day. Omit only `time_end` for an "
+            "open-ended event.\n"
+            "- `all_day`: force all-day (nulls time_start/time_end).\n"
+            "- `location`: free text, e.g. 'Office 2B'.\n"
+            "- `annotation`: subline text, e.g. 'prep doc attached'.\n"
+            "- `source`: 'manual' (default) or 'gcal' — future-reserved.\n"
+            "- `external_event_id`: GCal event id for dedup — future-reserved.\n\n"
+            "**Positioning** (same semantics as insert_blocks):\n"
+            "- `block_id` + `position` (after|before): relative to a block\n"
+            "- `index`: numeric, supports negative\n"
+            "- Neither: append to end\n\n"
+            "Read the document first (read_document or get_block) before "
+            "inserting. Never call in parallel with other write operations on "
+            "the same document."
+        ),
+    )
+    @resolve_home_graph
+    async def insert_calendar_event_tool(
+        graph_id: str | None = None,
+        document_id: str = "",
+        title: str = "",
+        time_start: Optional[str] = None,
+        time_end: Optional[str] = None,
+        all_day: Optional[bool] = None,
+        location: str = "",
+        annotation: str = "",
+        source: str = "manual",
+        external_event_id: Optional[str] = None,
+        block_id: Optional[str] = None,
+        index: Optional[int] = None,
+        position: str = "after",
+        context: Context | None = None,
+    ) -> dict:
+        """Insert a calendar event block."""
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        if not graph_id or not graph_id.strip():
+            raise ValueError("graph_id is required")
+        if not document_id or not document_id.strip():
+            raise ValueError("document_id is required")
+        if not title or not title.strip():
+            raise ValueError("title is required")
+        if block_id is not None and index is not None:
+            raise ValueError("Provide either 'block_id' or 'index', not both")
+        if position not in ("after", "before"):
+            raise ValueError("position must be 'after' or 'before'")
+        if source not in ("manual", "gcal"):
+            raise ValueError("source must be 'manual' or 'gcal'")
+
+        # Derive all_day when not explicit: true iff both times are missing.
+        resolved_all_day = all_day if all_day is not None else (not time_start and not time_end)
+        if resolved_all_day:
+            time_start = None
+            time_end = None
+
+        elem = ET.Element("calendarEvent")
+        elem.set("title", title.strip())
+        elem.set("allDay", "true" if resolved_all_day else "false")
+        elem.set("source", source)
+        if time_start:
+            elem.set("timeStart", time_start.strip())
+        if time_end:
+            elem.set("timeEnd", time_end.strip())
+        if location:
+            elem.set("location", location.strip())
+        if annotation:
+            elem.set("annotation", annotation.strip())
+        if external_event_id:
+            elem.set("externalEventId", external_event_id.strip())
+
+        block_xml = ET.tostring(elem, encoding="unicode")
+
+        try:
+            await _validate_document_in_workspace(
+                graph_id.strip(), document_id.strip(), auth.user_id, auth=auth,
+            )
+            await _assert_document_writable(graph_id.strip(), document_id.strip(), auth.user_id)
+            await hp_client.connect_document(
+                graph_id.strip(), document_id.strip(), user_id=auth.user_id,
+            )
+
+            new_block_id: str | None = None
+
+            def perform_insert(doc: Any) -> None:
+                nonlocal new_block_id
+                writer = DocumentWriter(doc)
+                reader = DocumentReader(doc)
+                fragment = reader.get_content_fragment()
+                block_count = len(list(fragment.children))
+
+                if block_id is not None:
+                    result = writer.find_block_by_id(block_id.strip())
+                    if result is None:
+                        raise ValueError(f"Block not found: {block_id}")
+                    ref_index, _ = result
+                    insert_at = ref_index + 1 if position == "after" else ref_index
+                elif index is not None:
+                    if index < 0:
+                        insert_at = max(0, block_count + 1 + index)
+                    else:
+                        insert_at = min(index, block_count)
+                else:
+                    insert_at = block_count
+
+                if insert_at == 0 and block_count > 0:
+                    raise ValueError(
+                        "Inserting before the first block is not supported — "
+                        "pycrdt inserts at position 0 lose ordering through "
+                        "CRDT sync. Workaround: use update_blocks to replace "
+                        "the first block, then insert after it."
+                    )
+
+                ids = writer.insert_blocks_at(insert_at, [block_xml])
+                new_block_id = ids[0] if ids else None
+
+            await hp_client.transact_document(
+                graph_id.strip(), document_id.strip(), perform_insert, user_id=auth.user_id,
+            )
+
+            return {
+                "success": True,
+                "block_id": new_block_id,
+            }
+
+        except ValueError as ve:
+            raise RuntimeError(str(ve))
+        except Exception as e:
+            logger.error(
+                "Failed to insert calendar event",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(f"Failed to insert calendar event: {e}")
+
     # delete_blocks — registered via unified delete tool
     @resolve_home_graph
     async def delete_blocks_tool(

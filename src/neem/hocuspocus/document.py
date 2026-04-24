@@ -151,6 +151,18 @@ BLOCK_DEFAULTS: dict[str, dict[str, Any]] = {
         "indent": 0,
         "checked": False,
     },
+    # Daily Notes calendar event (frontend: tiptap-calendar-event.ts).
+    # All attrs declared so y-prosemirror doesn't normalize the node.
+    "calendarEvent": {
+        "timeStart": "",
+        "timeEnd": "",
+        "allDay": "true",
+        "title": "",
+        "location": "",
+        "annotation": "",
+        "source": "manual",
+        "externalEventId": "",
+    },
 }
 
 # Reverse mapping: TipTap internal block attr names back to XML names
@@ -173,6 +185,7 @@ BLOCK_TYPES = frozenset({
     "tableRow",
     "tableHeader",
     "tableCell",
+    "calendarEvent", # Daily Notes atom block — title, time range, location
 })
 
 # List container elements that should be flattened to listItem blocks
