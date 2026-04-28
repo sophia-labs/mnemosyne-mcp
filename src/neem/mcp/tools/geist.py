@@ -64,6 +64,7 @@ IMPORTANCE_DOC_ID = "geist-importance"
 VALENCE_DOC_ID = "geist-valence"
 WEIGHTS_DOC_ID = "geist-weights"
 USER_PROMPT_ADDITION_DOC_ID = "user-prompt-addition"
+TAGS_CONFIG_DOC_ID = "tags-config"
 PAST_SONGS_DOC_ID = "geist-past-songs"
 PAST_IMPORTANCE_DOC_ID = "geist-past-importance"
 PAST_VALENCE_DOC_ID = "geist-past-valence"
@@ -83,6 +84,32 @@ CODA_EJECTION_LIFETIME = 8  # Coda survives this many verse ejections
 # the agent's way by default; user can fill it with personal guidance that
 # Gardener reads during attunement and treats as a prompt extension.
 SEED_USER_PROMPT_ADDITION = "<paragraph></paragraph>"
+
+# Seed for the tags-config doc. Documents the four core block-level tags
+# that ship with Garden (decision, tension, todo, pragma) and lets the user
+# add custom tags below the divider. Gardener reads this during attunement
+# so it knows what tags are available.
+SEED_TAGS_CONFIG = (
+    '<heading level="1">Tags Configuration</heading>'
+    "<paragraph>Block-level categorical tags. Wires connect; valuations weigh; "
+    "tags classify. Apply inline with <code>{#decision}</code>, <code>{#todo:7d}</code>, etc., "
+    "or via <code>value(tags=[...])</code>. Tags are graph-local.</paragraph>"
+    '<heading level="2">Core tags</heading>'
+    "<paragraph><strong>decision</strong> \u2014 a choice made, with rationale captured. "
+    "Don\u2019t expire decisions \u2014 supersede them via <code>contradicts</code> "
+    "or <code>consequenceOf</code> wires.</paragraph>"
+    "<paragraph><strong>tension</strong> \u2014 an unresolved contradiction or open problem. "
+    "The categorical sibling of negative valence. Optional expiration when resolution "
+    "is expected.</paragraph>"
+    "<paragraph><strong>todo</strong> \u2014 an action item. Ephemeral by nature. "
+    "Suggested expiration: 14d. Use <code>{#todo:7d}</code> or <code>{#todo:2026-05-15}</code>.</paragraph>"
+    "<paragraph><strong>pragma</strong> \u2014 operational knowledge. The boring stuff "
+    "you need to deploy, debug, configure. Persists until superseded.</paragraph>"
+    '<heading level="2">Custom tags</heading>'
+    "<paragraph>Add your own tags below \u2014 freeform. Logseq-style "
+    "<code>#meeting</code>, <code>#q2-planning</code>, <code>#projectX</code>. "
+    "One per line, optionally with description.</paragraph>"
+)
 
 SEED_SONG = (
     '<heading level="1">The Song</heading>'
@@ -397,11 +424,12 @@ async def _ensure_scratchpad(
     reader = WorkspaceReader(channel.doc)
 
     # Fast check: if all required scratchpad docs exist, we're done. Checking
-    # both memory-queue and user-prompt-addition so scratchpads created before
-    # user-prompt-addition landed get backfilled on the next Geist call.
+    # the most recently added docs ensures pre-existing scratchpads get
+    # backfilled on the next Geist call when new seed docs land.
     if (
         reader.get_document(MEMORY_QUEUE_DOC_ID) is not None
         and reader.get_document(USER_PROMPT_ADDITION_DOC_ID) is not None
+        and reader.get_document(TAGS_CONFIG_DOC_ID) is not None
     ):
         return
 
@@ -420,6 +448,13 @@ async def _ensure_scratchpad(
         ws.upsert_document(
             USER_PROMPT_ADDITION_DOC_ID,
             "Custom Instructions",
+            parent_id=SCRATCHPAD_FOLDER_ID,
+        )
+        # Tags configuration doc at scratchpad root. Pre-populated with the
+        # four core tags + a custom-tags section the user can extend.
+        ws.upsert_document(
+            TAGS_CONFIG_DOC_ID,
+            "Tags Configuration",
             parent_id=SCRATCHPAD_FOLDER_ID,
         )
         # present/ folder
@@ -450,6 +485,7 @@ async def _ensure_scratchpad(
         VALENCE_DOC_ID: SEED_VALENCE_PROMPT,
         WEIGHTS_DOC_ID: SEED_WEIGHTS,
         USER_PROMPT_ADDITION_DOC_ID: SEED_USER_PROMPT_ADDITION,
+        TAGS_CONFIG_DOC_ID: SEED_TAGS_CONFIG,
     }
 
     for doc_id, content in seed_docs.items():
