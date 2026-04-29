@@ -85,15 +85,20 @@ CODA_EJECTION_LIFETIME = 8  # Coda survives this many verse ejections
 # Gardener reads during attunement and treats as a prompt extension.
 SEED_USER_PROMPT_ADDITION = "<paragraph></paragraph>"
 
-# Seed for the tags-config doc. Documents the four core block-level tags
-# that ship with Garden (decision, tension, todo, pragma) and lets the user
-# add custom tags below the divider. Gardener reads this during attunement
-# so it knows what tags are available.
+# Seed for the tags-config doc. Documents the five core block-level tags
+# that ship with Garden (decision, tension, todo, pragma, event) and lets
+# the user add custom tags below the divider. Gardener reads this during
+# attunement so it knows what tags are available.
+#
+# `event` and `todo` with expiration dates are special: they auto-surface
+# on the daily note for that date via incoming wires (see daily-notes
+# design doc). `#event` without a date defaults to today.
 SEED_TAGS_CONFIG = (
     '<heading level="1">Tags Configuration</heading>'
     "<paragraph>Block-level categorical tags. Wires connect; valuations weigh; "
-    "tags classify. Apply inline with <code>{#decision}</code>, <code>{#todo:7d}</code>, etc., "
-    "or via <code>value(tags=[...])</code>. Tags are graph-local.</paragraph>"
+    "tags classify. Apply inline with <code>{#decision}</code>, <code>{#todo:7d}</code>, "
+    "<code>{#event:2026-05-15}</code>, or via <code>value(tags=[...])</code>. "
+    "Tags are graph-local.</paragraph>"
     '<heading level="2">Core tags</heading>'
     "<paragraph><strong>decision</strong> \u2014 a choice made, with rationale captured. "
     "Don\u2019t expire decisions \u2014 supersede them via <code>contradicts</code> "
@@ -102,9 +107,15 @@ SEED_TAGS_CONFIG = (
     "The categorical sibling of negative valence. Optional expiration when resolution "
     "is expected.</paragraph>"
     "<paragraph><strong>todo</strong> \u2014 an action item. Ephemeral by nature. "
-    "Suggested expiration: 14d. Use <code>{#todo:7d}</code> or <code>{#todo:2026-05-15}</code>.</paragraph>"
+    "Use <code>{#todo:7d}</code> or <code>{#todo:2026-05-15}</code>; the block surfaces "
+    "on the daily note for that date.</paragraph>"
     "<paragraph><strong>pragma</strong> \u2014 operational knowledge. The boring stuff "
     "you need to deploy, debug, configure. Persists until superseded.</paragraph>"
+    "<paragraph><strong>event</strong> \u2014 a scheduled happening. Use "
+    "<code>{#event:2026-05-15}</code> for a specific date or <code>{#event}</code> for today. "
+    "The block surfaces on the daily note for that date as a wire reference. For richer "
+    "events with time/location, use the slash-command <code>/event</code> in the editor "
+    "to insert a structured calendarEvent block.</paragraph>"
     '<heading level="2">Custom tags</heading>'
     "<paragraph>Add your own tags below \u2014 freeform. Logseq-style "
     "<code>#meeting</code>, <code>#q2-planning</code>, <code>#projectX</code>. "
