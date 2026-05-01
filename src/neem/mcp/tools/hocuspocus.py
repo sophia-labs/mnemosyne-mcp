@@ -276,12 +276,68 @@ _TAG_EXP_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _TAG_EXP_REL_RE = re.compile(r"^(\d+)d$")
 
 # Tags whose dated expirations preemptively create a daily-note doc for
-# the target date and (eventually) materialize a structured block on it.
-# Per the integration design: #event becomes a calendarEvent atom on the
-# daily-note; #todo becomes a todoItem in the Follow-ups section. The
-# atom/item materialization is read-time on daily-note open; only the
-# workspace-level doc-existence gate is write-time.
+# the target date and materialize a structured block on it. Per the
+# integration design (Eschaton 2026-05-01): #event becomes a calendarEvent
+# atom on the daily-note (so /event's inline-edit UI can fully edit it);
+# #todo becomes a todoItem with the source block content. Both paths
+# fire write-time so future-dated daily-notes have presence in search
+# and the sidebar even before anyone opens them.
 _SCHEDULED_TAGS: frozenset[str] = frozenset({"event", "todo"})
+
+
+def _build_calendar_event_xml(
+    *,
+    source_block_id: str,
+    date_str: str,
+    title: str,
+) -> str:
+    """Build TipTap XML for a calendarEvent atom that mirrors the source block.
+
+    The atom id is deterministic from (source, date) so re-firing the same
+    inline-tag write produces an idempotent insert (find_block_by_id catches
+    the duplicate). externalEventId tracks the source block so future
+    operations (cleanup on tag removal, source-edit propagation) can locate
+    the atom from the source side.
+    """
+    import html as _html
+
+    atom_id = f"evt-{source_block_id}-{date_str}"
+    return (
+        '<mn-calendar-event '
+        f'id="{_html.escape(atom_id, quote=True)}" '
+        f'data-block-id="{_html.escape(atom_id, quote=True)}" '
+        f'data-source-block-id="{_html.escape(source_block_id, quote=True)}" '
+        'allDay="true" '
+        f'title="{_html.escape(title or "", quote=True)}" '
+        'source="manual" '
+        f'externalEventId="src:{_html.escape(source_block_id, quote=True)}"'
+        ' />'
+    )
+
+
+def _build_todo_item_xml(
+    *,
+    source_block_id: str,
+    date_str: str,
+    content: str,
+) -> str:
+    """Build TipTap XML for a todoItem listItem mirroring the source block.
+
+    Block id is deterministic from (source, date) for idempotent insert.
+    data-source-block-id tracks the origin for future maintenance flows.
+    """
+    import html as _html
+
+    block_id = f"todo-{source_block_id}-{date_str}"
+    return (
+        '<listItem '
+        f'data-block-id="{_html.escape(block_id, quote=True)}" '
+        f'data-source-block-id="{_html.escape(source_block_id, quote=True)}" '
+        'listType="todo" '
+        'checked="false">'
+        f'<paragraph>{_html.escape(content or "", quote=False)}</paragraph>'
+        '</listItem>'
+    )
 
 
 def _resolve_tag_expirations(
@@ -1283,12 +1339,13 @@ GROUP BY ?docId
                 return {"error": f"No channel for {document_id}"}
 
             writer = DocumentWriter(channel.doc)
+            reader = DocumentReader(channel.doc)
             applied = 0
-            # (tag_name, date_str) pairs from this batch where the tag is in
-            # the "schedules-into-daily-note" set (event/todo). Collected as
-            # we apply, used after the doc-side loop to ensure the target
-            # daily-notes exist in the workspace.
-            scheduled_dates: set[tuple[str, str]] = set()
+            # Per-(source-block, tag, date) records for newly applied
+            # event/todo expirations. Used after the doc-side loop to
+            # ensure target daily-notes exist AND to materialize atoms
+            # (calendarEvent / todoItem) into them.
+            scheduled_items: list[dict] = []
             for entry in entries:
                 block_id = entry["block_id"]
                 new_tags = entry["tags"]
@@ -1319,18 +1376,19 @@ GROUP BY ?docId
                 # Read existing expirations and merge with new (new wins on
                 # conflict — typing {#todo:14d} updates a prior {#todo:7d}).
                 existing_exp_raw = elem.attributes.get("data-tag-expirations")
-                merged_expirations: dict[str, str] = {}
+                existing_expirations: dict[str, str] = {}
                 if existing_exp_raw:
                     try:
                         parsed_exp = _json.loads(existing_exp_raw)
                         if isinstance(parsed_exp, dict):
-                            merged_expirations = {
+                            existing_expirations = {
                                 str(k).strip().lstrip("#").lower(): str(v).strip()
                                 for k, v in parsed_exp.items()
                                 if k and v
                             }
                     except (_json.JSONDecodeError, TypeError):
                         pass
+                merged_expirations = dict(existing_expirations)
                 merged_expirations.update(new_expirations)
                 # Drop expirations whose tag was not actually applied to this
                 # block — keeps the two attrs in sync.
@@ -1338,13 +1396,30 @@ GROUP BY ?docId
                     k: v for k, v in merged_expirations.items() if k in merged_tags
                 }
 
-                # Track event/todo expirations so we can preemptively create
-                # the target daily-notes. Only newly-applied expirations
-                # count; we don't re-fire on expirations the block already
-                # had (those daily-notes were ensured on the prior write).
+                # Track event/todo expirations only when NEWLY applied
+                # (or when the date changed). Pre-existing pairs already
+                # had their daily-note + atom created on a prior write.
+                source_text = ""
+                source_text_loaded = False
                 for tag_name, date_str in new_expirations.items():
-                    if tag_name in _SCHEDULED_TAGS:
-                        scheduled_dates.add((tag_name, date_str))
+                    if tag_name not in _SCHEDULED_TAGS:
+                        continue
+                    if existing_expirations.get(tag_name) == date_str:
+                        continue
+                    # Lazy-load source block text once per entry.
+                    if not source_text_loaded:
+                        try:
+                            info = reader.get_block_text_info(block_id)
+                            source_text = (info or {}).get("text", "") or ""
+                        except Exception:
+                            source_text = ""
+                        source_text_loaded = True
+                    scheduled_items.append({
+                        "source_block_id": block_id,
+                        "tag": tag_name,
+                        "date": date_str,
+                        "title": source_text,
+                    })
 
                 attrs_to_write: dict[str, str] = {
                     "data-tags": _json.dumps(merged_tags),
@@ -1355,12 +1430,12 @@ GROUP BY ?docId
                 applied += 1
 
             # Preemptively ensure daily-notes exist for any newly-applied
-            # event/todo dates. Idempotent on re-write. Workspace metadata
-            # only — content is materialized lazily by the frontend on
-            # daily-note open. Failures here are non-fatal.
+            # event/todo dates. Idempotent on re-write. Failures here are
+            # non-fatal — the source-doc tag write still succeeded.
             daily_notes_ensured = 0
-            if scheduled_dates:
-                unique_dates = sorted({d for _t, d in scheduled_dates})
+            atoms_materialized = 0
+            if scheduled_items:
+                unique_dates = sorted({item["date"] for item in scheduled_items})
                 try:
                     def _ensure_dailies(ws_doc: Any) -> None:
                         ws_writer = WorkspaceWriter(ws_doc)
@@ -1381,6 +1456,57 @@ GROUP BY ?docId
                         },
                     )
 
+                # Materialize atoms in each target daily-note's content
+                # CRDT. Idempotent via deterministic block id. Per-date
+                # failures are isolated and logged; the rest still proceed.
+                items_by_date: dict[str, list[dict]] = {}
+                for item in scheduled_items:
+                    items_by_date.setdefault(item["date"], []).append(item)
+                for date_str, items in items_by_date.items():
+                    daily_note_id = f"daily-note-{date_str}"
+                    try:
+                        dn_channel = hp_client.get_document_channel(
+                            graph_id, daily_note_id, user_id=user_id,
+                        )
+                        if not dn_channel:
+                            continue
+                        dn_writer = DocumentWriter(dn_channel.doc)
+                        for item in items:
+                            tag = item["tag"]
+                            src_id = item["source_block_id"]
+                            title = item["title"]
+                            if tag == "event":
+                                atom_id = f"evt-{src_id}-{date_str}"
+                                xml_str = _build_calendar_event_xml(
+                                    source_block_id=src_id,
+                                    date_str=date_str,
+                                    title=title,
+                                )
+                            else:  # todo
+                                atom_id = f"todo-{src_id}-{date_str}"
+                                xml_str = _build_todo_item_xml(
+                                    source_block_id=src_id,
+                                    date_str=date_str,
+                                    content=title,
+                                )
+                            # Idempotency: skip if a block with this
+                            # deterministic id already lives in the
+                            # daily-note's content.
+                            if dn_writer.find_block_by_id(atom_id) is not None:
+                                continue
+                            dn_writer.append_block(xml_str)
+                            atoms_materialized += 1
+                    except Exception as exc:
+                        logger.warning(
+                            "materialize_scheduled_atoms_failed",
+                            extra_context={
+                                "graph_id": graph_id,
+                                "source_document_id": document_id,
+                                "daily_note_id": daily_note_id,
+                                "error": str(exc),
+                            },
+                        )
+
             logger.info(
                 "inline_tags_applied",
                 extra_context={
@@ -1392,12 +1518,14 @@ GROUP BY ?docId
                     ),
                     "blocks_updated": applied,
                     "daily_notes_ensured": daily_notes_ensured,
+                    "atoms_materialized": atoms_materialized,
                 },
             )
             return {
                 "applied": applied,
                 "entries": len(entries),
                 "daily_notes_ensured": daily_notes_ensured,
+                "atoms_materialized": atoms_materialized,
             }
         except Exception as e:
             logger.warning(
