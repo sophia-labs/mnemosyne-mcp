@@ -380,6 +380,233 @@ def _resolve_tag_expirations(
     return out
 
 
+def parse_tag_list_with_expirations(
+    raw_tags: list[str] | None,
+) -> tuple[list[str], dict[str, str]]:
+    """Split a flat tag list into (tag_names, expirations_dict).
+
+    Accepts inline-marker syntax — entries like ``"event:7d"`` or
+    ``"event:2026-05-15"`` are parsed by splitting on the first colon.
+    Bare tag names are kept as-is. The same tag may appear with or
+    without an expiration; if both, the dated form wins.
+
+    Used by callers (notably value()) that take ``tags=[...]`` as a
+    single argument and want the same expression power as the inline
+    ``{#tag:dur}`` markers, without forcing a parallel
+    ``tag_expirations`` parameter on the caller side.
+    """
+    if not raw_tags:
+        return [], {}
+    tags: list[str] = []
+    expirations: dict[str, str] = {}
+    for raw in raw_tags:
+        if not raw:
+            continue
+        s = str(raw).strip().lstrip("#")
+        if not s:
+            continue
+        tag_name, sep, dur = s.partition(":")
+        tag_norm = tag_name.strip().lower()
+        if not tag_norm:
+            continue
+        if tag_norm not in tags:
+            tags.append(tag_norm)
+        if sep and dur.strip():
+            expirations[tag_norm] = dur.strip()
+    return tags, expirations
+
+
+async def apply_tags_with_side_effects(
+    *,
+    hp_client: Any,
+    graph_id: str,
+    document_id: str,
+    user_id: str,
+    entries: list[dict],
+) -> dict:
+    """Apply tags + expirations to source-doc blocks AND fire scheduling
+    side-effects (ensure target daily-notes, materialize calendarEvent /
+    todoItem atoms) for #event/#todo with a date.
+
+    Single shared implementation for the inline-marker, update_blocks,
+    and value() entry points, so the user-facing behavior is identical
+    regardless of how the tag was attached. Fire-and-forget — failures
+    are logged at warning level and the return dict carries counts.
+
+    Args:
+        hp_client: A HocuspocusClient with workspace + document channels.
+        graph_id: Source document's graph.
+        document_id: Source document.
+        user_id: Resolved user id (auth.user_id, or None — caller should
+            resolve this via get_user_id_from_token before calling).
+        entries: Per-block records with shape:
+            {"block_id": str, "tags": list[str], "expirations": dict[str, str]?}
+            ``expirations`` is the raw {tag → "Nd"|"YYYY-MM-DD"} map; this
+            helper resolves relative durations to absolute dates internally.
+
+    Returns:
+        ``{"applied": int, "daily_notes_ensured": int, "atoms_materialized": int}``
+    """
+    import json as _json
+
+    from neem.hocuspocus import DocumentReader, DocumentWriter, WorkspaceWriter
+
+    if not entries or not user_id:
+        return {"applied": 0, "daily_notes_ensured": 0, "atoms_materialized": 0}
+
+    channel = hp_client.get_document_channel(graph_id, document_id, user_id=user_id)
+    if not channel:
+        return {"applied": 0, "daily_notes_ensured": 0, "atoms_materialized": 0}
+
+    writer = DocumentWriter(channel.doc)
+    reader = DocumentReader(channel.doc)
+    applied = 0
+    scheduled_items: list[dict] = []
+
+    for entry in entries:
+        block_id = entry.get("block_id") or ""
+        new_tags = list(entry.get("tags") or [])
+        if not block_id or not new_tags:
+            continue
+
+        new_expirations = _resolve_tag_expirations(entry.get("expirations") or {})
+
+        result = writer.find_block_by_id(block_id)
+        if result is None:
+            continue
+        _idx, elem = result
+
+        existing_raw = elem.attributes.get("data-tags")
+        existing_tags: list[str] = []
+        if existing_raw:
+            try:
+                parsed = _json.loads(existing_raw)
+                if isinstance(parsed, list):
+                    existing_tags = [str(t) for t in parsed if t]
+            except (_json.JSONDecodeError, TypeError):
+                pass
+        merged_tags = list(dict.fromkeys(existing_tags + new_tags))
+
+        existing_exp_raw = elem.attributes.get("data-tag-expirations")
+        existing_expirations: dict[str, str] = {}
+        if existing_exp_raw:
+            try:
+                parsed_exp = _json.loads(existing_exp_raw)
+                if isinstance(parsed_exp, dict):
+                    existing_expirations = {
+                        str(k).strip().lstrip("#").lower(): str(v).strip()
+                        for k, v in parsed_exp.items()
+                        if k and v
+                    }
+            except (_json.JSONDecodeError, TypeError):
+                pass
+        merged_expirations = dict(existing_expirations)
+        merged_expirations.update(new_expirations)
+        merged_expirations = {
+            k: v for k, v in merged_expirations.items() if k in merged_tags
+        }
+
+        # Schedule side-effects for newly-applied event/todo dates only —
+        # pre-existing pairs already had their daily-note + atom from a
+        # prior write.
+        source_text = ""
+        source_text_loaded = False
+        for tag_name, date_str in new_expirations.items():
+            if tag_name not in _SCHEDULED_TAGS:
+                continue
+            if existing_expirations.get(tag_name) == date_str:
+                continue
+            if not source_text_loaded:
+                try:
+                    info = reader.get_block_text_info(block_id)
+                    source_text = (info or {}).get("text", "") or ""
+                except Exception:
+                    source_text = ""
+                source_text_loaded = True
+            scheduled_items.append({
+                "source_block_id": block_id,
+                "tag": tag_name,
+                "date": date_str,
+                "title": source_text,
+            })
+
+        attrs_to_write: dict[str, str] = {"data-tags": _json.dumps(merged_tags)}
+        if merged_expirations:
+            attrs_to_write["data-tag-expirations"] = _json.dumps(merged_expirations)
+        writer.update_block_attributes(block_id, attrs_to_write)
+        applied += 1
+
+    # Ensure daily-notes for newly-applied event/todo dates.
+    daily_notes_ensured = 0
+    atoms_materialized = 0
+    if scheduled_items:
+        unique_dates = sorted({item["date"] for item in scheduled_items})
+        try:
+            def _ensure_dailies(ws_doc: Any) -> None:
+                ws_writer = WorkspaceWriter(ws_doc)
+                for date_str in unique_dates:
+                    ws_writer.ensure_daily_note(date_str)
+            await hp_client.transact_workspace(graph_id, _ensure_dailies, user_id=user_id)
+            daily_notes_ensured = len(unique_dates)
+        except Exception as exc:
+            logger.warning(
+                "ensure_daily_notes_for_scheduled_tags_failed",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "dates": unique_dates,
+                    "error": str(exc),
+                },
+            )
+
+        items_by_date: dict[str, list[dict]] = {}
+        for item in scheduled_items:
+            items_by_date.setdefault(item["date"], []).append(item)
+        for date_str, items in items_by_date.items():
+            daily_note_id = f"daily-note-{date_str}"
+            try:
+                dn_channel = hp_client.get_document_channel(
+                    graph_id, daily_note_id, user_id=user_id,
+                )
+                if not dn_channel:
+                    continue
+                dn_writer = DocumentWriter(dn_channel.doc)
+                for item in items:
+                    tag = item["tag"]
+                    src_id = item["source_block_id"]
+                    title = item["title"]
+                    if tag == "event":
+                        atom_id = f"evt-{src_id}-{date_str}"
+                        xml_str = _build_calendar_event_xml(
+                            source_block_id=src_id, date_str=date_str, title=title,
+                        )
+                    else:
+                        atom_id = f"todo-{src_id}-{date_str}"
+                        xml_str = _build_todo_item_xml(
+                            source_block_id=src_id, date_str=date_str, content=title,
+                        )
+                    if dn_writer.find_block_by_id(atom_id) is not None:
+                        continue
+                    dn_writer.append_block(xml_str)
+                    atoms_materialized += 1
+            except Exception as exc:
+                logger.warning(
+                    "materialize_scheduled_atoms_failed",
+                    extra_context={
+                        "graph_id": graph_id,
+                        "source_document_id": document_id,
+                        "daily_note_id": daily_note_id,
+                        "error": str(exc),
+                    },
+                )
+
+    return {
+        "applied": applied,
+        "daily_notes_ensured": daily_notes_ensured,
+        "atoms_materialized": atoms_materialized,
+    }
+
+
 def _normalize_timestamp_to_iso(value: Any) -> str | None:
     """Normalize timestamp-like values to ISO-8601 UTC.
 
@@ -1316,7 +1543,7 @@ GROUP BY ?docId
         graph_id: str,
         auth: MCPAuthContext,
     ) -> dict | None:
-        """Apply pending tags as CRDT data-tags + data-tag-expirations attrs.
+        """Apply pending tags via the shared apply-with-side-effects helper.
 
         Fire-and-forget: returns results on success, logs and returns
         error dict on failure. Never raises.
@@ -1329,184 +1556,17 @@ GROUP BY ?docId
             return None
 
         try:
-            import json as _json
             user_id = auth.user_id or (get_user_id_from_token(auth.token) if auth.token else None)
             if not user_id:
                 return {"error": "Could not resolve user_id for inline tags"}
 
-            channel = hp_client.get_document_channel(graph_id, document_id, user_id=user_id)
-            if not channel:
-                return {"error": f"No channel for {document_id}"}
-
-            writer = DocumentWriter(channel.doc)
-            reader = DocumentReader(channel.doc)
-            applied = 0
-            # Per-(source-block, tag, date) records for newly applied
-            # event/todo expirations. Used after the doc-side loop to
-            # ensure target daily-notes exist AND to materialize atoms
-            # (calendarEvent / todoItem) into them.
-            scheduled_items: list[dict] = []
-            for entry in entries:
-                block_id = entry["block_id"]
-                new_tags = entry["tags"]
-                # Resolve relative durations (e.g. "7d") to absolute ISO dates;
-                # drop anything we can't normalize so the platform sees only
-                # well-formed YYYY-MM-DD values.
-                new_expirations = _resolve_tag_expirations(entry.get("expirations") or {})
-
-                # Read existing tags and merge
-                result = writer.find_block_by_id(block_id)
-                if result is None:
-                    continue
-
-                _idx, elem = result
-                existing_raw = elem.attributes.get("data-tags")
-                existing_tags: list[str] = []
-                if existing_raw:
-                    try:
-                        parsed = _json.loads(existing_raw)
-                        if isinstance(parsed, list):
-                            existing_tags = [str(t) for t in parsed if t]
-                    except (_json.JSONDecodeError, TypeError):
-                        pass
-
-                # Merge tags: union, preserving order.
-                merged_tags = list(dict.fromkeys(existing_tags + new_tags))
-
-                # Read existing expirations and merge with new (new wins on
-                # conflict — typing {#todo:14d} updates a prior {#todo:7d}).
-                existing_exp_raw = elem.attributes.get("data-tag-expirations")
-                existing_expirations: dict[str, str] = {}
-                if existing_exp_raw:
-                    try:
-                        parsed_exp = _json.loads(existing_exp_raw)
-                        if isinstance(parsed_exp, dict):
-                            existing_expirations = {
-                                str(k).strip().lstrip("#").lower(): str(v).strip()
-                                for k, v in parsed_exp.items()
-                                if k and v
-                            }
-                    except (_json.JSONDecodeError, TypeError):
-                        pass
-                merged_expirations = dict(existing_expirations)
-                merged_expirations.update(new_expirations)
-                # Drop expirations whose tag was not actually applied to this
-                # block — keeps the two attrs in sync.
-                merged_expirations = {
-                    k: v for k, v in merged_expirations.items() if k in merged_tags
-                }
-
-                # Track event/todo expirations only when NEWLY applied
-                # (or when the date changed). Pre-existing pairs already
-                # had their daily-note + atom created on a prior write.
-                source_text = ""
-                source_text_loaded = False
-                for tag_name, date_str in new_expirations.items():
-                    if tag_name not in _SCHEDULED_TAGS:
-                        continue
-                    if existing_expirations.get(tag_name) == date_str:
-                        continue
-                    # Lazy-load source block text once per entry.
-                    if not source_text_loaded:
-                        try:
-                            info = reader.get_block_text_info(block_id)
-                            source_text = (info or {}).get("text", "") or ""
-                        except Exception:
-                            source_text = ""
-                        source_text_loaded = True
-                    scheduled_items.append({
-                        "source_block_id": block_id,
-                        "tag": tag_name,
-                        "date": date_str,
-                        "title": source_text,
-                    })
-
-                attrs_to_write: dict[str, str] = {
-                    "data-tags": _json.dumps(merged_tags),
-                }
-                if merged_expirations:
-                    attrs_to_write["data-tag-expirations"] = _json.dumps(merged_expirations)
-                writer.update_block_attributes(block_id, attrs_to_write)
-                applied += 1
-
-            # Preemptively ensure daily-notes exist for any newly-applied
-            # event/todo dates. Idempotent on re-write. Failures here are
-            # non-fatal — the source-doc tag write still succeeded.
-            daily_notes_ensured = 0
-            atoms_materialized = 0
-            if scheduled_items:
-                unique_dates = sorted({item["date"] for item in scheduled_items})
-                try:
-                    def _ensure_dailies(ws_doc: Any) -> None:
-                        ws_writer = WorkspaceWriter(ws_doc)
-                        for date_str in unique_dates:
-                            ws_writer.ensure_daily_note(date_str)
-                    await hp_client.transact_workspace(
-                        graph_id, _ensure_dailies, user_id=user_id,
-                    )
-                    daily_notes_ensured = len(unique_dates)
-                except Exception as exc:
-                    logger.warning(
-                        "ensure_daily_notes_for_scheduled_tags_failed",
-                        extra_context={
-                            "graph_id": graph_id,
-                            "document_id": document_id,
-                            "dates": unique_dates,
-                            "error": str(exc),
-                        },
-                    )
-
-                # Materialize atoms in each target daily-note's content
-                # CRDT. Idempotent via deterministic block id. Per-date
-                # failures are isolated and logged; the rest still proceed.
-                items_by_date: dict[str, list[dict]] = {}
-                for item in scheduled_items:
-                    items_by_date.setdefault(item["date"], []).append(item)
-                for date_str, items in items_by_date.items():
-                    daily_note_id = f"daily-note-{date_str}"
-                    try:
-                        dn_channel = hp_client.get_document_channel(
-                            graph_id, daily_note_id, user_id=user_id,
-                        )
-                        if not dn_channel:
-                            continue
-                        dn_writer = DocumentWriter(dn_channel.doc)
-                        for item in items:
-                            tag = item["tag"]
-                            src_id = item["source_block_id"]
-                            title = item["title"]
-                            if tag == "event":
-                                atom_id = f"evt-{src_id}-{date_str}"
-                                xml_str = _build_calendar_event_xml(
-                                    source_block_id=src_id,
-                                    date_str=date_str,
-                                    title=title,
-                                )
-                            else:  # todo
-                                atom_id = f"todo-{src_id}-{date_str}"
-                                xml_str = _build_todo_item_xml(
-                                    source_block_id=src_id,
-                                    date_str=date_str,
-                                    content=title,
-                                )
-                            # Idempotency: skip if a block with this
-                            # deterministic id already lives in the
-                            # daily-note's content.
-                            if dn_writer.find_block_by_id(atom_id) is not None:
-                                continue
-                            dn_writer.append_block(xml_str)
-                            atoms_materialized += 1
-                    except Exception as exc:
-                        logger.warning(
-                            "materialize_scheduled_atoms_failed",
-                            extra_context={
-                                "graph_id": graph_id,
-                                "source_document_id": document_id,
-                                "daily_note_id": daily_note_id,
-                                "error": str(exc),
-                            },
-                        )
-
+            result = await apply_tags_with_side_effects(
+                hp_client=hp_client,
+                graph_id=graph_id,
+                document_id=document_id,
+                user_id=user_id,
+                entries=entries,
+            )
             logger.info(
                 "inline_tags_applied",
                 extra_context={
@@ -1516,17 +1576,12 @@ GROUP BY ?docId
                     "expirations_count": sum(
                         len(e.get("expirations") or {}) for e in entries
                     ),
-                    "blocks_updated": applied,
-                    "daily_notes_ensured": daily_notes_ensured,
-                    "atoms_materialized": atoms_materialized,
+                    "blocks_updated": result["applied"],
+                    "daily_notes_ensured": result["daily_notes_ensured"],
+                    "atoms_materialized": result["atoms_materialized"],
                 },
             )
-            return {
-                "applied": applied,
-                "entries": len(entries),
-                "daily_notes_ensured": daily_notes_ensured,
-                "atoms_materialized": atoms_materialized,
-            }
+            return {**result, "entries": len(entries)}
         except Exception as e:
             logger.warning(
                 "inline_tags_failed",
@@ -4133,101 +4188,19 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             tag_result = None
             if all_pending_tag_entries:
                 try:
-                    import json as _json
                     user_id = auth.user_id or (get_user_id_from_token(auth.token) if auth.token else None)
                     if user_id:
-                        channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip(), user_id=user_id)
-                        if channel:
-                            writer = DocumentWriter(channel.doc)
-                            applied = 0
-                            scheduled_dates: set[tuple[str, str]] = set()
-                            for te in all_pending_tag_entries:
-                                bid = te["block_id"]
-                                result_find = writer.find_block_by_id(bid)
-                                if result_find is None:
-                                    continue
-                                _idx, elem = result_find
-                                existing_raw = elem.attributes.get("data-tags")
-                                existing_tags: list[str] = []
-                                if existing_raw:
-                                    try:
-                                        parsed = _json.loads(existing_raw)
-                                        if isinstance(parsed, list):
-                                            existing_tags = [str(t) for t in parsed if t]
-                                    except (_json.JSONDecodeError, TypeError):
-                                        pass
-                                merged_tags = list(dict.fromkeys(existing_tags + te["tags"]))
-
-                                # Resolve and merge expirations (relative
-                                # durations like "7d" → absolute ISO dates).
-                                new_expirations = _resolve_tag_expirations(
-                                    te.get("expirations") or {}
-                                )
-                                existing_exp_raw = elem.attributes.get(
-                                    "data-tag-expirations"
-                                )
-                                merged_exp: dict[str, str] = {}
-                                if existing_exp_raw:
-                                    try:
-                                        parsed_exp = _json.loads(existing_exp_raw)
-                                        if isinstance(parsed_exp, dict):
-                                            merged_exp = {
-                                                str(k).strip().lstrip("#").lower(): str(v).strip()
-                                                for k, v in parsed_exp.items()
-                                                if k and v
-                                            }
-                                    except (_json.JSONDecodeError, TypeError):
-                                        pass
-                                merged_exp.update(new_expirations)
-                                merged_exp = {
-                                    k: v for k, v in merged_exp.items() if k in merged_tags
-                                }
-
-                                # Track event/todo dates for preemptive
-                                # daily-note creation after the doc loop.
-                                for tag_name, date_str in new_expirations.items():
-                                    if tag_name in _SCHEDULED_TAGS:
-                                        scheduled_dates.add((tag_name, date_str))
-
-                                attrs_to_write: dict[str, str] = {
-                                    "data-tags": _json.dumps(merged_tags),
-                                }
-                                if merged_exp:
-                                    attrs_to_write["data-tag-expirations"] = _json.dumps(merged_exp)
-                                writer.update_block_attributes(bid, attrs_to_write)
-                                applied += 1
-
-                            # Preemptively ensure daily-notes for newly-applied
-                            # event/todo dates. Workspace metadata only;
-                            # content is materialized lazily on daily-note open.
-                            daily_notes_ensured = 0
-                            if scheduled_dates:
-                                unique_dates = sorted({d for _t, d in scheduled_dates})
-                                try:
-                                    def _ensure_dailies(ws_doc: Any) -> None:
-                                        ws_writer = WorkspaceWriter(ws_doc)
-                                        for date_str in unique_dates:
-                                            ws_writer.ensure_daily_note(date_str)
-                                    await hp_client.transact_workspace(
-                                        graph_id.strip(), _ensure_dailies, user_id=user_id,
-                                    )
-                                    daily_notes_ensured = len(unique_dates)
-                                except Exception as ws_exc:
-                                    logger.warning(
-                                        "ensure_daily_notes_for_scheduled_tags_failed",
-                                        extra_context={
-                                            "graph_id": graph_id,
-                                            "document_id": document_id,
-                                            "dates": unique_dates,
-                                            "error": str(ws_exc),
-                                        },
-                                    )
-
-                            tag_result = {
-                                "applied": applied,
-                                "entries": len(all_pending_tag_entries),
-                                "daily_notes_ensured": daily_notes_ensured,
-                            }
+                        side_result = await apply_tags_with_side_effects(
+                            hp_client=hp_client,
+                            graph_id=graph_id.strip(),
+                            document_id=document_id.strip(),
+                            user_id=user_id,
+                            entries=all_pending_tag_entries,
+                        )
+                        tag_result = {
+                            **side_result,
+                            "entries": len(all_pending_tag_entries),
+                        }
                 except Exception as e:
                     logger.warning(
                         "inline_tags_failed",
