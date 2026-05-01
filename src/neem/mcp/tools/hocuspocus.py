@@ -272,6 +272,50 @@ class _EditMatchError(ValueError):
         self.diagnostics = diagnostics
 
 
+_TAG_EXP_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_TAG_EXP_REL_RE = re.compile(r"^(\d+)d$")
+
+
+def _resolve_tag_expirations(
+    raw: dict[str, str] | None,
+    *,
+    today: Any = None,
+) -> dict[str, str]:
+    """Normalize raw expiration values to absolute ISO calendar dates.
+
+    Accepts:
+    - ``<N>d`` — N days from today (UTC by default)
+    - ``YYYY-MM-DD`` — pass through
+    - anything else — dropped
+
+    Returns a dict mapping lowercase tag name → ``YYYY-MM-DD``. The platform
+    rejects non-ISO forms when materializing to RDF; resolving here keeps
+    the contract clean (CRDT carries absolute dates only). The ``today``
+    parameter is exposed for tests; production callers leave it None and
+    pick up datetime.date.today().
+    """
+    from datetime import date as _date, timedelta as _timedelta
+
+    if not raw:
+        return {}
+    today_val = today if today is not None else _date.today()
+    out: dict[str, str] = {}
+    for tag, value in raw.items():
+        tag_norm = (str(tag) if tag is not None else "").strip().lstrip("#").lower()
+        value_str = (str(value) if value is not None else "").strip()
+        if not tag_norm or not value_str or tag_norm in out:
+            continue
+        if _TAG_EXP_ISO_RE.match(value_str):
+            out[tag_norm] = value_str
+            continue
+        m = _TAG_EXP_REL_RE.match(value_str)
+        if m:
+            days = int(m.group(1))
+            resolved = today_val + _timedelta(days=days)
+            out[tag_norm] = resolved.isoformat()
+    return out
+
+
 def _normalize_timestamp_to_iso(value: Any) -> str | None:
     """Normalize timestamp-like values to ISO-8601 UTC.
 
@@ -1208,7 +1252,7 @@ GROUP BY ?docId
         graph_id: str,
         auth: MCPAuthContext,
     ) -> dict | None:
-        """Apply pending tags as CRDT data-tags attributes on blocks.
+        """Apply pending tags as CRDT data-tags + data-tag-expirations attrs.
 
         Fire-and-forget: returns results on success, logs and returns
         error dict on failure. Never raises.
@@ -1235,6 +1279,10 @@ GROUP BY ?docId
             for entry in entries:
                 block_id = entry["block_id"]
                 new_tags = entry["tags"]
+                # Resolve relative durations (e.g. "7d") to absolute ISO dates;
+                # drop anything we can't normalize so the platform sees only
+                # well-formed YYYY-MM-DD values.
+                new_expirations = _resolve_tag_expirations(entry.get("expirations") or {})
 
                 # Read existing tags and merge
                 result = writer.find_block_by_id(block_id)
@@ -1252,9 +1300,37 @@ GROUP BY ?docId
                     except (_json.JSONDecodeError, TypeError):
                         pass
 
-                # Merge: union of existing and new, preserving order
-                merged = list(dict.fromkeys(existing_tags + new_tags))
-                writer.update_block_attributes(block_id, {"data-tags": _json.dumps(merged)})
+                # Merge tags: union, preserving order.
+                merged_tags = list(dict.fromkeys(existing_tags + new_tags))
+
+                # Read existing expirations and merge with new (new wins on
+                # conflict — typing {#todo:14d} updates a prior {#todo:7d}).
+                existing_exp_raw = elem.attributes.get("data-tag-expirations")
+                merged_expirations: dict[str, str] = {}
+                if existing_exp_raw:
+                    try:
+                        parsed_exp = _json.loads(existing_exp_raw)
+                        if isinstance(parsed_exp, dict):
+                            merged_expirations = {
+                                str(k).strip().lstrip("#").lower(): str(v).strip()
+                                for k, v in parsed_exp.items()
+                                if k and v
+                            }
+                    except (_json.JSONDecodeError, TypeError):
+                        pass
+                merged_expirations.update(new_expirations)
+                # Drop expirations whose tag was not actually applied to this
+                # block — keeps the two attrs in sync.
+                merged_expirations = {
+                    k: v for k, v in merged_expirations.items() if k in merged_tags
+                }
+
+                attrs_to_write: dict[str, str] = {
+                    "data-tags": _json.dumps(merged_tags),
+                }
+                if merged_expirations:
+                    attrs_to_write["data-tag-expirations"] = _json.dumps(merged_expirations)
+                writer.update_block_attributes(block_id, attrs_to_write)
                 applied += 1
 
             logger.info(
@@ -1263,6 +1339,9 @@ GROUP BY ?docId
                     "graph_id": graph_id,
                     "document_id": document_id,
                     "tags_count": sum(len(e["tags"]) for e in entries),
+                    "expirations_count": sum(
+                        len(e.get("expirations") or {}) for e in entries
+                    ),
                     "blocks_updated": applied,
                 },
             )
@@ -3805,10 +3884,13 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                     # Block ID is already known — map tags directly
                     if pending_tags and bid:
                         for pt in pending_tags:
-                            all_pending_tag_entries.append({
+                            entry: dict = {
                                 "block_id": bid.strip(),
                                 "tags": pt.tags,
-                            })
+                            }
+                            if pt.expirations:
+                                entry["expirations"] = pt.expirations
+                            all_pending_tag_entries.append(entry)
                 preprocessed_updates.append({
                     "block_id": bid,
                     "resolved_xml": resolved_xml,
@@ -3892,8 +3974,39 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                                             existing_tags = [str(t) for t in parsed if t]
                                     except (_json.JSONDecodeError, TypeError):
                                         pass
-                                merged = list(dict.fromkeys(existing_tags + te["tags"]))
-                                writer.update_block_attributes(bid, {"data-tags": _json.dumps(merged)})
+                                merged_tags = list(dict.fromkeys(existing_tags + te["tags"]))
+
+                                # Resolve and merge expirations (relative
+                                # durations like "7d" → absolute ISO dates).
+                                new_expirations = _resolve_tag_expirations(
+                                    te.get("expirations") or {}
+                                )
+                                existing_exp_raw = elem.attributes.get(
+                                    "data-tag-expirations"
+                                )
+                                merged_exp: dict[str, str] = {}
+                                if existing_exp_raw:
+                                    try:
+                                        parsed_exp = _json.loads(existing_exp_raw)
+                                        if isinstance(parsed_exp, dict):
+                                            merged_exp = {
+                                                str(k).strip().lstrip("#").lower(): str(v).strip()
+                                                for k, v in parsed_exp.items()
+                                                if k and v
+                                            }
+                                    except (_json.JSONDecodeError, TypeError):
+                                        pass
+                                merged_exp.update(new_expirations)
+                                merged_exp = {
+                                    k: v for k, v in merged_exp.items() if k in merged_tags
+                                }
+
+                                attrs_to_write: dict[str, str] = {
+                                    "data-tags": _json.dumps(merged_tags),
+                                }
+                                if merged_exp:
+                                    attrs_to_write["data-tag-expirations"] = _json.dumps(merged_exp)
+                                writer.update_block_attributes(bid, attrs_to_write)
                                 applied += 1
                             tag_result = {"applied": applied, "entries": len(all_pending_tag_entries)}
                 except Exception as e:
