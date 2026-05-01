@@ -275,6 +275,14 @@ class _EditMatchError(ValueError):
 _TAG_EXP_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _TAG_EXP_REL_RE = re.compile(r"^(\d+)d$")
 
+# Tags whose dated expirations preemptively create a daily-note doc for
+# the target date and (eventually) materialize a structured block on it.
+# Per the integration design: #event becomes a calendarEvent atom on the
+# daily-note; #todo becomes a todoItem in the Follow-ups section. The
+# atom/item materialization is read-time on daily-note open; only the
+# workspace-level doc-existence gate is write-time.
+_SCHEDULED_TAGS: frozenset[str] = frozenset({"event", "todo"})
+
 
 def _resolve_tag_expirations(
     raw: dict[str, str] | None,
@@ -1276,6 +1284,11 @@ GROUP BY ?docId
 
             writer = DocumentWriter(channel.doc)
             applied = 0
+            # (tag_name, date_str) pairs from this batch where the tag is in
+            # the "schedules-into-daily-note" set (event/todo). Collected as
+            # we apply, used after the doc-side loop to ensure the target
+            # daily-notes exist in the workspace.
+            scheduled_dates: set[tuple[str, str]] = set()
             for entry in entries:
                 block_id = entry["block_id"]
                 new_tags = entry["tags"]
@@ -1325,6 +1338,14 @@ GROUP BY ?docId
                     k: v for k, v in merged_expirations.items() if k in merged_tags
                 }
 
+                # Track event/todo expirations so we can preemptively create
+                # the target daily-notes. Only newly-applied expirations
+                # count; we don't re-fire on expirations the block already
+                # had (those daily-notes were ensured on the prior write).
+                for tag_name, date_str in new_expirations.items():
+                    if tag_name in _SCHEDULED_TAGS:
+                        scheduled_dates.add((tag_name, date_str))
+
                 attrs_to_write: dict[str, str] = {
                     "data-tags": _json.dumps(merged_tags),
                 }
@@ -1332,6 +1353,33 @@ GROUP BY ?docId
                     attrs_to_write["data-tag-expirations"] = _json.dumps(merged_expirations)
                 writer.update_block_attributes(block_id, attrs_to_write)
                 applied += 1
+
+            # Preemptively ensure daily-notes exist for any newly-applied
+            # event/todo dates. Idempotent on re-write. Workspace metadata
+            # only — content is materialized lazily by the frontend on
+            # daily-note open. Failures here are non-fatal.
+            daily_notes_ensured = 0
+            if scheduled_dates:
+                unique_dates = sorted({d for _t, d in scheduled_dates})
+                try:
+                    def _ensure_dailies(ws_doc: Any) -> None:
+                        ws_writer = WorkspaceWriter(ws_doc)
+                        for date_str in unique_dates:
+                            ws_writer.ensure_daily_note(date_str)
+                    await hp_client.transact_workspace(
+                        graph_id, _ensure_dailies, user_id=user_id,
+                    )
+                    daily_notes_ensured = len(unique_dates)
+                except Exception as exc:
+                    logger.warning(
+                        "ensure_daily_notes_for_scheduled_tags_failed",
+                        extra_context={
+                            "graph_id": graph_id,
+                            "document_id": document_id,
+                            "dates": unique_dates,
+                            "error": str(exc),
+                        },
+                    )
 
             logger.info(
                 "inline_tags_applied",
@@ -1343,9 +1391,14 @@ GROUP BY ?docId
                         len(e.get("expirations") or {}) for e in entries
                     ),
                     "blocks_updated": applied,
+                    "daily_notes_ensured": daily_notes_ensured,
                 },
             )
-            return {"applied": applied, "entries": len(entries)}
+            return {
+                "applied": applied,
+                "entries": len(entries),
+                "daily_notes_ensured": daily_notes_ensured,
+            }
         except Exception as e:
             logger.warning(
                 "inline_tags_failed",
@@ -3959,6 +4012,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                         if channel:
                             writer = DocumentWriter(channel.doc)
                             applied = 0
+                            scheduled_dates: set[tuple[str, str]] = set()
                             for te in all_pending_tag_entries:
                                 bid = te["block_id"]
                                 result_find = writer.find_block_by_id(bid)
@@ -4001,6 +4055,12 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                                     k: v for k, v in merged_exp.items() if k in merged_tags
                                 }
 
+                                # Track event/todo dates for preemptive
+                                # daily-note creation after the doc loop.
+                                for tag_name, date_str in new_expirations.items():
+                                    if tag_name in _SCHEDULED_TAGS:
+                                        scheduled_dates.add((tag_name, date_str))
+
                                 attrs_to_write: dict[str, str] = {
                                     "data-tags": _json.dumps(merged_tags),
                                 }
@@ -4008,7 +4068,38 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                                     attrs_to_write["data-tag-expirations"] = _json.dumps(merged_exp)
                                 writer.update_block_attributes(bid, attrs_to_write)
                                 applied += 1
-                            tag_result = {"applied": applied, "entries": len(all_pending_tag_entries)}
+
+                            # Preemptively ensure daily-notes for newly-applied
+                            # event/todo dates. Workspace metadata only;
+                            # content is materialized lazily on daily-note open.
+                            daily_notes_ensured = 0
+                            if scheduled_dates:
+                                unique_dates = sorted({d for _t, d in scheduled_dates})
+                                try:
+                                    def _ensure_dailies(ws_doc: Any) -> None:
+                                        ws_writer = WorkspaceWriter(ws_doc)
+                                        for date_str in unique_dates:
+                                            ws_writer.ensure_daily_note(date_str)
+                                    await hp_client.transact_workspace(
+                                        graph_id.strip(), _ensure_dailies, user_id=user_id,
+                                    )
+                                    daily_notes_ensured = len(unique_dates)
+                                except Exception as ws_exc:
+                                    logger.warning(
+                                        "ensure_daily_notes_for_scheduled_tags_failed",
+                                        extra_context={
+                                            "graph_id": graph_id,
+                                            "document_id": document_id,
+                                            "dates": unique_dates,
+                                            "error": str(ws_exc),
+                                        },
+                                    )
+
+                            tag_result = {
+                                "applied": applied,
+                                "entries": len(all_pending_tag_entries),
+                                "daily_notes_ensured": daily_notes_ensured,
+                            }
                 except Exception as e:
                     logger.warning(
                         "inline_tags_failed",
