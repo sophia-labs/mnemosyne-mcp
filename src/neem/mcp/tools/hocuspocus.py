@@ -315,6 +315,78 @@ def _build_calendar_event_xml(
     )
 
 
+def _sync_tag_chips_to_block(
+    elem: Any,
+    tag_dates: dict[str, str | None],
+) -> int:
+    """Ensure inline tag-chip atoms exist in a block matching the supplied
+    {tag_name → date} map.
+
+    Per (tag, date) pair:
+      - if no chip with this tag-name exists in the block, append one
+      - if a chip exists with this name but a different date, update its
+        date attribute in place (avoids accumulating duplicate-name chips
+        with stale dates)
+      - if a chip already exists with the same name + date, no-op
+
+    Multiple chips with the same name are tolerated on read (the frontend
+    sync plugin's ``collectChipsFromBlock`` keeps the last date wins);
+    we never produce duplicates from this helper, but legacy content or
+    cross-collaborator races might. Returns the number of chips added or
+    updated.
+    """
+    import pycrdt
+
+    def _attr_or_empty(attrs: Any, key: str) -> str:
+        # pycrdt's XmlAttributesView.get() takes only the key (no default),
+        # raising KeyError on miss — different from a regular dict. Wrap
+        # the access so callers can ask "what's there or empty string?"
+        # without trying to remember which kind of view they have.
+        try:
+            value = attrs[key]
+        except (KeyError, TypeError):
+            return ""
+        return value or ""
+
+    existing_by_name: dict[str, Any] = {}
+    for child in elem.children:
+        if not isinstance(child, pycrdt.XmlElement):
+            continue
+        if child.tag != "mn-tag-chip":
+            continue
+        name_attr = _attr_or_empty(child.attributes, "name")
+        if name_attr and name_attr not in existing_by_name:
+            existing_by_name[name_attr] = child
+
+    changed = 0
+    for tag, date in tag_dates.items():
+        if not tag:
+            continue
+        target_date = (date or "").strip()
+        existing = existing_by_name.get(tag)
+        if existing is not None:
+            existing_date = _attr_or_empty(existing.attributes, "date")
+            if existing_date != target_date:
+                if target_date:
+                    existing.attributes["date"] = target_date
+                # If target_date is empty we leave the old date attribute
+                # alone — the data layer (data-tag-expirations) is the
+                # source of truth for "no longer dated"; the chip will
+                # be reconciled on next user edit by the frontend sync
+                # plugin's collectChipsFromBlock semantics.
+                changed += 1
+            continue
+        # Append new chip atom.
+        chip_attrs: dict[str, Any] = {"name": tag, "data-tag-chip": ""}
+        if target_date:
+            chip_attrs["date"] = target_date
+        chip = pycrdt.XmlElement("mn-tag-chip", chip_attrs)
+        elem.children.append(chip)
+        existing_by_name[tag] = chip
+        changed += 1
+    return changed
+
+
 def _build_todo_item_xml(
     *,
     source_block_id: str,
@@ -535,6 +607,38 @@ async def apply_tags_with_side_effects(
             attrs_to_write["data-tag-expirations"] = _json.dumps(merged_expirations)
         writer.update_block_attributes(block_id, attrs_to_write)
         applied += 1
+
+        # Sync inline tag-chip atoms for the tags this call newly added
+        # (or whose date changed). Existing tags whose date is unchanged
+        # are not touched — we don't retroactively bootstrap chips for
+        # legacy data-tags from this call. The frontend's TagChipSync
+        # plugin keeps data-tags in sync with chips, so the only path
+        # that adds chips server-side is "the tag is newly applied here".
+        chip_specs: dict[str, str | None] = {}
+        for tag in new_tags:
+            tag_norm = (tag or "").strip().lstrip("#").lower()
+            if not tag_norm or tag_norm not in merged_tags:
+                continue
+            new_date = new_expirations.get(tag_norm)
+            old_date = existing_expirations.get(tag_norm)
+            # Only emit a chip-spec when the tag is newly added OR the
+            # date changed. Same-date no-ops are filtered out.
+            if tag_norm not in existing_tags or new_date != old_date:
+                chip_specs[tag_norm] = new_date or None
+        if chip_specs:
+            try:
+                with channel.doc.transaction():
+                    _sync_tag_chips_to_block(elem, chip_specs)
+            except Exception as exc:
+                logger.warning(
+                    "sync_tag_chips_failed",
+                    extra_context={
+                        "graph_id": graph_id,
+                        "document_id": document_id,
+                        "block_id": block_id,
+                        "error": str(exc),
+                    },
+                )
 
     # Ensure daily-notes for newly-applied event/todo dates.
     daily_notes_ensured = 0
