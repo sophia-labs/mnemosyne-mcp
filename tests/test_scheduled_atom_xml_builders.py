@@ -61,7 +61,11 @@ class TestCalendarEventBuilder:
             date_str="2026-05-15",
             title="x",
         )
-        assert xml.startswith("<mn-calendar-event ")
+        # Tag MUST be the PM schema node name `calendarEvent`, not the
+        # HTML render tag `mn-calendar-event`. y-prosemirror maps Y →
+        # PM via schema.node(el.nodeName, ...) directly; a tag mismatch
+        # raises and the atom is silently deleted on next sync.
+        assert xml.startswith("<calendarEvent ")
         assert xml.endswith("/>")
 
     def test_empty_title_produces_empty_string(self) -> None:
@@ -92,8 +96,12 @@ class TestTodoItemBuilder:
             content="follow up with vendor",
         )
         assert 'data-block-id="todo-b1-2026-05-15"' in xml
-        assert 'listType="todo"' in xml
-        assert 'checked="false"' in xml
+        # listType MUST be `task` — only that value triggers the
+        # checkbox-rendering branch in the listItem extension.
+        assert 'listType="task"' in xml
+        # checked must be ABSENT — string "false" is truthy in JS, so
+        # any value (incl. "false") would render as pre-checked.
+        assert 'checked="' not in xml
 
     def test_carries_source_reference(self) -> None:
         xml = _build_todo_item_xml(

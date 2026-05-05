@@ -298,12 +298,19 @@ def _build_calendar_event_xml(
     the duplicate). externalEventId tracks the source block so future
     operations (cleanup on tag removal, source-edit propagation) can locate
     the atom from the source side.
+
+    XML tag is the ProseMirror schema node name (``calendarEvent``), not the
+    HTML render tag (``mn-calendar-event``). y-prosemirror reconciles
+    Y.XmlElement → PM via ``schema.node(el.nodeName, ...)`` directly — a
+    tag mismatch raises and the atom is silently deleted on next sync.
+    The HTML tag ``mn-calendar-event`` is the *render-time* output of the
+    extension's renderHTML, not the storage tag.
     """
     import html as _html
 
     atom_id = f"evt-{source_block_id}-{date_str}"
     return (
-        '<mn-calendar-event '
+        '<calendarEvent '
         f'id="{_html.escape(atom_id, quote=True)}" '
         f'data-block-id="{_html.escape(atom_id, quote=True)}" '
         f'data-source-block-id="{_html.escape(source_block_id, quote=True)}" '
@@ -397,6 +404,15 @@ def _build_todo_item_xml(
 
     Block id is deterministic from (source, date) for idempotent insert.
     data-source-block-id tracks the origin for future maintenance flows.
+
+    listType MUST be ``task`` (the listItem extension's task-checkbox
+    rendering branch). Earlier ``todo`` was wrong: the extension only
+    branches into the checkbox renderHTML path on listType==='task', so
+    a ``todo`` value silently fell back to plain bullet rendering.
+
+    ``checked`` is intentionally omitted: the literal string ``"false"``
+    deserializes as truthy in y-prosemirror, which would render the new
+    task pre-checked. Absence is the canonical unchecked state.
     """
     import html as _html
 
@@ -405,8 +421,7 @@ def _build_todo_item_xml(
         '<listItem '
         f'data-block-id="{_html.escape(block_id, quote=True)}" '
         f'data-source-block-id="{_html.escape(source_block_id, quote=True)}" '
-        'listType="todo" '
-        'checked="false">'
+        'listType="task">'
         f'<paragraph>{_html.escape(content or "", quote=False)}</paragraph>'
         '</listItem>'
     )
