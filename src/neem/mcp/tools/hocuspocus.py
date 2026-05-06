@@ -284,6 +284,24 @@ _TAG_EXP_REL_RE = re.compile(r"^(\d+)d$")
 # and the sidebar even before anyone opens them.
 _SCHEDULED_TAGS: frozenset[str] = frozenset({"event", "todo"})
 
+# Reserved doc-id prefix for synthesized read-only tag-page views. Mirrors
+# the platform's `app.services.documents.tag_pages.TAG_PAGE_PREFIX`. Kept
+# in lockstep so the two sides reject mutations on the same set of ids.
+TAG_PAGE_DOC_ID_PREFIX = "tag-page-"
+
+
+def is_tag_page_doc_id(doc_id: str) -> bool:
+    """True iff ``doc_id`` addresses a synthesized read-only tag-page view."""
+    return isinstance(doc_id, str) and doc_id.startswith(TAG_PAGE_DOC_ID_PREFIX)
+
+
+def tag_page_read_only_error(doc_id: str) -> RuntimeError:
+    """Build the user-facing rejection error for a tag-page write attempt."""
+    return RuntimeError(
+        f"Document '{doc_id}' is a synthesized tag-page view (read-only). "
+        f"To edit a tagged block, open it in its source document."
+    )
+
 
 def _build_calendar_event_xml(
     *,
@@ -1299,6 +1317,13 @@ GROUP BY ?docId
         Call this in write tools *after* _validate_document_in_workspace
         (which ensures the workspace channel is already connected).
         """
+        # Tag-pages are synthesized read-only views over blocks tagged with
+        # a given name. They have no Y.Doc, no persisted RDF representation
+        # of the view itself, and no edit affordances. Reject up-front so
+        # the caller gets a clear message instead of a cascade of "doc not
+        # found" errors from the workspace check below.
+        if is_tag_page_doc_id(document_id):
+            raise tag_page_read_only_error(document_id)
         ws_channel = hp_client.get_workspace_channel(graph_id, user_id=user_id)
         if ws_channel is None:
             # Workspace not connected — try connecting
