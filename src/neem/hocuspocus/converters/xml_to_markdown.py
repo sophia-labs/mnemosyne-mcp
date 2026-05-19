@@ -42,6 +42,7 @@ TASK_LIST_TAG = "taskList"
 # Inline elements
 FOOTNOTE_TAG = "footnote"
 WIKILINK_TAG = "wikilink"
+TAG_CHIP_TAG = "mn-tag-chip"
 HARD_BREAK_TAG = "hardBreak"
 
 
@@ -314,6 +315,17 @@ def _convert_inline(
     if tag == WIKILINK_TAG:
         label = elem.get("label", "")
         return label  # Just output the label text
+
+    # Tag chip (inline atom): render to "#name" or "#name:date" so the
+    # text round-trips back through the editor's input rule on next
+    # paste. The frontend's TipTap TagRecognition will re-promote the
+    # text to a chip atom on the trailing space after typing.
+    if tag == TAG_CHIP_TAG:
+        name = (elem.get("name") or "").strip().lower()
+        if not name:
+            return ""
+        date = (elem.get("date") or "").strip()
+        return f"#{name}:{date}" if date else f"#{name}"
 
     # Hard break
     if tag == HARD_BREAK_TAG:

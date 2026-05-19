@@ -272,6 +272,478 @@ class _EditMatchError(ValueError):
         self.diagnostics = diagnostics
 
 
+_TAG_EXP_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_TAG_EXP_REL_RE = re.compile(r"^(\d+)d$")
+
+# Tags whose dated expirations preemptively create a daily-note doc for
+# the target date and materialize a structured block on it. Per the
+# integration design (Eschaton 2026-05-01): #event becomes a calendarEvent
+# atom on the daily-note (so /event's inline-edit UI can fully edit it);
+# #todo becomes a todoItem with the source block content. Both paths
+# fire write-time so future-dated daily-notes have presence in search
+# and the sidebar even before anyone opens them.
+_SCHEDULED_TAGS: frozenset[str] = frozenset({"event", "todo"})
+
+# Reserved doc-id prefix for synthesized read-only tag-page views. Mirrors
+# the platform's `app.services.documents.tag_pages.TAG_PAGE_PREFIX`. Kept
+# in lockstep so the two sides reject mutations on the same set of ids.
+TAG_PAGE_DOC_ID_PREFIX = "tag-page-"
+
+
+def is_tag_page_doc_id(doc_id: str) -> bool:
+    """True iff ``doc_id`` addresses a synthesized read-only tag-page view."""
+    return isinstance(doc_id, str) and doc_id.startswith(TAG_PAGE_DOC_ID_PREFIX)
+
+
+def tag_page_read_only_error(doc_id: str) -> RuntimeError:
+    """Build the user-facing rejection error for a tag-page write attempt."""
+    return RuntimeError(
+        f"Document '{doc_id}' is a synthesized tag-page view (read-only). "
+        f"To edit a tagged block, open it in its source document."
+    )
+
+
+def _build_calendar_event_xml(
+    *,
+    source_block_id: str,
+    date_str: str,
+    title: str,
+) -> str:
+    """Build TipTap XML for a calendarEvent atom that mirrors the source block.
+
+    The atom id is deterministic from (source, date) so re-firing the same
+    inline-tag write produces an idempotent insert (find_block_by_id catches
+    the duplicate). externalEventId tracks the source block so future
+    operations (cleanup on tag removal, source-edit propagation) can locate
+    the atom from the source side.
+
+    XML tag is the ProseMirror schema node name (``calendarEvent``), not the
+    HTML render tag (``mn-calendar-event``). y-prosemirror reconciles
+    Y.XmlElement → PM via ``schema.node(el.nodeName, ...)`` directly — a
+    tag mismatch raises and the atom is silently deleted on next sync.
+    The HTML tag ``mn-calendar-event`` is the *render-time* output of the
+    extension's renderHTML, not the storage tag.
+    """
+    import html as _html
+
+    atom_id = f"evt-{source_block_id}-{date_str}"
+    return (
+        '<calendarEvent '
+        f'id="{_html.escape(atom_id, quote=True)}" '
+        f'data-block-id="{_html.escape(atom_id, quote=True)}" '
+        f'data-source-block-id="{_html.escape(source_block_id, quote=True)}" '
+        'allDay="true" '
+        f'title="{_html.escape(title or "", quote=True)}" '
+        'source="manual" '
+        f'externalEventId="src:{_html.escape(source_block_id, quote=True)}"'
+        ' />'
+    )
+
+
+def _sync_tag_chips_to_block(
+    elem: Any,
+    tag_dates: dict[str, str | None],
+) -> int:
+    """Ensure inline tag-chip atoms exist in a block matching the supplied
+    {tag_name → date} map.
+
+    Per (tag, date) pair:
+      - if no chip with this tag-name exists in the block, append one
+      - if a chip exists with this name but a different date, update its
+        date attribute in place (avoids accumulating duplicate-name chips
+        with stale dates)
+      - if a chip already exists with the same name + date, no-op
+
+    Multiple chips with the same name are tolerated on read (the frontend
+    sync plugin's ``collectChipsFromBlock`` keeps the last date wins);
+    we never produce duplicates from this helper, but legacy content or
+    cross-collaborator races might. Returns the number of chips added or
+    updated.
+    """
+    import pycrdt
+
+    def _attr_or_empty(attrs: Any, key: str) -> str:
+        # pycrdt's XmlAttributesView.get() takes only the key (no default),
+        # raising KeyError on miss — different from a regular dict. Wrap
+        # the access so callers can ask "what's there or empty string?"
+        # without trying to remember which kind of view they have.
+        try:
+            value = attrs[key]
+        except (KeyError, TypeError):
+            return ""
+        return value or ""
+
+    existing_by_name: dict[str, Any] = {}
+    for child in elem.children:
+        if not isinstance(child, pycrdt.XmlElement):
+            continue
+        if child.tag != "mn-tag-chip":
+            continue
+        name_attr = _attr_or_empty(child.attributes, "name")
+        if name_attr and name_attr not in existing_by_name:
+            existing_by_name[name_attr] = child
+
+    changed = 0
+    for tag, date in tag_dates.items():
+        if not tag:
+            continue
+        target_date = (date or "").strip()
+        existing = existing_by_name.get(tag)
+        if existing is not None:
+            existing_date = _attr_or_empty(existing.attributes, "date")
+            if existing_date != target_date:
+                if target_date:
+                    existing.attributes["date"] = target_date
+                # If target_date is empty we leave the old date attribute
+                # alone — the data layer (data-tag-expirations) is the
+                # source of truth for "no longer dated"; the chip will
+                # be reconciled on next user edit by the frontend sync
+                # plugin's collectChipsFromBlock semantics.
+                changed += 1
+            continue
+        # Append new chip atom.
+        chip_attrs: dict[str, Any] = {"name": tag, "data-tag-chip": ""}
+        if target_date:
+            chip_attrs["date"] = target_date
+        chip = pycrdt.XmlElement("mn-tag-chip", chip_attrs)
+        elem.children.append(chip)
+        existing_by_name[tag] = chip
+        changed += 1
+    return changed
+
+
+def _build_todo_item_xml(
+    *,
+    source_block_id: str,
+    date_str: str,
+    content: str,
+) -> str:
+    """Build TipTap XML for a todoItem listItem mirroring the source block.
+
+    Block id is deterministic from (source, date) for idempotent insert.
+    data-source-block-id tracks the origin for future maintenance flows.
+
+    listType MUST be ``task`` (the listItem extension's task-checkbox
+    rendering branch). Earlier ``todo`` was wrong: the extension only
+    branches into the checkbox renderHTML path on listType==='task', so
+    a ``todo`` value silently fell back to plain bullet rendering.
+
+    ``checked`` is intentionally omitted: the literal string ``"false"``
+    deserializes as truthy in y-prosemirror, which would render the new
+    task pre-checked. Absence is the canonical unchecked state.
+    """
+    import html as _html
+
+    block_id = f"todo-{source_block_id}-{date_str}"
+    return (
+        '<listItem '
+        f'data-block-id="{_html.escape(block_id, quote=True)}" '
+        f'data-source-block-id="{_html.escape(source_block_id, quote=True)}" '
+        'listType="task">'
+        f'<paragraph>{_html.escape(content or "", quote=False)}</paragraph>'
+        '</listItem>'
+    )
+
+
+def _resolve_tag_expirations(
+    raw: dict[str, str] | None,
+    *,
+    today: Any = None,
+) -> dict[str, str]:
+    """Normalize raw expiration values to absolute ISO calendar dates.
+
+    Accepts:
+    - ``<N>d`` — N days from today (UTC by default)
+    - ``YYYY-MM-DD`` — pass through
+    - anything else — dropped
+
+    Returns a dict mapping lowercase tag name → ``YYYY-MM-DD``. The platform
+    rejects non-ISO forms when materializing to RDF; resolving here keeps
+    the contract clean (CRDT carries absolute dates only). The ``today``
+    parameter is exposed for tests; production callers leave it None and
+    pick up datetime.date.today().
+    """
+    from datetime import date as _date, timedelta as _timedelta
+
+    if not raw:
+        return {}
+    today_val = today if today is not None else _date.today()
+    out: dict[str, str] = {}
+    for tag, value in raw.items():
+        tag_norm = (str(tag) if tag is not None else "").strip().lstrip("#").lower()
+        value_str = (str(value) if value is not None else "").strip()
+        if not tag_norm or not value_str or tag_norm in out:
+            continue
+        if _TAG_EXP_ISO_RE.match(value_str):
+            out[tag_norm] = value_str
+            continue
+        m = _TAG_EXP_REL_RE.match(value_str)
+        if m:
+            days = int(m.group(1))
+            resolved = today_val + _timedelta(days=days)
+            out[tag_norm] = resolved.isoformat()
+    return out
+
+
+def parse_tag_list_with_expirations(
+    raw_tags: list[str] | None,
+) -> tuple[list[str], dict[str, str]]:
+    """Split a flat tag list into (tag_names, expirations_dict).
+
+    Accepts inline-marker syntax — entries like ``"event:7d"`` or
+    ``"event:2026-05-15"`` are parsed by splitting on the first colon.
+    Bare tag names are kept as-is. The same tag may appear with or
+    without an expiration; if both, the dated form wins.
+
+    Used by callers (notably value()) that take ``tags=[...]`` as a
+    single argument and want the same expression power as the inline
+    ``{#tag:dur}`` markers, without forcing a parallel
+    ``tag_expirations`` parameter on the caller side.
+    """
+    if not raw_tags:
+        return [], {}
+    tags: list[str] = []
+    expirations: dict[str, str] = {}
+    for raw in raw_tags:
+        if not raw:
+            continue
+        s = str(raw).strip().lstrip("#")
+        if not s:
+            continue
+        tag_name, sep, dur = s.partition(":")
+        tag_norm = tag_name.strip().lower()
+        if not tag_norm:
+            continue
+        if tag_norm not in tags:
+            tags.append(tag_norm)
+        if sep and dur.strip():
+            expirations[tag_norm] = dur.strip()
+    return tags, expirations
+
+
+async def apply_tags_with_side_effects(
+    *,
+    hp_client: Any,
+    graph_id: str,
+    document_id: str,
+    user_id: str,
+    entries: list[dict],
+) -> dict:
+    """Apply tags + expirations to source-doc blocks AND fire scheduling
+    side-effects (ensure target daily-notes, materialize calendarEvent /
+    todoItem atoms) for #event/#todo with a date.
+
+    Single shared implementation for the inline-marker, update_blocks,
+    and value() entry points, so the user-facing behavior is identical
+    regardless of how the tag was attached. Fire-and-forget — failures
+    are logged at warning level and the return dict carries counts.
+
+    Args:
+        hp_client: A HocuspocusClient with workspace + document channels.
+        graph_id: Source document's graph.
+        document_id: Source document.
+        user_id: Resolved user id (auth.user_id, or None — caller should
+            resolve this via get_user_id_from_token before calling).
+        entries: Per-block records with shape:
+            {"block_id": str, "tags": list[str], "expirations": dict[str, str]?}
+            ``expirations`` is the raw {tag → "Nd"|"YYYY-MM-DD"} map; this
+            helper resolves relative durations to absolute dates internally.
+
+    Returns:
+        ``{"applied": int, "daily_notes_ensured": int, "atoms_materialized": int}``
+    """
+    import json as _json
+
+    from neem.hocuspocus import DocumentReader, DocumentWriter, WorkspaceWriter
+
+    if not entries or not user_id:
+        return {"applied": 0, "daily_notes_ensured": 0, "atoms_materialized": 0}
+
+    channel = hp_client.get_document_channel(graph_id, document_id, user_id=user_id)
+    if not channel:
+        return {"applied": 0, "daily_notes_ensured": 0, "atoms_materialized": 0}
+
+    writer = DocumentWriter(channel.doc)
+    reader = DocumentReader(channel.doc)
+    applied = 0
+    scheduled_items: list[dict] = []
+
+    for entry in entries:
+        block_id = entry.get("block_id") or ""
+        new_tags = list(entry.get("tags") or [])
+        if not block_id or not new_tags:
+            continue
+
+        new_expirations = _resolve_tag_expirations(entry.get("expirations") or {})
+
+        result = writer.find_block_by_id(block_id)
+        if result is None:
+            continue
+        _idx, elem = result
+
+        existing_raw = elem.attributes.get("data-tags")
+        existing_tags: list[str] = []
+        if existing_raw:
+            try:
+                parsed = _json.loads(existing_raw)
+                if isinstance(parsed, list):
+                    existing_tags = [str(t) for t in parsed if t]
+            except (_json.JSONDecodeError, TypeError):
+                pass
+        merged_tags = list(dict.fromkeys(existing_tags + new_tags))
+
+        existing_exp_raw = elem.attributes.get("data-tag-expirations")
+        existing_expirations: dict[str, str] = {}
+        if existing_exp_raw:
+            try:
+                parsed_exp = _json.loads(existing_exp_raw)
+                if isinstance(parsed_exp, dict):
+                    existing_expirations = {
+                        str(k).strip().lstrip("#").lower(): str(v).strip()
+                        for k, v in parsed_exp.items()
+                        if k and v
+                    }
+            except (_json.JSONDecodeError, TypeError):
+                pass
+        merged_expirations = dict(existing_expirations)
+        merged_expirations.update(new_expirations)
+        merged_expirations = {
+            k: v for k, v in merged_expirations.items() if k in merged_tags
+        }
+
+        # Schedule side-effects for newly-applied event/todo dates only —
+        # pre-existing pairs already had their daily-note + atom from a
+        # prior write.
+        source_text = ""
+        source_text_loaded = False
+        for tag_name, date_str in new_expirations.items():
+            if tag_name not in _SCHEDULED_TAGS:
+                continue
+            if existing_expirations.get(tag_name) == date_str:
+                continue
+            if not source_text_loaded:
+                try:
+                    info = reader.get_block_text_info(block_id)
+                    source_text = (info or {}).get("text", "") or ""
+                except Exception:
+                    source_text = ""
+                source_text_loaded = True
+            scheduled_items.append({
+                "source_block_id": block_id,
+                "tag": tag_name,
+                "date": date_str,
+                "title": source_text,
+            })
+
+        attrs_to_write: dict[str, str] = {"data-tags": _json.dumps(merged_tags)}
+        if merged_expirations:
+            attrs_to_write["data-tag-expirations"] = _json.dumps(merged_expirations)
+        writer.update_block_attributes(block_id, attrs_to_write)
+        applied += 1
+
+        # Sync inline tag-chip atoms for the tags this call newly added
+        # (or whose date changed). Existing tags whose date is unchanged
+        # are not touched — we don't retroactively bootstrap chips for
+        # legacy data-tags from this call. The frontend's TagChipSync
+        # plugin keeps data-tags in sync with chips, so the only path
+        # that adds chips server-side is "the tag is newly applied here".
+        chip_specs: dict[str, str | None] = {}
+        for tag in new_tags:
+            tag_norm = (tag or "").strip().lstrip("#").lower()
+            if not tag_norm or tag_norm not in merged_tags:
+                continue
+            new_date = new_expirations.get(tag_norm)
+            old_date = existing_expirations.get(tag_norm)
+            # Only emit a chip-spec when the tag is newly added OR the
+            # date changed. Same-date no-ops are filtered out.
+            if tag_norm not in existing_tags or new_date != old_date:
+                chip_specs[tag_norm] = new_date or None
+        if chip_specs:
+            try:
+                with channel.doc.transaction():
+                    _sync_tag_chips_to_block(elem, chip_specs)
+            except Exception as exc:
+                logger.warning(
+                    "sync_tag_chips_failed",
+                    extra_context={
+                        "graph_id": graph_id,
+                        "document_id": document_id,
+                        "block_id": block_id,
+                        "error": str(exc),
+                    },
+                )
+
+    # Ensure daily-notes for newly-applied event/todo dates.
+    daily_notes_ensured = 0
+    atoms_materialized = 0
+    if scheduled_items:
+        unique_dates = sorted({item["date"] for item in scheduled_items})
+        try:
+            def _ensure_dailies(ws_doc: Any) -> None:
+                ws_writer = WorkspaceWriter(ws_doc)
+                for date_str in unique_dates:
+                    ws_writer.ensure_daily_note(date_str)
+            await hp_client.transact_workspace(graph_id, _ensure_dailies, user_id=user_id)
+            daily_notes_ensured = len(unique_dates)
+        except Exception as exc:
+            logger.warning(
+                "ensure_daily_notes_for_scheduled_tags_failed",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "dates": unique_dates,
+                    "error": str(exc),
+                },
+            )
+
+        items_by_date: dict[str, list[dict]] = {}
+        for item in scheduled_items:
+            items_by_date.setdefault(item["date"], []).append(item)
+        for date_str, items in items_by_date.items():
+            daily_note_id = f"daily-note-{date_str}"
+            try:
+                dn_channel = hp_client.get_document_channel(
+                    graph_id, daily_note_id, user_id=user_id,
+                )
+                if not dn_channel:
+                    continue
+                dn_writer = DocumentWriter(dn_channel.doc)
+                for item in items:
+                    tag = item["tag"]
+                    src_id = item["source_block_id"]
+                    title = item["title"]
+                    if tag == "event":
+                        atom_id = f"evt-{src_id}-{date_str}"
+                        xml_str = _build_calendar_event_xml(
+                            source_block_id=src_id, date_str=date_str, title=title,
+                        )
+                    else:
+                        atom_id = f"todo-{src_id}-{date_str}"
+                        xml_str = _build_todo_item_xml(
+                            source_block_id=src_id, date_str=date_str, content=title,
+                        )
+                    if dn_writer.find_block_by_id(atom_id) is not None:
+                        continue
+                    dn_writer.append_block(xml_str)
+                    atoms_materialized += 1
+            except Exception as exc:
+                logger.warning(
+                    "materialize_scheduled_atoms_failed",
+                    extra_context={
+                        "graph_id": graph_id,
+                        "source_document_id": document_id,
+                        "daily_note_id": daily_note_id,
+                        "error": str(exc),
+                    },
+                )
+
+    return {
+        "applied": applied,
+        "daily_notes_ensured": daily_notes_ensured,
+        "atoms_materialized": atoms_materialized,
+    }
+
+
 def _normalize_timestamp_to_iso(value: Any) -> str | None:
     """Normalize timestamp-like values to ISO-8601 UTC.
 
@@ -845,6 +1317,13 @@ GROUP BY ?docId
         Call this in write tools *after* _validate_document_in_workspace
         (which ensures the workspace channel is already connected).
         """
+        # Tag-pages are synthesized read-only views over blocks tagged with
+        # a given name. They have no Y.Doc, no persisted RDF representation
+        # of the view itself, and no edit affordances. Reject up-front so
+        # the caller gets a clear message instead of a cascade of "doc not
+        # found" errors from the workspace check below.
+        if is_tag_page_doc_id(document_id):
+            raise tag_page_read_only_error(document_id)
         ws_channel = hp_client.get_workspace_channel(graph_id, user_id=user_id)
         if ws_channel is None:
             # Workspace not connected — try connecting
@@ -1208,7 +1687,7 @@ GROUP BY ?docId
         graph_id: str,
         auth: MCPAuthContext,
     ) -> dict | None:
-        """Apply pending tags as CRDT data-tags attributes on blocks.
+        """Apply pending tags via the shared apply-with-side-effects helper.
 
         Fire-and-forget: returns results on success, logs and returns
         error dict on failure. Never raises.
@@ -1221,52 +1700,32 @@ GROUP BY ?docId
             return None
 
         try:
-            import json as _json
             user_id = auth.user_id or (get_user_id_from_token(auth.token) if auth.token else None)
             if not user_id:
                 return {"error": "Could not resolve user_id for inline tags"}
 
-            channel = hp_client.get_document_channel(graph_id, document_id, user_id=user_id)
-            if not channel:
-                return {"error": f"No channel for {document_id}"}
-
-            writer = DocumentWriter(channel.doc)
-            applied = 0
-            for entry in entries:
-                block_id = entry["block_id"]
-                new_tags = entry["tags"]
-
-                # Read existing tags and merge
-                result = writer.find_block_by_id(block_id)
-                if result is None:
-                    continue
-
-                _idx, elem = result
-                existing_raw = elem.attributes.get("data-tags")
-                existing_tags: list[str] = []
-                if existing_raw:
-                    try:
-                        parsed = _json.loads(existing_raw)
-                        if isinstance(parsed, list):
-                            existing_tags = [str(t) for t in parsed if t]
-                    except (_json.JSONDecodeError, TypeError):
-                        pass
-
-                # Merge: union of existing and new, preserving order
-                merged = list(dict.fromkeys(existing_tags + new_tags))
-                writer.update_block_attributes(block_id, {"data-tags": _json.dumps(merged)})
-                applied += 1
-
+            result = await apply_tags_with_side_effects(
+                hp_client=hp_client,
+                graph_id=graph_id,
+                document_id=document_id,
+                user_id=user_id,
+                entries=entries,
+            )
             logger.info(
                 "inline_tags_applied",
                 extra_context={
                     "graph_id": graph_id,
                     "document_id": document_id,
                     "tags_count": sum(len(e["tags"]) for e in entries),
-                    "blocks_updated": applied,
+                    "expirations_count": sum(
+                        len(e.get("expirations") or {}) for e in entries
+                    ),
+                    "blocks_updated": result["applied"],
+                    "daily_notes_ensured": result["daily_notes_ensured"],
+                    "atoms_materialized": result["atoms_materialized"],
                 },
             )
-            return {"applied": applied, "entries": len(entries)}
+            return {**result, "entries": len(entries)}
         except Exception as e:
             logger.warning(
                 "inline_tags_failed",
@@ -3805,10 +4264,13 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                     # Block ID is already known — map tags directly
                     if pending_tags and bid:
                         for pt in pending_tags:
-                            all_pending_tag_entries.append({
+                            entry: dict = {
                                 "block_id": bid.strip(),
                                 "tags": pt.tags,
-                            })
+                            }
+                            if pt.expirations:
+                                entry["expirations"] = pt.expirations
+                            all_pending_tag_entries.append(entry)
                 preprocessed_updates.append({
                     "block_id": bid,
                     "resolved_xml": resolved_xml,
@@ -3870,32 +4332,19 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             tag_result = None
             if all_pending_tag_entries:
                 try:
-                    import json as _json
                     user_id = auth.user_id or (get_user_id_from_token(auth.token) if auth.token else None)
                     if user_id:
-                        channel = hp_client.get_document_channel(graph_id.strip(), document_id.strip(), user_id=user_id)
-                        if channel:
-                            writer = DocumentWriter(channel.doc)
-                            applied = 0
-                            for te in all_pending_tag_entries:
-                                bid = te["block_id"]
-                                result_find = writer.find_block_by_id(bid)
-                                if result_find is None:
-                                    continue
-                                _idx, elem = result_find
-                                existing_raw = elem.attributes.get("data-tags")
-                                existing_tags: list[str] = []
-                                if existing_raw:
-                                    try:
-                                        parsed = _json.loads(existing_raw)
-                                        if isinstance(parsed, list):
-                                            existing_tags = [str(t) for t in parsed if t]
-                                    except (_json.JSONDecodeError, TypeError):
-                                        pass
-                                merged = list(dict.fromkeys(existing_tags + te["tags"]))
-                                writer.update_block_attributes(bid, {"data-tags": _json.dumps(merged)})
-                                applied += 1
-                            tag_result = {"applied": applied, "entries": len(all_pending_tag_entries)}
+                        side_result = await apply_tags_with_side_effects(
+                            hp_client=hp_client,
+                            graph_id=graph_id.strip(),
+                            document_id=document_id.strip(),
+                            user_id=user_id,
+                            entries=all_pending_tag_entries,
+                        )
+                        tag_result = {
+                            **side_result,
+                            "entries": len(all_pending_tag_entries),
+                        }
                 except Exception as e:
                     logger.warning(
                         "inline_tags_failed",

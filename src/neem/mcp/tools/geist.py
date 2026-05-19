@@ -64,6 +64,7 @@ IMPORTANCE_DOC_ID = "geist-importance"
 VALENCE_DOC_ID = "geist-valence"
 WEIGHTS_DOC_ID = "geist-weights"
 USER_PROMPT_ADDITION_DOC_ID = "user-prompt-addition"
+TAGS_CONFIG_DOC_ID = "tags-config"
 PAST_SONGS_DOC_ID = "geist-past-songs"
 PAST_IMPORTANCE_DOC_ID = "geist-past-importance"
 PAST_VALENCE_DOC_ID = "geist-past-valence"
@@ -83,6 +84,43 @@ CODA_EJECTION_LIFETIME = 8  # Coda survives this many verse ejections
 # the agent's way by default; user can fill it with personal guidance that
 # Gardener reads during attunement and treats as a prompt extension.
 SEED_USER_PROMPT_ADDITION = "<paragraph></paragraph>"
+
+# Seed for the tags-config doc. Documents the five core block-level tags
+# that ship with Garden (decision, tension, todo, pragma, event) and lets
+# the user add custom tags below the divider. Gardener reads this during
+# attunement so it knows what tags are available.
+#
+# `event` and `todo` with expiration dates are special: they auto-surface
+# on the daily note for that date via incoming wires (see daily-notes
+# design doc). `#event` without a date defaults to today.
+SEED_TAGS_CONFIG = (
+    '<heading level="1">Tags Configuration</heading>'
+    "<paragraph>Block-level categorical tags. Wires connect; valuations weigh; "
+    "tags classify. Apply inline with <code>{#decision}</code>, <code>{#todo:7d}</code>, "
+    "<code>{#event:2026-05-15}</code>, or via <code>value(tags=[...])</code>. "
+    "Tags are graph-local.</paragraph>"
+    '<heading level="2">Core tags</heading>'
+    "<paragraph><strong>decision</strong> \u2014 a choice made, with rationale captured. "
+    "Don\u2019t expire decisions \u2014 supersede them via <code>contradicts</code> "
+    "or <code>consequenceOf</code> wires.</paragraph>"
+    "<paragraph><strong>tension</strong> \u2014 an unresolved contradiction or open problem. "
+    "The categorical sibling of negative valence. Optional expiration when resolution "
+    "is expected.</paragraph>"
+    "<paragraph><strong>todo</strong> \u2014 an action item. Ephemeral by nature. "
+    "Use <code>{#todo:7d}</code> or <code>{#todo:2026-05-15}</code>; the block surfaces "
+    "on the daily note for that date.</paragraph>"
+    "<paragraph><strong>pragma</strong> \u2014 operational knowledge. The boring stuff "
+    "you need to deploy, debug, configure. Persists until superseded.</paragraph>"
+    "<paragraph><strong>event</strong> \u2014 a scheduled happening. Use "
+    "<code>{#event:2026-05-15}</code> for a specific date or <code>{#event}</code> for today. "
+    "The block surfaces on the daily note for that date as a wire reference. For richer "
+    "events with time/location, use the slash-command <code>/event</code> in the editor "
+    "to insert a structured calendarEvent block.</paragraph>"
+    '<heading level="2">Custom tags</heading>'
+    "<paragraph>Add your own tags below \u2014 freeform. Logseq-style "
+    "<code>#meeting</code>, <code>#q2-planning</code>, <code>#projectX</code>. "
+    "One per line, optionally with description.</paragraph>"
+)
 
 SEED_SONG = (
     '<heading level="1">The Song</heading>'
@@ -397,11 +435,12 @@ async def _ensure_scratchpad(
     reader = WorkspaceReader(channel.doc)
 
     # Fast check: if all required scratchpad docs exist, we're done. Checking
-    # both memory-queue and user-prompt-addition so scratchpads created before
-    # user-prompt-addition landed get backfilled on the next Geist call.
+    # the most recently added docs ensures pre-existing scratchpads get
+    # backfilled on the next Geist call when new seed docs land.
     if (
         reader.get_document(MEMORY_QUEUE_DOC_ID) is not None
         and reader.get_document(USER_PROMPT_ADDITION_DOC_ID) is not None
+        and reader.get_document(TAGS_CONFIG_DOC_ID) is not None
     ):
         return
 
@@ -420,6 +459,13 @@ async def _ensure_scratchpad(
         ws.upsert_document(
             USER_PROMPT_ADDITION_DOC_ID,
             "Custom Instructions",
+            parent_id=SCRATCHPAD_FOLDER_ID,
+        )
+        # Tags configuration doc at scratchpad root. Pre-populated with the
+        # four core tags + a custom-tags section the user can extend.
+        ws.upsert_document(
+            TAGS_CONFIG_DOC_ID,
+            "Tags Configuration",
             parent_id=SCRATCHPAD_FOLDER_ID,
         )
         # present/ folder
@@ -450,6 +496,7 @@ async def _ensure_scratchpad(
         VALENCE_DOC_ID: SEED_VALENCE_PROMPT,
         WEIGHTS_DOC_ID: SEED_WEIGHTS,
         USER_PROMPT_ADDITION_DOC_ID: SEED_USER_PROMPT_ADDITION,
+        TAGS_CONFIG_DOC_ID: SEED_TAGS_CONFIG,
     }
 
     for doc_id, content in seed_docs.items():
@@ -1499,8 +1546,14 @@ def register_geist_tools(server: FastMCP) -> None:
             "Wires express relationships between things; valuation expresses the agent's "
             "judgment about a single thing. Use both.\n\n"
             "**Tags:** Pass `tags` (list of strings) to tag the block in the same gesture as "
-            "valuing it. Tags are categorical metadata (e.g. decision, tension, todo, pragma). "
-            "In batch mode, include tags in each entry dict."
+            "valuing it. Tags are categorical metadata (e.g. decision, tension, todo, pragma, "
+            "event). In batch mode, include tags in each entry dict.\n\n"
+            "**Tag expirations:** Use the same colon-suffix syntax as inline markers — "
+            "`tags=[\"event:2026-05-15\"]` for an absolute date, `tags=[\"todo:7d\"]` for "
+            "a relative duration (resolved to today + N days). For #event/#todo with a date, "
+            "the target daily-note doc is preemptively created and a calendarEvent atom "
+            "(or todoItem block) is materialized in it — same flow as inline `{#event:D}` "
+            "markers."
         ),
     )
     @resolve_home_graph
@@ -1537,24 +1590,38 @@ def register_geist_tools(server: FastMCP) -> None:
             entry: dict = {"document_id": document_id, "block_id": block_id,
                            "importance": importance, "valence": valence}
             if tags:
-                entry["tags"] = [t.strip().lstrip("#").lower() for t in tags if t and t.strip()]
+                entry["tags"] = list(tags)
             entries_input = [entry]
         else:
             raise ValueError("Either 'document_id' and 'block_id' (single) or 'valuations' (batch) is required")
 
         is_single = valuations is None
 
-        # Separate tag entries from valuation entries
-        tag_entries: list[dict] = []
+        # Separate tag entries from valuation entries. Tags use the same
+        # colon-suffix syntax as inline markers ("event:7d", "todo:2026-05-15")
+        # so all four entry points (write_document, insert_blocks, update_blocks,
+        # value) converge on identical block state and side-effects.
+        from neem.mcp.tools.hocuspocus import (
+            apply_tags_with_side_effects,
+            parse_tag_list_with_expirations,
+        )
+
+        # Group raw entries by document so we can fire side-effects per-doc.
+        tag_entries_by_doc: dict[str, list[dict]] = {}
         valuation_entries: list[dict] = []
         for e in entries_input:
             entry_tags = e.pop("tags", None)
-            if entry_tags:
-                tag_entries.append({
-                    "document_id": e.get("document_id", ""),
-                    "block_id": e.get("block_id", ""),
-                    "tags": [t.strip().lstrip("#").lower() for t in entry_tags if t] if isinstance(entry_tags, list) else [],
-                })
+            if entry_tags and isinstance(entry_tags, list):
+                doc_id = e.get("document_id", "") or ""
+                bid = e.get("block_id", "") or ""
+                if doc_id and bid:
+                    tag_names, expirations = parse_tag_list_with_expirations(entry_tags)
+                    if tag_names:
+                        tag_entries_by_doc.setdefault(doc_id, []).append({
+                            "block_id": bid,
+                            "tags": tag_names,
+                            "expirations": expirations,
+                        })
             # Only send to valuation API if importance or valence is set
             if e.get("importance") is not None or e.get("valence") is not None:
                 valuation_entries.append(e)
@@ -1569,46 +1636,39 @@ def register_geist_tools(server: FastMCP) -> None:
             resp.raise_for_status()
             output = resp.json()
 
-        # Apply tags via CRDT attributes
-        if tag_entries and hp_client:
-            import json as _json
+        # Apply tags via the shared apply-with-side-effects helper. This
+        # writes data-tags + data-tag-expirations on the source block AND
+        # (for #event/#todo with a date) ensures the target daily-note exists
+        # and materializes a calendarEvent atom or todoItem block in it.
+        if tag_entries_by_doc and hp_client:
             user_id = auth.user_id or None
             tags_applied = 0
-            for te in tag_entries:
-                doc_id = te["document_id"]
-                bid = te["block_id"]
-                new_tags = te["tags"]
-                if not doc_id or not bid or not new_tags:
-                    continue
-                try:
-                    await hp_client.connect_document(graph_id, doc_id, user_id=user_id)
-                    channel = hp_client.get_document_channel(graph_id, doc_id, user_id=user_id)
-                    if not channel:
-                        continue
-                    from neem.hocuspocus import DocumentWriter
-                    writer = DocumentWriter(channel.doc)
-                    result_find = writer.find_block_by_id(bid)
-                    if result_find is None:
-                        continue
-                    _idx, elem = result_find
-                    existing_raw = elem.attributes.get("data-tags")
-                    existing_tags: list[str] = []
-                    if existing_raw:
-                        try:
-                            parsed = _json.loads(existing_raw)
-                            if isinstance(parsed, list):
-                                existing_tags = [str(t) for t in parsed if t]
-                        except (_json.JSONDecodeError, TypeError):
-                            pass
-                    merged = list(dict.fromkeys(existing_tags + new_tags))
-                    writer.update_block_attributes(bid, {"data-tags": _json.dumps(merged)})
-                    tags_applied += 1
-                except Exception as e:
-                    logger.warning("value_tool_tag_failed", extra_context={
-                        "block_id": bid, "document_id": doc_id, "error": str(e),
-                    })
+            daily_notes_ensured = 0
+            atoms_materialized = 0
+            if user_id:
+                for doc_id, doc_entries in tag_entries_by_doc.items():
+                    try:
+                        await hp_client.connect_document(graph_id, doc_id, user_id=user_id)
+                        side_result = await apply_tags_with_side_effects(
+                            hp_client=hp_client,
+                            graph_id=graph_id,
+                            document_id=doc_id,
+                            user_id=user_id,
+                            entries=doc_entries,
+                        )
+                        tags_applied += side_result.get("applied", 0)
+                        daily_notes_ensured += side_result.get("daily_notes_ensured", 0)
+                        atoms_materialized += side_result.get("atoms_materialized", 0)
+                    except Exception as e:
+                        logger.warning("value_tool_tag_failed", extra_context={
+                            "document_id": doc_id, "error": str(e),
+                        })
             if tags_applied:
                 output["tags_applied"] = tags_applied
+            if daily_notes_ensured:
+                output["daily_notes_ensured"] = daily_notes_ensured
+            if atoms_materialized:
+                output["atoms_materialized"] = atoms_materialized
 
         # Single mode: return flat result or raise on error
         if is_single:

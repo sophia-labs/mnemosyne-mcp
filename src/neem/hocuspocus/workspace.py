@@ -87,6 +87,7 @@ class WorkspaceWriter:
         *,
         parent_id: str | None = None,
         order: float | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> None:
         """Create or update a document entry in workspace navigation.
 
@@ -98,6 +99,10 @@ class WorkspaceWriter:
             title: Display title for the document
             parent_id: Parent folder ID (None for root level)
             order: Sort order within parent (defaults to current timestamp)
+            extra: Additional metadata fields (e.g. documentKind,
+                dailyNoteDate, dailyNoteTimeZone). On create these are
+                added to the document map; on update they overwrite
+                existing keys. None values are skipped.
         """
         now = time.time() * 1000  # Milliseconds for consistency with frontend
 
@@ -111,6 +116,10 @@ class WorkspaceWriter:
                 existing["parentId"] = parent_id
             if order is not None:
                 existing["order"] = order
+            if extra:
+                for k, v in extra.items():
+                    if v is not None:
+                        existing[k] = v
             logger.debug(
                 "Updated document in workspace",
                 extra_context={"doc_id": doc_id, "title": title},
@@ -125,12 +134,67 @@ class WorkspaceWriter:
                 "createdAt": now,
                 "updatedAt": now,
             }
+            if extra:
+                for k, v in extra.items():
+                    if v is not None:
+                        doc_data[k] = v
             doc_map = pycrdt.Map(doc_data)
             self._documents[doc_id] = doc_map
             logger.debug(
                 "Created document in workspace",
                 extra_context={"doc_id": doc_id, "title": title},
             )
+
+    def ensure_daily_note(
+        self,
+        date_str: str,
+        *,
+        time_zone: str | None = None,
+    ) -> str:
+        """Ensure the daily-note for a given ISO date exists. Idempotent.
+
+        Mirrors the frontend ``ensureDailyNote`` helper: deterministic ID
+        ``daily-note-{YYYY-MM-DD}`` and the same title format Vera uses
+        (``"{Month} {day}, {year}"``). Returns the doc_id whether it
+        already existed or was created.
+
+        Use to preemptively surface a future date as a regular workspace
+        document so MCP-written tags like ``{#event:2026-05-15}`` produce
+        a daily-note doc that is discoverable in search and the sidebar
+        before anyone opens the date.
+
+        Args:
+            date_str: ISO calendar date in ``YYYY-MM-DD`` form.
+            time_zone: IANA timezone the date was resolved in (optional).
+        """
+        from datetime import date as _date
+
+        doc_id = f"daily-note-{date_str}"
+        if self.get_document(doc_id) is not None:
+            return doc_id
+
+        try:
+            d = _date.fromisoformat(date_str)
+        except ValueError:
+            # Caller is responsible for date validation; silently no-op
+            # on malformed input rather than corrupting workspace state.
+            logger.warning(
+                "ensure_daily_note_invalid_date",
+                extra_context={"date_str": date_str},
+            )
+            return doc_id
+
+        # Match the frontend formatDailyNoteTitle output: "May 15, 2026".
+        title = f"{d.strftime('%B')} {d.day}, {d.year}"
+        extra: dict[str, Any] = {
+            "documentKind": "daily-note",
+            "dailyNoteDate": date_str,
+        }
+        if time_zone:
+            extra["dailyNoteTimeZone"] = time_zone
+
+        self.upsert_document(doc_id, title, extra=extra)
+        return doc_id
 
     def delete_document(self, doc_id: str) -> bool:
         """Remove a document from workspace navigation.

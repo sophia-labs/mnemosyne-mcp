@@ -479,3 +479,75 @@ def test_list_item_float_indent() -> None:
     )
     result = tiptap_xml_to_markdown(xml)
     assert "  - Indented" in result
+
+
+# ---------------------------------------------------------------------------
+# Tag chip atoms (inline)
+# ---------------------------------------------------------------------------
+
+def test_tag_chip_with_date() -> None:
+    """Chip atom with date renders to "#name:date" so the editor's input
+    rule can re-promote it to a chip on next paste."""
+    xml = (
+        '<paragraph>Meet Bob '
+        '<mn-tag-chip name="event" date="2026-05-15"></mn-tag-chip>'
+        '</paragraph>'
+    )
+    result = tiptap_xml_to_markdown(xml)
+    assert "Meet Bob #event:2026-05-15" in result
+
+
+def test_tag_chip_without_date() -> None:
+    """Bare chip (no date) renders to plain "#name"."""
+    xml = (
+        '<paragraph>Outcome '
+        '<mn-tag-chip name="decision"></mn-tag-chip>'
+        '</paragraph>'
+    )
+    result = tiptap_xml_to_markdown(xml)
+    assert "Outcome #decision" in result
+
+
+def test_tag_chip_self_closing() -> None:
+    xml = (
+        '<paragraph>Quick note '
+        '<mn-tag-chip name="todo" date="2026-05-20" />'
+        '</paragraph>'
+    )
+    result = tiptap_xml_to_markdown(xml)
+    assert "Quick note #todo:2026-05-20" in result
+
+
+def test_tag_chip_lowercases_name() -> None:
+    xml = (
+        '<paragraph>Tagged '
+        '<mn-tag-chip name="EVENT" date="2026-05-15"></mn-tag-chip>'
+        '</paragraph>'
+    )
+    result = tiptap_xml_to_markdown(xml)
+    assert "#event:2026-05-15" in result
+
+
+def test_tag_chip_empty_name_drops_chip() -> None:
+    """Malformed chip with no name renders as nothing — defensive."""
+    xml = (
+        '<paragraph>Just text '
+        '<mn-tag-chip name="" date="2026-05-15"></mn-tag-chip>'
+        '</paragraph>'
+    )
+    result = tiptap_xml_to_markdown(xml)
+    # Chip silently omitted; surrounding text remains.
+    assert "2026-05-15" not in result
+    assert "Just text" in result
+
+
+def test_multiple_chips_in_paragraph() -> None:
+    xml = (
+        '<paragraph>Both '
+        '<mn-tag-chip name="event" date="2026-05-15" /> and '
+        '<mn-tag-chip name="todo" date="2026-05-20" />'
+        '</paragraph>'
+    )
+    result = tiptap_xml_to_markdown(xml)
+    assert "#event:2026-05-15" in result
+    assert "#todo:2026-05-20" in result
