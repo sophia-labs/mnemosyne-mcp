@@ -333,3 +333,81 @@ class TestEndToEnd:
         assert pending == []
         # XML should be identical to what markdown_to_tiptap_xml produces
         assert clean == markdown_to_tiptap_xml(md)
+
+
+# ------------------------------------------------------------------
+# Bug A regression: valuation marker followed by inline tag marker(s)
+# ------------------------------------------------------------------
+
+
+class TestValuationFollowedByTag:
+    """A {!N,+M} marker immediately followed by a {#tag} marker must still be
+    extracted. Before the lookahead fix, the EOL-anchored regex failed to match
+    (the trailing {#tag} pushed the valuation marker off end-of-line), so the
+    valuation was silently dropped AND left as literal text in the block."""
+
+    def test_preprocess_extracts_valuation_before_tag(self):
+        result = preprocess_valuations("Key decision {!4,+2}{#decision}")
+        # Valuation marker → placeholder
+        assert "{!4,+2}" not in result
+        assert "VAL:4:2" in result
+        # Tag marker left intact for preprocess_tags (runs next)
+        assert "{#decision}" in result
+
+    def test_importance_only_before_tag(self):
+        result = preprocess_valuations("Note {!3}{#pragma}")
+        assert "VAL:3:" in result
+        assert "{#pragma}" in result
+
+    def test_valence_only_before_tag(self):
+        result = preprocess_valuations("Tension {!,-2}{#tension}")
+        assert "VAL::-2" in result
+        assert "{#tension}" in result
+
+    def test_tag_with_duration(self):
+        result = preprocess_valuations("Task {!2}{#todo:7d}")
+        assert "VAL:2:" in result
+        assert "{#todo:7d}" in result
+
+    def test_multiple_trailing_tags(self):
+        result = preprocess_valuations("Both {!5,+1}{#decision}{#pragma}")
+        assert "VAL:5:1" in result
+        assert "{#decision}" in result
+        assert "{#pragma}" in result
+
+    def test_space_between_valuation_and_tag(self):
+        result = preprocess_valuations("Spaced {!3,+1} {#todo}")
+        assert "VAL:3:1" in result
+        assert "{#todo}" in result
+
+    def test_standalone_valuation_still_works(self):
+        # Regression guard: the lookahead must not break the no-tag case.
+        result = preprocess_valuations("Plain insight {!4,+2}")
+        assert "VAL:4:2" in result
+
+    def test_full_pipeline_combined_marker(self):
+        """preprocess_valuations → preprocess_tags → md→xml → postprocess both:
+        a combined marker yields BOTH a valuation and a tag, content clean."""
+        from neem.hocuspocus.converters import (
+            markdown_to_tiptap_xml,
+            postprocess_tags,
+            preprocess_tags,
+        )
+
+        md = "A combined block {!4,+2}{#decision}"
+        pre = preprocess_valuations(md)
+        pre = preprocess_tags(pre)
+        xml = markdown_to_tiptap_xml(pre)
+        xml_v, valuations = postprocess_valuations(xml)
+        clean, tags = postprocess_tags(xml_v)
+
+        assert len(valuations) == 1
+        assert valuations[0].importance == 4
+        assert valuations[0].valence == 2
+        assert len(tags) == 1
+        assert tags[0].tags == ["decision"]
+        # No marker residue in final content
+        assert "{!" not in clean
+        assert "{#" not in clean
+        assert "" not in clean
+        assert "" not in clean

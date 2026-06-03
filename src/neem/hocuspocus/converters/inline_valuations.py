@@ -27,11 +27,15 @@ from typing import Optional
 _PH_START = "\uE000"
 _PH_END = "\uE001"
 
-# Matches {!N}, {!,+N}, {!N,+M}, {!N,-M} at end of line (optional trailing whitespace)
+# Matches {!N}, {!,+N}, {!N,+M}, {!N,-M} at end of line (optional trailing
+# whitespace). A trailing run of inline tag markers ({#tag}, {#tag:dur}) is
+# tolerated via lookahead so the combined "value and tag in one breath" form
+# `{!4,+2}{#decision}` still matches — the valuation marker is consumed, the
+# tag markers are left intact for preprocess_tags (which runs next).
 # Group 1: importance digit (optional)
 # Group 2: valence with sign (optional)
 _MARKER_RE = re.compile(
-    r"\{!(\d)?(?:,([+-]?\d))?\}\s*$",
+    r"\{!(\d)?(?:,([+-]?\d))?\}(?=(?:\s*\{#[a-zA-Z0-9_-]+(?::[a-zA-Z0-9_-]+)?\})*\s*$)",
     re.MULTILINE,
 )
 
