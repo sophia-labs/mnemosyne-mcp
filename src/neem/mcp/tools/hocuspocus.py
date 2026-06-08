@@ -2844,6 +2844,118 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
 
         return _sort_and_clean(render_items)
 
+    def _build_folder_path_map(folders: dict[str, Any]) -> dict[str, str]:
+        """Map folder_id -> human path ('A/B/C') via parentId chains."""
+        name_of = {fid: (f.get("name") or "Untitled") for fid, f in folders.items()}
+        parent_of = {fid: f.get("parentId") for fid, f in folders.items()}
+        cache: dict[str, str] = {}
+
+        def _path(fid: str | None) -> str:
+            if not fid or fid not in name_of:
+                return ""
+            if fid in cache:
+                return cache[fid]
+            parts: list[str] = []
+            seen: set[str] = set()
+            cur: str | None = fid
+            while cur and cur in name_of and cur not in seen:
+                seen.add(cur)
+                parts.append(name_of[cur])
+                cur = parent_of.get(cur)
+            result = "/".join(reversed(parts))
+            cache[fid] = result
+            return result
+
+        return {fid: _path(fid) for fid in name_of}
+
+    def _build_recent_docs(
+        snapshot: dict[str, Any],
+        recent_days: float | None,
+        recent_limit: int | None,
+        excluded_doc_ids: set[str] | None = None,
+        folder_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Flat, recency-sorted document view — 'catch up on what's been going on'.
+
+        Recency uses the workspace catalog timestamp (updatedAt, falling back to
+        createdAt, then order). That timestamp tracks entry activity — creation,
+        move, rename, reorder, and edits where the platform propagates them — so
+        it is a fast, single-channel proxy for "what's new" rather than a
+        guaranteed content-edit timestamp. No SPARQL.
+        """
+        documents = snapshot.get("documents", {})
+        folders = snapshot.get("folders", {})
+        path_map = _build_folder_path_map(folders)
+
+        # Optional folder scoping: folder_id plus all descendant folders.
+        allowed_folders: set[str] | None = None
+        if folder_id:
+            children_of: dict[str | None, list[str]] = {}
+            for fid, f in folders.items():
+                children_of.setdefault(f.get("parentId"), []).append(fid)
+            allowed_folders = set()
+            stack = [folder_id]
+            while stack:
+                cur = stack.pop()
+                if cur in allowed_folders:
+                    continue
+                allowed_folders.add(cur)
+                stack.extend(children_of.get(cur, []))
+
+        cutoff_ms: float | None = None
+        if recent_days is not None:
+            now_ms = datetime.now(timezone.utc).timestamp() * 1000.0
+            cutoff_ms = now_ms - float(recent_days) * 86_400_000.0
+
+        ts_keys = ("updatedAt", "updated_at", "lastModified", "createdAt", "created_at", "order")
+        rows: list[dict[str, Any]] = []
+        for did, ddata in documents.items():
+            if not isinstance(ddata, dict):
+                continue
+            if excluded_doc_ids and did in excluded_doc_ids:
+                continue
+            if allowed_folders is not None and ddata.get("parentId") not in allowed_folders:
+                continue
+
+            ts_ms: float | None = None
+            ts_iso: str | None = None
+            for k in ts_keys:
+                norm = _normalize_timestamp_to_iso(ddata.get(k))
+                if norm:
+                    try:
+                        ts_ms = datetime.fromisoformat(norm).timestamp() * 1000.0
+                        ts_iso = norm
+                        break
+                    except Exception:
+                        continue
+            if ts_ms is None:
+                continue
+            if cutoff_ms is not None and ts_ms < cutoff_ms:
+                continue
+
+            row: dict[str, Any] = {
+                "id": did,
+                "title": ddata.get("title", "Untitled"),
+                "updated_at": ts_iso,
+                "_ts": ts_ms,
+            }
+            fpath = path_map.get(ddata.get("parentId"), "")
+            if fpath:
+                row["folder_path"] = fpath
+            if ddata.get("readOnly"):
+                row["readOnly"] = True
+            sf = ddata.get("sf_fileType")
+            if sf:
+                row["fileType"] = sf
+            rows.append(row)
+
+        rows.sort(key=lambda r: r["_ts"], reverse=True)
+        if recent_limit is not None and recent_limit > 0:
+            rows = rows[:recent_limit]
+        for r in rows:
+            r.pop("_ts", None)
+        return rows
+
     @server.tool(
         name="get_workspace",
         title="Get Workspace Structure",
@@ -2864,7 +2976,14 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "are always shown.\n"
             "- folders_only (default false): Return only the folder hierarchy with document counts "
             "per folder. No individual documents listed. Useful for understanding graph organization "
-            "without the full document list.\n\n"
+            "without the full document list.\n"
+            "- recent_days / recent_limit (optional): Catch up on what's been going on. When either is "
+            "set, returns a FLAT list of documents sorted most-recently-updated first (across all "
+            "folders, each with its folder path) instead of the nested tree. recent_days keeps docs "
+            "touched within the last N days; recent_limit caps to the N most recent. Recency uses the "
+            "workspace catalog timestamp (create / move / rename / reorder, plus edits where "
+            "propagated) — a fast proxy for 'what's new', read from one channel with no query. "
+            "Combine with folder_id to scope to one area.\n\n"
             "This is always complete at the requested depth — prefer it over sparql_query for "
             "discovering what documents exist."
         ),
@@ -2876,9 +2995,11 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         folder_id: Optional[str] = None,
         min_score: Optional[float] = None,
         folders_only: bool = False,
+        recent_days: Optional[float] = None,
+        recent_limit: Optional[int] = None,
         context: Context | None = None,
     ) -> str:
-        """Get workspace folder structure as a nested tree."""
+        """Get workspace folder structure as a nested tree (or a flat recency view)."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -2908,6 +3029,29 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 excluded_doc_ids, valued_doc_ids = await _get_excluded_docs_by_score(
                     graph_id, min_score, auth
                 )
+
+            # Recency mode: a flat, most-recently-updated-first list for catching
+            # up on a graph. Cheap — reads only the workspace catalog, no SPARQL.
+            if recent_days is not None or recent_limit is not None:
+                recent = _build_recent_docs(
+                    snapshot,
+                    recent_days=recent_days,
+                    recent_limit=recent_limit,
+                    excluded_doc_ids=excluded_doc_ids,
+                    folder_id=folder_id,
+                )
+                recent_result: dict[str, Any] = {
+                    "graph_id": graph_id,
+                    "recent": recent,
+                    "count": len(recent),
+                }
+                if recent_days is not None:
+                    recent_result["recent_days"] = recent_days
+                if recent_limit is not None:
+                    recent_result["recent_limit"] = recent_limit
+                if folder_id:
+                    recent_result["folder_id"] = folder_id
+                return json.dumps(recent_result)
 
             tree = _build_workspace_tree(
                 snapshot,
@@ -3081,7 +3225,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         title="Move Folder",
         description=(
             "Move a folder to a new parent folder. "
-            "Set new_parent_id to null to move to root level. "
+            "Set parent_id to null to move to root level. "
             "Optionally update the order for positioning among siblings."
         ),
     )
@@ -3089,7 +3233,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
     async def move_folder_tool(
         graph_id: str | None = None,
         folder_id: str = "",
-        new_parent_id: Optional[str] = None,
+        parent_id: Optional[str] = None,
         new_order: Optional[float] = None,
         context: Context | None = None,
     ) -> dict:
@@ -3117,9 +3261,9 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 raise RuntimeError(f"Folder '{folder_id}' not found in graph '{graph_id}'")
 
             # Validate target folder exists
-            if new_parent_id and not reader.folder_exists(new_parent_id.strip()):
+            if parent_id and not reader.folder_exists(parent_id.strip()):
                 raise ValueError(
-                    f"Target folder '{new_parent_id}' does not exist in graph '{graph_id}'. "
+                    f"Target folder '{parent_id}' does not exist in graph '{graph_id}'. "
                     f"Use get_workspace to see available folder IDs."
                 )
 
@@ -3128,7 +3272,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 graph_id.strip(),
                 lambda doc: WorkspaceWriter(doc).update_folder(
                     folder_id.strip(),
-                    parent_id=new_parent_id.strip() if new_parent_id else None,
+                    parent_id=parent_id.strip() if parent_id else None,
                     order=new_order,
                 ),
                 user_id=auth.user_id,
@@ -3138,7 +3282,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 "success": True,
                 "folder_id": folder_id.strip(),
                 "graph_id": graph_id.strip(),
-                "new_parent_id": new_parent_id.strip() if new_parent_id else None,
+                "parent_id": parent_id.strip() if parent_id else None,
             }
 
         except Exception as e:
@@ -3634,7 +3778,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         source_graph_id: str,
         target_graph_id: str,
         document_id: str,
-        new_parent_id: Optional[str],
+        parent_id: Optional[str],
     ) -> dict:
         """Move a document between graphs by reading content, writing to target, and deleting source.
 
@@ -3661,14 +3805,14 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
 
         # 2. Validate target graph and folder
         await hp_client.connect_workspace(target_graph_id, user_id=auth.user_id)
-        if new_parent_id:
+        if parent_id:
             target_ws = hp_client.get_workspace_channel(target_graph_id, user_id=auth.user_id)
             if target_ws is None:
                 raise RuntimeError(f"Could not connect to workspace for graph '{target_graph_id}'")
             target_reader = WorkspaceReader(target_ws.doc)
-            if not target_reader.folder_exists(new_parent_id.strip()):
+            if not target_reader.folder_exists(parent_id.strip()):
                 raise ValueError(
-                    f"Target folder '{new_parent_id}' not found in graph '{target_graph_id}'. "
+                    f"Target folder '{parent_id}' not found in graph '{target_graph_id}'. "
                     f"Use get_workspace to see available folder IDs."
                 )
 
@@ -3702,7 +3846,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         )
 
         # Register in target workspace
-        parent = new_parent_id.strip() if new_parent_id else None
+        parent = parent_id.strip() if parent_id else None
         await hp_client.transact_workspace(
             target_graph_id,
             lambda doc: WorkspaceWriter(doc).upsert_document(document_id, title, parent_id=parent),
@@ -3733,7 +3877,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             "document_id": document_id,
             "source_graph_id": source_graph_id,
             "target_graph_id": target_graph_id,
-            "new_parent_id": parent,
+            "parent_id": parent,
             "title": title,
             "warning": "Wires and block-level connections were not preserved in cross-graph move. Block IDs have changed.",
         }
@@ -3744,7 +3888,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         description=(
             "Move document(s) to a folder. For a single document, pass document_id. "
             "For multiple documents, pass a document_ids list. All documents are moved "
-            "to the same new_parent_id (null for root level). "
+            "to the same parent_id (null for root level). "
             "Set target_graph_id to move to a different graph "
             "(content and comments are preserved; wires and block IDs are not). "
             "Note: This updates the document's folder assignment in workspace navigation."
@@ -3755,7 +3899,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         graph_id: str | None = None,
         document_id: Optional[str] = None,
         document_ids: list[str] | None = None,
-        new_parent_id: str | None = None,
+        parent_id: str | None = None,
         target_graph_id: str | None = None,
         context: Context | None = None,
     ) -> dict:
@@ -3789,7 +3933,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             for did in ids_to_move:
                 try:
                     result = await _move_document_cross_graph(
-                        auth, graph_id.strip(), target_graph_id.strip(), did, new_parent_id,
+                        auth, graph_id.strip(), target_graph_id.strip(), did, parent_id,
                     )
                     results.append(result)
                 except Exception as e:
@@ -3816,9 +3960,9 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
             reader = WorkspaceReader(channel.doc)
 
             # Validate target folder exists
-            if new_parent_id and not reader.folder_exists(new_parent_id.strip()):
+            if parent_id and not reader.folder_exists(parent_id.strip()):
                 raise ValueError(
-                    f"Target folder '{new_parent_id}' does not exist in graph '{graph_id}'. "
+                    f"Target folder '{parent_id}' does not exist in graph '{graph_id}'. "
                     f"Use get_workspace to see available folder IDs."
                 )
 
@@ -3835,7 +3979,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                         graph_id.strip(),
                         lambda doc, _did=did: WorkspaceWriter(doc).update_document(
                             _did,
-                            parent_id=new_parent_id.strip() if new_parent_id else None,
+                            parent_id=parent_id.strip() if parent_id else None,
                         ),
                         user_id=auth.user_id,
                     )
@@ -3843,7 +3987,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                         "success": True,
                         "document_id": did,
                         "graph_id": graph_id.strip(),
-                        "new_parent_id": new_parent_id.strip() if new_parent_id else None,
+                        "parent_id": parent_id.strip() if parent_id else None,
                     })
                 except Exception as e:
                     errors.append({"document_id": did, "error": str(e)})
