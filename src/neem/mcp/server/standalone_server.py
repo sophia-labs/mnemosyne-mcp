@@ -469,6 +469,7 @@ HIVEMIND_EXCLUDED: frozenset[str] = frozenset({
     "list_wire_predicates", # predicate taxonomy is in CLAUDE.md — no need for a tool call
     "archive_memories",     # rare maintenance op — switch to full profile when needed
     "surface",              # browser chat UI card — irrelevant to agent sessions
+    "context_bundle",       # single-call attunement built for Hyle — hivemind attunes manually
 })
 
 # Tools available in the "angel" profile — haiku-class subagents with
@@ -1074,7 +1075,7 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
             "This MCP server provides real-time access to Mnemosyne knowledge graphs. "
             "Available tools:\n\n"
             "**Quick-start workflow:**\n"
-            "(1) Orient — context_bundle (single call) or get_user_location �� set_home_graph → get_workspace.\n"
+            "(1) Orient — get_user_location �� set_home_graph → get_workspace.\n"
             "(2) Read — read_document to see content and block IDs.\n"
             "(3) Edit — use block tools for surgical changes or write_document for full replacement.\n"
             "(4) Connect — create_wire with predicates from list_wire_predicates, using block IDs for precision.\n\n"
@@ -1097,7 +1098,7 @@ def create_standalone_mcp_server(profile: str | None = None) -> FastMCP:
             "immediately in the Mnemosyne web UI.\n\n"
             "**Geist (Sophia Memory Tools):**\n"
             "Memory, valuation, and self-narrative tools for agent continuity.\n"
-            "- Orientation flow: context_bundle() (preferred) or get_user_location → music() → recall() → get_workspace()\n"
+            "- Orientation flow: get_user_location → music() → recall() → get_workspace() (manual — preferred for the hivemind); context_bundle() bundles these in one call where available\n"
             "- music/sing: Read/write the Song (narrative orientation before structural orientation)\n"
             "- remember/recall/care: Working memory queue (FIFO, numbered, append-only)\n"
             "- value/get_block_values: Block-level importance (0-5) and valence (-5 to +5) scoring\n"
