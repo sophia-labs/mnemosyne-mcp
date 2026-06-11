@@ -202,20 +202,26 @@ def map_valuations_to_block_ids(
 ) -> list[dict]:
     """Map block indices to block IDs, producing batch entries for value_tool.
 
-    Entries with out-of-range block indices are silently skipped.
+    Entries with out-of-range block indices are silently skipped, as are
+    entries whose resolved block ID is None/empty (a failed ID resolution
+    upstream must not produce valuations against a literal "None" block).
     """
     entries: list[dict] = []
     for pv in pending:
-        if 0 <= pv.block_index < len(block_ids):
-            entry: dict = {
-                "document_id": document_id,
-                "block_id": block_ids[pv.block_index],
-            }
-            if pv.importance is not None:
-                entry["importance"] = pv.importance
-            if pv.valence is not None:
-                entry["valence"] = pv.valence
-            entries.append(entry)
+        if not (0 <= pv.block_index < len(block_ids)):
+            continue
+        block_id = block_ids[pv.block_index] or ""
+        if not block_id:
+            continue
+        entry: dict = {
+            "document_id": document_id,
+            "block_id": block_id,
+        }
+        if pv.importance is not None:
+            entry["importance"] = pv.importance
+        if pv.valence is not None:
+            entry["valence"] = pv.valence
+        entries.append(entry)
     return entries
 
 

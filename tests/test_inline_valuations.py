@@ -281,6 +281,22 @@ class TestMapValuationsToBlockIds:
         assert result[0]["importance"] == 4
         assert result[0]["valence"] == 2
 
+    def test_none_block_id_skipped(self):
+        """Regression: a None ID from failed upstream resolution must be
+        skipped, not passed through to be stringified into block "None"."""
+        pending = [
+            PendingValuation(block_index=0, importance=3, valence=None),
+            PendingValuation(block_index=1, importance=4, valence=2),
+        ]
+        result = map_valuations_to_block_ids(pending, [None, "block-b"], "doc-1")
+        assert len(result) == 1
+        assert result[0]["block_id"] == "block-b"
+
+    def test_empty_block_id_skipped(self):
+        pending = [PendingValuation(block_index=0, importance=3, valence=None)]
+        result = map_valuations_to_block_ids(pending, [""], "doc-1")
+        assert result == []
+
 
 # ------------------------------------------------------------------
 # End-to-end: preprocess → markdown_to_xml → postprocess

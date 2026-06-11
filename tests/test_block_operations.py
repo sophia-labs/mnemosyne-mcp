@@ -451,6 +451,54 @@ class TestDocumentWriter:
         # Should add 2 blocks (flattened listItems)
         assert reader.get_block_count() == initial_count + 2
 
+    def test_insert_blocks_at_append_returns_real_ids(self, populated_doc):
+        """Regression: the append path must return real block IDs, not None.
+
+        befd7f7 delegated appends to append_block(), which returns None —
+        every default-append insert_blocks call returned [None, ...] and the
+        inline-valuation pipeline wrote phantom block-"None" valuations.
+        """
+        writer = DocumentWriter(populated_doc)
+        reader = DocumentReader(populated_doc)
+
+        initial_count = reader.get_block_count()
+
+        new_ids = writer.insert_blocks_at(initial_count, [
+            '<paragraph>Appended one</paragraph>',
+            '<heading level="2">Appended two</heading>',
+            '<paragraph>Appended three</paragraph>',
+        ])
+
+        assert reader.get_block_count() == initial_count + 3
+        assert len(new_ids) == 3
+        for bid in new_ids:
+            assert isinstance(bid, str) and bid.startswith("block-")
+
+        # Returned IDs must match the actual appended children, in order
+        fragment = reader.get_content_fragment()
+        appended = list(fragment.children)[initial_count:]
+        assert new_ids == [c.attributes.get("data-block-id") for c in appended]
+
+    def test_insert_blocks_at_append_list_container_returns_real_id(self, populated_doc):
+        """Appending a list container returns the first flattened item's real ID."""
+        writer = DocumentWriter(populated_doc)
+        reader = DocumentReader(populated_doc)
+
+        initial_count = reader.get_block_count()
+
+        new_ids = writer.insert_blocks_at(initial_count, [
+            '<bulletList><listItem><paragraph>Item 1</paragraph></listItem>'
+            '<listItem><paragraph>Item 2</paragraph></listItem></bulletList>',
+        ])
+
+        # Container flattens to 2 listItems; new_ids stays 1:1 with inputs
+        assert reader.get_block_count() == initial_count + 2
+        assert len(new_ids) == 1
+
+        fragment = reader.get_content_fragment()
+        first_appended = list(fragment.children)[initial_count]
+        assert new_ids[0] == first_appended.attributes.get("data-block-id")
+
 
 class TestEdgeCases:
     """Test edge cases and error handling."""

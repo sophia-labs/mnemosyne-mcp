@@ -759,8 +759,11 @@ async def _apply_valuations_batch(
     # 1. Validate entries and build URI maps
     valid_entries: List[Dict[str, Any]] = []
     for i, entry in enumerate(entries):
-        doc_id = str(entry.get("document_id", "")).strip()
-        blk_id = str(entry.get("block_id", "")).strip()
+        # `or ""` (not a str() of the raw value): str(None) is the truthy
+        # string "None", which sails past the emptiness guard below and
+        # writes valuations against a phantom block-"None" URI.
+        doc_id = str(entry.get("document_id") or "").strip()
+        blk_id = str(entry.get("block_id") or "").strip()
         imp = entry.get("importance")
         val = entry.get("valence")
 

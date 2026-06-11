@@ -1736,9 +1736,16 @@ class DocumentWriter:
         new_ids: list[str] = []
 
         if index >= block_count:
-            # Append mode
+            # Append mode. append_block() returns None by design, so collect
+            # IDs by reading back the children each call adds. This also
+            # handles list-container flattening (1 xml_str -> N blocks): we
+            # return the first appended block's real ID to keep new_ids 1:1
+            # with xml_strings — inline marker mapping indexes on xml_strings.
             for xml_str in xml_strings:
-                bid = self.append_block(xml_str)
+                before = len(list(fragment.children))
+                self.append_block(xml_str)
+                appended = list(fragment.children)[before:]
+                bid = appended[0].attributes.get("data-block-id") if appended else None
                 new_ids.append(bid)
         else:
             # Insert after block at (index - 1) using proven insert_block_after_id
