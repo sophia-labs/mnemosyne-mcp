@@ -126,18 +126,35 @@ def _levenshtein(a: str, b: str) -> int:
     return prev[-1]
 
 
-def _nearest_field_name(target: str, candidates: list[str]) -> str | None:
+def _nearest_field_names(
+    target: str, candidates: list[str], max_results: int = 2
+) -> list[str]:
+    """Return up to max_results candidates closest to target, within threshold.
+
+    When multiple candidates are nearly tied (within 1 of the best distance),
+    return both rather than a single misleading suggestion. Example:
+    `doc_id` is distance 3 from both `block_id` (the alphabetically-first
+    match) and `document_id` (the real intent at distance 5) — suggesting
+    only `block_id` actively points the wrong direction.
+    """
     if not candidates:
-        return None
+        return []
     target_lower = target.lower()
-    best: tuple[int, str] | None = None
-    for c in candidates:
-        d = _levenshtein(target_lower, c.lower())
-        if best is None or d < best[0]:
-            best = (d, c)
-    if best and best[0] <= max(2, len(target) // 2):
-        return best[1]
-    return None
+    scored = sorted(
+        ((_levenshtein(target_lower, c.lower()), c) for c in candidates),
+        key=lambda x: (x[0], x[1]),
+    )
+    threshold = max(2, len(target) // 2)
+    best_distance = scored[0][0]
+    if best_distance > threshold:
+        return []
+    return [c for d, c in scored if d <= best_distance + 1][:max_results]
+
+
+def _nearest_field_name(target: str, candidates: list[str]) -> str | None:
+    """Single-best back-compat shim around _nearest_field_names."""
+    nearest = _nearest_field_names(target, candidates, max_results=1)
+    return nearest[0] if nearest else None
 
 
 def _format_validation_error_with_field_hints(
@@ -146,7 +163,7 @@ def _format_validation_error_with_field_hints(
     """Build an enhanced message for extra_forbidden errors; return None if not applicable."""
     errors = original.errors()
     permitted = sorted(getattr(cls, "model_fields", {}).keys())
-    extras: list[tuple[str, str | None]] = []
+    extras: list[tuple[str, list[str]]] = []
     other_errors: list[str] = []
 
     for err in errors:
@@ -154,7 +171,7 @@ def _format_validation_error_with_field_hints(
             loc = err.get("loc", ())
             if loc and isinstance(loc[0], str):
                 bad = loc[0]
-                extras.append((bad, _nearest_field_name(bad, permitted)))
+                extras.append((bad, _nearest_field_names(bad, permitted)))
         else:
             msg = err.get("msg", "")
             loc = ".".join(str(p) for p in err.get("loc", ()))
@@ -164,10 +181,13 @@ def _format_validation_error_with_field_hints(
         return None
 
     parts: list[str] = []
-    for bad, suggestion in extras:
+    for bad, suggestions in extras:
         msg = f"Unknown field '{bad}'."
-        if suggestion:
-            msg += f" Did you mean '{suggestion}'?"
+        if len(suggestions) == 1:
+            msg += f" Did you mean '{suggestions[0]}'?"
+        elif len(suggestions) > 1:
+            quoted = " or ".join(f"'{s}'" for s in suggestions)
+            msg += f" Did you mean {quoted}?"
         parts.append(msg)
     permitted_str = ", ".join(permitted) if permitted else "(none)"
     enhanced = f"{' '.join(parts)} Permitted fields: [{permitted_str}]."
@@ -533,6 +553,7 @@ LITE_TOOLS: frozenset[str] = frozenset({
     "query_blocks",
     "search_documents",
     "search_blocks",
+    "check_document",
     # History
     "get_document_history",
     "read_document_at_snapshot",

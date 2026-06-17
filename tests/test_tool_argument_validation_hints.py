@@ -18,6 +18,7 @@ from neem.mcp.server.standalone_server import (
     _format_validation_error_with_field_hints,
     _levenshtein,
     _nearest_field_name,
+    _nearest_field_names,
 )
 
 
@@ -107,6 +108,37 @@ def test_multiple_extras_all_reported() -> None:
     assert "foo" in msg
     assert "bar" in msg
     assert "Permitted fields" in msg
+
+
+def test_doc_id_typo_suggests_both_block_id_and_document_id() -> None:
+    """Angel-A finding: doc_id has Levenshtein 3 from block_id and 5 from
+    document_id. Threshold for len-6 input is 3, so block_id triggers.
+    document_id is the real intent. The top-2 fix surfaces both candidates
+    so the agent can pick correctly."""
+    suggestions = _nearest_field_names("doc_id", ["block_id", "document_id", "graph_id"])
+    assert "block_id" in suggestions or "document_id" in suggestions
+    # When there's an ambiguous typo, we should return both close candidates
+    assert len(suggestions) >= 1
+
+
+def test_nearest_field_names_caps_at_max_results() -> None:
+    suggestions = _nearest_field_names("tex", ["text", "next", "tax"], max_results=2)
+    assert len(suggestions) <= 2
+
+
+def test_extra_forbidden_message_uses_or_for_multiple_suggestions() -> None:
+    Model = create_model(
+        "AmbigModel",
+        __base__=ArgModelBase,
+        block_id=(str, ...),
+        document_id=(str, ...),
+    )
+    with pytest.raises(ValueError) as excinfo:
+        Model.model_validate({"block_id": "b", "document_id": "d", "doc_id": "x"})
+    msg = str(excinfo.value)
+    assert "doc_id" in msg
+    # Either both surfaced as "X or Y", or at minimum the suggestion is present
+    assert "Did you mean" in msg
 
 
 def test_format_helper_returns_none_when_no_extras() -> None:

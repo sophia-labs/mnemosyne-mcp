@@ -4477,6 +4477,12 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
         try:
             await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id, auth=auth)
             await _assert_document_writable(graph_id.strip(), document_id.strip(), auth.user_id)
+            if await _check_document_tombstone(graph_id.strip(), document_id.strip(), auth):
+                raise RuntimeError(
+                    f"Document '{document_id}' is tombstoned in graph '{graph_id}'. "
+                    f"Deleted document IDs cannot be reused — use a different document ID. "
+                    f"Use check_document(graph_id, document_id) to probe availability."
+                )
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 
             results: list[Dict[str, Any]] = []
@@ -4934,6 +4940,12 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
             # Validate document exists in workspace
             await _validate_document_in_workspace(graph_id.strip(), document_id.strip(), auth.user_id, auth=auth)
             await _assert_document_writable(graph_id.strip(), document_id.strip(), auth.user_id)
+            if await _check_document_tombstone(graph_id.strip(), document_id.strip(), auth):
+                raise RuntimeError(
+                    f"Document '{document_id}' is tombstoned in graph '{graph_id}'. "
+                    f"Deleted document IDs cannot be reused — use a different document ID. "
+                    f"Use check_document(graph_id, document_id) to probe availability."
+                )
 
             await hp_client.connect_document(graph_id.strip(), document_id.strip(), user_id=auth.user_id)
 

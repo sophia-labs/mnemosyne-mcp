@@ -52,12 +52,12 @@ def register_surface_tools(server: FastMCP) -> None:
         graph_id: str | None = None,
         actions: List[dict[str, Any]] = [],
         ctx: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         auth = MCPAuthContext.from_context(ctx)
         auth.require_auth()
 
         if not actions:
-            return json.dumps({"type": "surface", "actions": []})
+            return {"type": "surface", "actions": []}
 
         # Resolve document titles from workspace Y.Doc
         titles: dict[str, str | None] = {}
@@ -102,4 +102,4 @@ def register_surface_tools(server: FastMCP) -> None:
             },
         )
 
-        return json.dumps(result)
+        return result

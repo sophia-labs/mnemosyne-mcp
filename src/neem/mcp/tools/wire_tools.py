@@ -409,7 +409,7 @@ def register_wire_tools(server: FastMCP) -> None:
     async def list_wire_predicates_tool(
         graph_id: str | None = None,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         """List all wire predicates (built-in + custom in use)."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
@@ -455,7 +455,7 @@ def register_wire_tools(server: FastMCP) -> None:
                 extra_context={"graph_id": graph_id, "error": str(e)},
             )
 
-        return json.dumps({"predicates": predicates, "count": len(predicates)})
+        return {"predicates": predicates, "count": len(predicates)}
 
     # ─────────────────────────────────────────────────────────────────────────
     # create_wires
@@ -490,7 +490,7 @@ def register_wire_tools(server: FastMCP) -> None:
         target_graph_id: Optional[str] = None,
         wires: list[dict[str, Any]] | None = None,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         """Create one or more wires between documents/blocks via Y.js CRDT."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
@@ -576,7 +576,7 @@ def register_wire_tools(server: FastMCP) -> None:
                 if errors:
                     output["errors"] = errors
                     output["error_count"] = len(errors)
-                return json.dumps(output)
+                return output
 
             except Exception as e:
                 raise RuntimeError(f"Failed to create wires: {e}")
@@ -643,7 +643,7 @@ def register_wire_tools(server: FastMCP) -> None:
 
                 await _refresh_wire_snapshot(backend_config.base_url, auth, graph_id, wire_id)
 
-                return json.dumps(result)
+                return result
 
             except Exception as e:
                 raise RuntimeError(f"Failed to create wire: {e}")
@@ -670,7 +670,7 @@ def register_wire_tools(server: FastMCP) -> None:
         direction: str = "both",
         predicate: Optional[str] = None,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         """Get wires connected to a document."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
@@ -766,7 +766,7 @@ def register_wire_tools(server: FastMCP) -> None:
                 result["restored_wires"] = len(restored)
             if swept:
                 result["swept_tombstones"] = len(swept)
-            return json.dumps(result)
+            return result
 
         except Exception as e:
             raise RuntimeError(f"Failed to get wires: {e}")
@@ -794,7 +794,7 @@ def register_wire_tools(server: FastMCP) -> None:
         predicate: Optional[str] = None,
         direction: str = "both",
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         """Traverse wire connections from a starting document."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
@@ -898,10 +898,10 @@ def register_wire_tools(server: FastMCP) -> None:
                         }
                         queue.append((other_id, depth + 1))
 
-            return json.dumps({
+            return {
                 "nodes": list(nodes.values()),
                 "edges": edges,
-            })
+            }
 
         except Exception as e:
             raise RuntimeError(f"Failed to traverse wires: {e}")
@@ -919,7 +919,7 @@ def register_wire_tools(server: FastMCP) -> None:
         document_id: Optional[str] = None,
         block_id: Optional[str] = None,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         """Delete wires by ID, by document, or by block."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
@@ -971,11 +971,11 @@ def register_wire_tools(server: FastMCP) -> None:
                     graph_id, _do_delete_matching, user_id=auth.user_id
                 )
 
-                return json.dumps({
+                return {
                     "deleted": deleted,
                     "deleted_count": len(deleted),
                     "scope": {"document_id": doc_id, "block_id": blk_id},
-                })
+                }
 
             # Mode: delete by explicit IDs
             if wire_ids is not None and wire_id is not None:
@@ -1018,7 +1018,7 @@ def register_wire_tools(server: FastMCP) -> None:
             if errors:
                 output["errors"] = errors
                 output["error_count"] = len(errors)
-            return json.dumps(output)
+            return output
 
         except Exception as e:
             raise RuntimeError(f"Failed to delete wires: {e}")

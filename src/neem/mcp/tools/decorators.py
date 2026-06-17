@@ -150,17 +150,26 @@ def _load_persisted_home_graphs() -> dict[str, tuple[str, float]]:
 
 def _persist_home_graphs() -> None:
     path = _home_graph_state_path()
+    # Per-PID tmp suffix avoids collision when two MCP processes for the same
+    # user persist concurrently. Atomic rename guarantees no torn writes; the
+    # remaining race (one process's in-memory dict overwriting another's on
+    # disk) is documented and acceptable for the single-user case.
+    tmp_path = path.with_suffix(f"{path.suffix}.tmp.{os.getpid()}")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             user_id: {"graph_id": gid, "ts": ts}
             for user_id, (gid, ts) in _home_graphs_with_ts.items()
         }
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
         tmp_path.write_text(json.dumps(payload))
         os.replace(tmp_path, path)
     except Exception:
-        pass
+        # Best-effort cleanup of an orphaned tmp file if rename never landed.
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
 
 
 _home_graphs_with_ts: dict[str, tuple[str, float]] = _load_persisted_home_graphs()

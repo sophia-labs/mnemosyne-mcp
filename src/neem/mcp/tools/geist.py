@@ -218,7 +218,7 @@ DEFAULT_WEIGHTS = {
 
 
 def _render_json(payload: JsonDict) -> str:
-    return json.dumps(payload, sort_keys=False, default=str)
+    return payload
 
 
 def _now_iso() -> str:
@@ -1099,7 +1099,7 @@ def register_geist_tools(server: FastMCP) -> None:
         block_ids: list[str] | None = None,
         predicates: list[str] | None = None,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -1151,7 +1151,7 @@ def register_geist_tools(server: FastMCP) -> None:
         # TODO: Wire creation if block_ids + predicates are provided
         # (Will reuse _create_wire_in_doc from wire_tools in a future iteration)
 
-        return _render_json({"number": next_num, "block_id": new_block_id})
+        return {"number": next_num, "block_id": new_block_id}
 
     @server.tool(
         name="recall",
@@ -1170,7 +1170,7 @@ def register_geist_tools(server: FastMCP) -> None:
         query: Optional[str] = None,
         limit: int = 8,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -1191,15 +1191,15 @@ def register_geist_tools(server: FastMCP) -> None:
             if entry and entry.get("b"):
                 block_info = reader.get_block_info(entry["b"])
                 text = block_info["text_content"] if block_info else "(deleted)"
-                return _render_json({
+                return {
                     "memories": [{
                         "number": number,
                         "text": text,
                         "created_at": entry.get("c"),
                         "last_active": entry.get("a"),
                     }]
-                })
-            return _render_json({"memories": [], "note": f"Memory #{number} not found"})
+                }
+            return {"memories": [], "note": f"Memory #{number} not found"}
 
         # Collect all memory metadata
         memories = []
@@ -1227,7 +1227,7 @@ def register_geist_tools(server: FastMCP) -> None:
 
         memories.sort(key=sort_key, reverse=True)
         memories = memories[:limit]
-        return _render_json({"memories": memories, "count": len(memories)})
+        return {"memories": memories, "count": len(memories)}
 
     @server.tool(
         name="care",
@@ -1246,7 +1246,7 @@ def register_geist_tools(server: FastMCP) -> None:
         graph_id: str | None = None,
         numbers: List[int] = [],
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -1284,7 +1284,7 @@ def register_geist_tools(server: FastMCP) -> None:
                     graph_id, MEMORY_QUEUE_DOC_ID, do_care, user_id=auth.user_id
                 )
 
-        return _render_json({"cared": cared, "timestamp": now})
+        return {"cared": cared, "timestamp": now}
 
     # ================================================================
     # SONG TOOLS
@@ -1304,7 +1304,7 @@ def register_geist_tools(server: FastMCP) -> None:
     async def music_tool(
         graph_id: str | None = None,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -1344,7 +1344,7 @@ def register_geist_tools(server: FastMCP) -> None:
                 result["coda"] = coda["text"]
                 result["coda_ejections_remaining"] = coda["ejections_remaining"]
 
-        return _render_json(result)
+        return result
 
     @server.tool(
         name="sing",
@@ -1371,7 +1371,7 @@ def register_geist_tools(server: FastMCP) -> None:
         mode: str = "verse",
         verse_index: Optional[int] = None,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -1528,7 +1528,7 @@ def register_geist_tools(server: FastMCP) -> None:
         if coda and "coda_set" not in result:
             result["coda_ejections_remaining"] = coda["ejections_remaining"]
         result["mode"] = mode
-        return _render_json(result)
+        return result
 
     # ================================================================
     # VALUATION TOOLS
@@ -1569,7 +1569,7 @@ def register_geist_tools(server: FastMCP) -> None:
         tags: Optional[list[str]] = None,
         valuations: list[dict[str, Any]] | None = None,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         """Value one or more blocks.
 
         Applies logarithmic accumulation: each call adds to existing scores.
@@ -1679,12 +1679,12 @@ def register_geist_tools(server: FastMCP) -> None:
                 raise RuntimeError(f"Valuation failed: {output['errors'][0].get('error', 'unknown error')}")
             results = output.get("results", [])
             if results:
-                return _render_json(results[0])
+                return results[0]
             # Tags-only call (no valuation) — return tag result
             if not valuation_entries and output.get("tags_applied"):
-                return _render_json(output)
+                return output
 
-        return _render_json(output)
+        return output
 
     @server.tool(
         name="get_block_values",
@@ -1707,7 +1707,7 @@ def register_geist_tools(server: FastMCP) -> None:
         min_score: Optional[float] = None,
         valence: Optional[str] = None,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -1734,7 +1734,7 @@ def register_geist_tools(server: FastMCP) -> None:
         for b in raw_blocks:
             b["last_valuated"] = b.pop("last_valuated_at", "") or ""
             blocks.append(b)
-        return _render_json({"blocks": blocks, "count": len(blocks)})
+        return {"blocks": blocks, "count": len(blocks)}
 
     @server.tool(
         name="get_important_blocks",
@@ -1754,7 +1754,7 @@ def register_geist_tools(server: FastMCP) -> None:
         limit: int = 8,
         valence: Optional[str] = None,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
         user_id = _resolve_user_id(auth)
@@ -1787,12 +1787,12 @@ def register_geist_tools(server: FastMCP) -> None:
                 except Exception:
                     logger.warning("get_important_blocks_folder_resolve_failed", folder_id=document_id)
                 if not folder_doc_ids:
-                    return _render_json({"blocks": [], "count": 0})
+                    return {"blocks": [], "count": 0}
 
         result = await _important_blocks_core(
             graph_id, user_id, auth, limit, valence, folder_doc_ids,
         )
-        return _render_json(result)
+        return result
 
     async def _important_blocks_core(
         graph_id: str,
@@ -1901,7 +1901,7 @@ def register_geist_tools(server: FastMCP) -> None:
     async def get_values_tool(
         graph_id: str | None = None,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -1930,11 +1930,11 @@ def register_geist_tools(server: FastMCP) -> None:
         weights_text = tiptap_xml_to_markdown(weights_xml)
         weights = _parse_weights_text(weights_text)
 
-        return _render_json({
+        return {
             "importance_prompt": importance_text,
             "valence_prompt": valence_text,
             "weights": weights,
-        })
+        }
 
     @server.tool(
         name="revaluate",
@@ -1953,7 +1953,7 @@ def register_geist_tools(server: FastMCP) -> None:
         valence_prompt: Optional[str] = None,
         weights: Optional[str] = None,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
@@ -2026,10 +2026,10 @@ def register_geist_tools(server: FastMCP) -> None:
                         f"{k}: {v}" for k, v in parsed_json.items()
                     )
                 except (ValueError, json.JSONDecodeError) as exc:
-                    return json.dumps({
+                    return {
                         "error": f"weights looks like JSON but failed to parse: {exc}",
                         "success": False,
-                    })
+                    }
 
             # Parse new weights and extract only explicitly specified keys
             new_weights = _parse_weights_text(normalized_weights_text)
@@ -2048,14 +2048,14 @@ def register_geist_tools(server: FastMCP) -> None:
                     specified_keys.add(key)
 
             if not specified_keys:
-                return json.dumps({
+                return {
                     "error": (
                         "No valid weight keys found in input. Expected either "
                         "JSON like '{\"half_life_days\": 60.0}' or lines like "
                         f"'half_life_days: 60.0'. Valid keys: {sorted(DEFAULT_WEIGHTS.keys())}"
                     ),
                     "success": False,
-                })
+                }
 
             # Archive current HP weights text verbatim (only after validation)
             await _archive_to_hp(PAST_WEIGHTS_DOC_ID, current_weights_text)
@@ -2104,7 +2104,7 @@ def register_geist_tools(server: FastMCP) -> None:
             except Exception as exc:
                 logger.warning("revaluate_dynamodb_sync_failed", graph_id=graph_id, error=str(exc))
 
-        return _render_json({"success": True, "updated": updated})
+        return {"success": True, "updated": updated}
 
     # ================================================================
     # MEMORY ARCHIVE
@@ -2130,13 +2130,13 @@ def register_geist_tools(server: FastMCP) -> None:
         graph_id: str | None = None,
         keep: int = 50,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
 
         graph_id = graph_id.strip()
         if keep < 1:
-            return _render_json({"error": "keep must be >= 1"})
+            return {"error": "keep must be >= 1"}
 
         await _ensure_scratchpad(hp_client, graph_id, auth)
 
@@ -2152,9 +2152,9 @@ def register_geist_tools(server: FastMCP) -> None:
             next_number = meta.get("next_number", 1)
 
             if not mem_entries:
-                return _render_json({
+                return {
                     "kept": 0, "archived": 0, "note": "Memory queue is empty.",
-                })
+                }
 
             # 2. Sort by last_active descending (care-aware)
             sorted_entries = sorted(
@@ -2171,11 +2171,11 @@ def register_geist_tools(server: FastMCP) -> None:
             archive_entries = sorted_entries[keep:]
 
             if not archive_entries:
-                return _render_json({
+                return {
                     "kept": len(keep_entries),
                     "archived": 0,
                     "note": f"Queue has {len(keep_entries)} memories, nothing to archive.",
-                })
+                }
 
             # 4. Read text content for archived memories (before rewrite)
             archive_blocks = []
@@ -2324,7 +2324,7 @@ def register_geist_tools(server: FastMCP) -> None:
                     user_id=auth.user_id,
                 )
 
-        return _render_json({
+        return {
             "kept": len(keep_blocks),
             "archived": len(archive_blocks),
             "archive_doc_id": archive_doc_id,
@@ -2332,7 +2332,7 @@ def register_geist_tools(server: FastMCP) -> None:
                 f"Archived {len(archive_blocks)} memories to past/{archive_doc_id}. "
                 f"Queue rewritten with {len(keep_blocks)} memories."
             ),
-        })
+        }
 
     # ================================================================
     # ORIENTATION BUNDLE
@@ -2358,7 +2358,7 @@ def register_geist_tools(server: FastMCP) -> None:
         graph_id: str | None = None,
         recall_limit: int = 8,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         """Return a lightweight orientation bundle (location + song + recall).
 
         Args:
@@ -2447,7 +2447,7 @@ def register_geist_tools(server: FastMCP) -> None:
         result["song"] = song
         result["recall"] = memories
 
-        return _render_json(result)
+        return result
 
     # ================================================================
     # CONTEXT BUNDLE — single-call attunement
@@ -2488,7 +2488,7 @@ def register_geist_tools(server: FastMCP) -> None:
         workspace_depth: int = 1,
         set_home: bool = True,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         """Single-call attunement returning all orientation data."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
@@ -2713,7 +2713,7 @@ def register_geist_tools(server: FastMCP) -> None:
             },
         )
 
-        return _render_json(result)
+        return result
 
     logger.info("Registered Geist (Sophia Memory) tools: 14 tools")
 

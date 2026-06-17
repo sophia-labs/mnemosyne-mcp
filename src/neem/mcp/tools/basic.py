@@ -68,7 +68,7 @@ def register_basic_tools(server: FastMCP) -> None:
     async def list_graphs_tool(
         include_deleted: bool = False,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         """List graphs owned by the authenticated user.
 
         Args:
@@ -90,7 +90,7 @@ def register_basic_tools(server: FastMCP) -> None:
                 raise ValueError(f"Unexpected /graphs/catalog payload type: {type(graphs).__name__}")
             graphs = _filter_deleted_graphs(graphs, include_deleted)
             trace("SUCCESS: Got %d graphs from catalog" % len(graphs))
-            return _render_json({"graphs": graphs, "count": len(graphs)})
+            return {"graphs": graphs, "count": len(graphs)}
         except Exception as exc:
             trace("Catalog endpoint failed, falling back to job queue: %s" % exc)
 
@@ -123,7 +123,7 @@ def register_basic_tools(server: FastMCP) -> None:
                 graphs = _filter_deleted_graphs(graphs, include_deleted)
                 if context:
                     await context.report_progress(100, 100)
-                return _render_json({"graphs": graphs, "count": len(graphs)})
+                return {"graphs": graphs, "count": len(graphs)}
 
         if poll_payload:
             graphs = _extract_graphs_from_status(poll_payload)
@@ -131,14 +131,14 @@ def register_basic_tools(server: FastMCP) -> None:
                 graphs = _filter_deleted_graphs(graphs, include_deleted)
                 if context:
                     await context.report_progress(100, 100)
-                return _render_json({"graphs": graphs, "count": len(graphs)})
+                return {"graphs": graphs, "count": len(graphs)}
 
         if context:
             await context.report_progress(100, 100)
 
-        return _render_json({
+        return {
             "error": "Failed to extract graph list from job result",
-        })
+        }
 
 
 async def submit_job(
@@ -481,4 +481,4 @@ async def _request_json(
 
 
 def _render_json(payload: JsonDict) -> str:
-    return json.dumps(payload, sort_keys=True)
+    return payload
