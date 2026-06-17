@@ -194,6 +194,20 @@ class StructuredLogger:
 
         log_method(message, **context)
 
+    @staticmethod
+    def _merge_extra(
+        extra_context: Optional[Dict[str, Any]], extra: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        # Accept the structlog-style `logger.warning(msg, key=value, ...)` idiom
+        # by merging stray kwargs into extra_context. This was the source of
+        # `StructuredLogger.warning() got an unexpected keyword argument 'error'`
+        # crashes in geist tools — many callsites mix the two styles.
+        if not extra:
+            return extra_context
+        if extra_context is None:
+            return dict(extra)
+        return {**extra_context, **extra}
+
     def trace(
         self,
         message: str,
@@ -201,12 +215,13 @@ class StructuredLogger:
         extra_context: Optional[Dict[str, Any]] = None,
         exception: Optional[Exception] = None,
         lazy_context: Optional[Callable[[], Dict[str, Any]]] = None,
+        **extra: Any,
     ) -> None:
         """Log trace message (very detailed debugging)."""
         self._log_with_context(
             "DEBUG",  # Map to DEBUG since TRACE isn't standard
             f"[TRACE] {message}",
-            extra_context=extra_context,
+            extra_context=self._merge_extra(extra_context, extra),
             exception=exception,
             lazy_context=lazy_context,
         )
@@ -217,10 +232,14 @@ class StructuredLogger:
         *,
         extra_context: Optional[Dict[str, Any]] = None,
         lazy_context: Optional[Callable[[], Dict[str, Any]]] = None,
+        **extra: Any,
     ) -> None:
         """Log debug message."""
         self._log_with_context(
-            "DEBUG", message, extra_context=extra_context, lazy_context=lazy_context
+            "DEBUG",
+            message,
+            extra_context=self._merge_extra(extra_context, extra),
+            lazy_context=lazy_context,
         )
 
     def info(
@@ -229,10 +248,14 @@ class StructuredLogger:
         *,
         extra_context: Optional[Dict[str, Any]] = None,
         lazy_context: Optional[Callable[[], Dict[str, Any]]] = None,
+        **extra: Any,
     ) -> None:
         """Log info message."""
         self._log_with_context(
-            "INFO", message, extra_context=extra_context, lazy_context=lazy_context
+            "INFO",
+            message,
+            extra_context=self._merge_extra(extra_context, extra),
+            lazy_context=lazy_context,
         )
 
     def happy(
@@ -241,10 +264,14 @@ class StructuredLogger:
         *,
         extra_context: Optional[Dict[str, Any]] = None,
         lazy_context: Optional[Callable[[], Dict[str, Any]]] = None,
+        **extra: Any,
     ) -> None:
         """Log happy milestone message (job progression, success events)."""
         self._log_with_context(
-            "HAPPY", message, extra_context=extra_context, lazy_context=lazy_context
+            "HAPPY",
+            message,
+            extra_context=self._merge_extra(extra_context, extra),
+            lazy_context=lazy_context,
         )
 
     def warning(
@@ -254,12 +281,13 @@ class StructuredLogger:
         extra_context: Optional[Dict[str, Any]] = None,
         exception: Optional[Exception] = None,
         lazy_context: Optional[Callable[[], Dict[str, Any]]] = None,
+        **extra: Any,
     ) -> None:
         """Log warning message."""
         self._log_with_context(
             "WARNING",
             message,
-            extra_context=extra_context,
+            extra_context=self._merge_extra(extra_context, extra),
             exception=exception,
             lazy_context=lazy_context,
         )
@@ -271,12 +299,13 @@ class StructuredLogger:
         extra_context: Optional[Dict[str, Any]] = None,
         exception: Optional[Exception] = None,
         lazy_context: Optional[Callable[[], Dict[str, Any]]] = None,
+        **extra: Any,
     ) -> None:
         """Log error message."""
         self._log_with_context(
             "ERROR",
             message,
-            extra_context=extra_context,
+            extra_context=self._merge_extra(extra_context, extra),
             exception=exception,
             lazy_context=lazy_context,
         )
@@ -288,12 +317,13 @@ class StructuredLogger:
         extra_context: Optional[Dict[str, Any]] = None,
         exception: Optional[Exception] = None,
         lazy_context: Optional[Callable[[], Dict[str, Any]]] = None,
+        **extra: Any,
     ) -> None:
         """Log critical message."""
         self._log_with_context(
             "CRITICAL",
             message,
-            extra_context=extra_context,
+            extra_context=self._merge_extra(extra_context, extra),
             exception=exception,
             lazy_context=lazy_context,
         )
@@ -442,6 +472,16 @@ class ContextualLogger:
 
         method(message, **kwargs)
 
+    @staticmethod
+    def _merge_extra(
+        extra_context: Optional[Dict[str, Any]], extra: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        if not extra:
+            return extra_context
+        if extra_context is None:
+            return dict(extra)
+        return {**extra_context, **extra}
+
     def trace(
         self,
         message: str,
@@ -449,12 +489,13 @@ class ContextualLogger:
         extra_context: Optional[Dict[str, Any]] = None,
         exception: Optional[Exception] = None,
         lazy_context: Optional[Callable[[], Dict[str, Any]]] = None,
+        **extra: Any,
     ) -> None:
         """Log trace with context."""
         self._log_with_added_context(
             "trace",
             message,
-            extra_context=extra_context,
+            extra_context=self._merge_extra(extra_context, extra),
             exception=exception,
             lazy_context=lazy_context,
         )
@@ -465,10 +506,14 @@ class ContextualLogger:
         *,
         extra_context: Optional[Dict[str, Any]] = None,
         lazy_context: Optional[Callable[[], Dict[str, Any]]] = None,
+        **extra: Any,
     ) -> None:
         """Log debug with context."""
         self._log_with_added_context(
-            "debug", message, extra_context=extra_context, lazy_context=lazy_context
+            "debug",
+            message,
+            extra_context=self._merge_extra(extra_context, extra),
+            lazy_context=lazy_context,
         )
 
     def info(
@@ -477,10 +522,14 @@ class ContextualLogger:
         *,
         extra_context: Optional[Dict[str, Any]] = None,
         lazy_context: Optional[Callable[[], Dict[str, Any]]] = None,
+        **extra: Any,
     ) -> None:
         """Log info with context."""
         self._log_with_added_context(
-            "info", message, extra_context=extra_context, lazy_context=lazy_context
+            "info",
+            message,
+            extra_context=self._merge_extra(extra_context, extra),
+            lazy_context=lazy_context,
         )
 
     def happy(
@@ -489,10 +538,14 @@ class ContextualLogger:
         *,
         extra_context: Optional[Dict[str, Any]] = None,
         lazy_context: Optional[Callable[[], Dict[str, Any]]] = None,
+        **extra: Any,
     ) -> None:
         """Log happy milestone with context."""
         self._log_with_added_context(
-            "happy", message, extra_context=extra_context, lazy_context=lazy_context
+            "happy",
+            message,
+            extra_context=self._merge_extra(extra_context, extra),
+            lazy_context=lazy_context,
         )
 
     def warning(
@@ -502,12 +555,13 @@ class ContextualLogger:
         extra_context: Optional[Dict[str, Any]] = None,
         exception: Optional[Exception] = None,
         lazy_context: Optional[Callable[[], Dict[str, Any]]] = None,
+        **extra: Any,
     ) -> None:
         """Log warning with context."""
         self._log_with_added_context(
             "warning",
             message,
-            extra_context=extra_context,
+            extra_context=self._merge_extra(extra_context, extra),
             exception=exception,
             lazy_context=lazy_context,
         )
@@ -519,12 +573,13 @@ class ContextualLogger:
         extra_context: Optional[Dict[str, Any]] = None,
         exception: Optional[Exception] = None,
         lazy_context: Optional[Callable[[], Dict[str, Any]]] = None,
+        **extra: Any,
     ) -> None:
         """Log error with context."""
         self._log_with_added_context(
             "error",
             message,
-            extra_context=extra_context,
+            extra_context=self._merge_extra(extra_context, extra),
             exception=exception,
             lazy_context=lazy_context,
         )
@@ -536,12 +591,13 @@ class ContextualLogger:
         extra_context: Optional[Dict[str, Any]] = None,
         exception: Optional[Exception] = None,
         lazy_context: Optional[Callable[[], Dict[str, Any]]] = None,
+        **extra: Any,
     ) -> None:
         """Log critical with context."""
         self._log_with_added_context(
             "critical",
             message,
-            extra_context=extra_context,
+            extra_context=self._merge_extra(extra_context, extra),
             exception=exception,
             lazy_context=lazy_context,
         )

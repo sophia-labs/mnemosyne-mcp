@@ -920,30 +920,61 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
 
     _blob_timeout_seconds = _parse_float_env("MNEMOSYNE_READ_BLOB_TIMEOUT_SECONDS", 8.0)
 
+    # Read-side transient retry: 2 retries on 5xx / network failure, 500ms then 2s.
+    # No retry on 4xx (client error) or 200/410 (success). Total worst-case latency
+    # added: ~2.5s for fully-failed reads, which is well within agent tolerance.
+    _READ_RETRY_BACKOFFS = (0.5, 2.0)
+
     async def _http_get_blob(path: str, auth: MCPAuthContext) -> tuple[bytes | None, int, str | None]:
         url = f"{backend_config.base_url}{path}"
-        try:
-            response = await get_http_client().get(
-                url, headers=auth.http_headers(),
-                timeout=httpx.Timeout(_blob_timeout_seconds),
-            )
-            if response.status_code == 200:
-                blob_source = response.headers.get("X-Blob-Source")
-                return response.content, 200, blob_source
-            if response.status_code == 410:
-                return None, 410, None
-            _bump_read_counter("blob_http_error")
-            logger.debug(
-                "http_blob_read_non_200",
-                extra_context={"url": path, "status": response.status_code},
-            )
-            return None, response.status_code, None
-        except Exception as exc:
-            logger.warning(
-                "http_blob_read_failed",
-                extra_context={"url": path, "error": str(exc)},
-            )
-            return None, 0, None
+        last_status = 0
+        for attempt in range(len(_READ_RETRY_BACKOFFS) + 1):
+            try:
+                response = await get_http_client().get(
+                    url, headers=auth.http_headers(),
+                    timeout=httpx.Timeout(_blob_timeout_seconds),
+                )
+                if response.status_code == 200:
+                    blob_source = response.headers.get("X-Blob-Source")
+                    return response.content, 200, blob_source
+                if response.status_code == 410:
+                    return None, 410, None
+                last_status = response.status_code
+                if 500 <= response.status_code < 600 and attempt < len(_READ_RETRY_BACKOFFS):
+                    backoff = _READ_RETRY_BACKOFFS[attempt]
+                    logger.debug(
+                        "http_blob_read_5xx_retry",
+                        extra_context={"url": path, "status": response.status_code, "attempt": attempt + 1, "backoff": backoff},
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                _bump_read_counter("blob_http_error")
+                logger.debug(
+                    "http_blob_read_non_200",
+                    extra_context={"url": path, "status": response.status_code},
+                )
+                return None, response.status_code, None
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
+                if attempt < len(_READ_RETRY_BACKOFFS):
+                    backoff = _READ_RETRY_BACKOFFS[attempt]
+                    logger.debug(
+                        "http_blob_read_transient_retry",
+                        extra_context={"url": path, "error": str(exc), "attempt": attempt + 1, "backoff": backoff},
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                logger.warning(
+                    "http_blob_read_failed",
+                    extra_context={"url": path, "error": str(exc), "attempts": attempt + 1},
+                )
+                return None, 0, None
+            except Exception as exc:
+                logger.warning(
+                    "http_blob_read_failed",
+                    extra_context={"url": path, "error": str(exc)},
+                )
+                return None, 0, None
+        return None, last_status, None
 
     async def _check_document_tombstone(
         graph_id: str,
@@ -2558,6 +2589,8 @@ Comments: Pass a dict mapping comment IDs to metadata. Comment IDs must match da
 Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}
 
 Indentation: Use tab characters at the start of a line to set paragraph indent level (1 tab = indent 1, 2 tabs = indent 2, etc.). Creates visual hierarchy. Tabs inside code fences and on list items are not affected.
+
+XML constraints (when content is raw XML, not markdown): each top-level block must be a complete element (`<paragraph>...</paragraph>`, `<heading level="2">...</heading>`, etc.). Multiple block elements may be concatenated at the top level — they do not require a synthetic root. Inline `&`, `<`, `>` in text nodes must be entity-escaped (`&amp;`, `&lt;`, `&gt;`). A `junk after document element` or `no element found` error means the XML is malformed at the root — either an unterminated element, a stray `&`, or stray text outside any element.
 
 `await_durable` (default true) forces post-write verification through a fresh document channel rather than the same cached channel.
 
@@ -4432,6 +4465,10 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
             "Can update attributes (indent, checked, listType) without changing content, "
             "or replace entire block content. Plain text in xml_content is auto-wrapped "
             "in a <paragraph>. Markdown is also accepted and auto-converted.\n\n"
+            "**XML constraint:** each `xml_content` payload must be a single well-formed block element "
+            "(`<paragraph>...</paragraph>`, `<heading level=\"2\">...</heading>`, etc.). "
+            "Inline `&`, `<`, `>` in text nodes must be entity-escaped (`&amp;`, `&lt;`, `&gt;`). "
+            "`junk after document element` means you wrote two siblings — split into separate updates.\n\n"
             "Always read the document or block first (read_document or get_block) before updating — "
             "write tools use a cached channel and need a preceding read to sync latest state.\n\n"
             "Inline valuations: Add {!N} (importance 0-5), {!,+N} or {!,-N} (valence), "
@@ -4889,6 +4926,12 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
             "Supports negative indexing.\n"
             "- Neither: appends to end (most common case)\n"
             "- Both: error (mutually exclusive)\n\n"
+            "**XML constraints (when content is raw XML):** each top-level block must be a complete "
+            "element. Multiple block elements concatenated at the top level are supported and inserted "
+            "as separate blocks. Inline `&`, `<`, `>` in text nodes must be entity-escaped "
+            "(`&amp;`, `&lt;`, `&gt;`). `junk after document element` / `no element found` means the "
+            "XML is malformed at the root — an unterminated element, a stray `&`, or stray text "
+            "outside any element.\n\n"
             "**Limitation:** Inserting before the very first block (index=0 or position='before' "
             "on the first block) is not supported due to CRDT sync ordering. To prepend content, "
             "use update_blocks to replace the first block with your new content, then insert_blocks "

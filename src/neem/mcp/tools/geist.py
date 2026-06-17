@@ -1154,6 +1154,31 @@ def register_geist_tools(server: FastMCP) -> None:
         return {"number": next_num, "block_id": new_block_id}
 
     @server.tool(
+        name="store_memory",
+        title="Store Memory (deprecated alias for remember)",
+        description=(
+            "DEPRECATED: use `remember` instead. This alias exists only to suppress the "
+            "common hallucination from agents trained on prior MCP surfaces. It dispatches "
+            "directly to `remember` with identical semantics."
+        ),
+    )
+    @resolve_home_graph
+    async def store_memory_alias_tool(
+        graph_id: str | None = None,
+        content: str = "",
+        block_ids: list[str] | None = None,
+        predicates: list[str] | None = None,
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        return await store_memory_tool(
+            graph_id=graph_id,
+            content=content,
+            block_ids=block_ids,
+            predicates=predicates,
+            context=context,
+        )
+
+    @server.tool(
         name="recall",
         title="Recall Memories",
         description=(
