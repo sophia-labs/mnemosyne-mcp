@@ -21,6 +21,11 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from neem.hocuspocus import HocuspocusClient, WorkspaceReader, WorkspaceWriter
 from neem.mcp.auth import MCPAuthContext, get_current_auth_token, get_hocuspocus_client_kwargs
+from neem.mcp.tools._id_normalize import (
+    bare_block_id,
+    bare_ids_in_result,
+    normalize_block_id_for_lookup,
+)
 from neem.mcp.tools.decorators import resolve_home_graph
 from neem.mcp.http_client import get_http_client
 from neem.utils.logging import LoggerFactory
@@ -532,6 +537,10 @@ def register_wire_tools(server: FastMCP) -> None:
                         bidir = bool(spec.get("bidirectional", False))
                         src_block = (spec.get("source_block_id") or "").strip() or None
                         tgt_block = (spec.get("target_block_id") or "").strip() or None
+                        if src_block:
+                            src_block = normalize_block_id_for_lookup(src_block)
+                        if tgt_block:
+                            tgt_block = normalize_block_id_for_lookup(tgt_block)
 
                         await _ensure_document_in_ws(graph_id, src_doc, auth.user_id)
                         if eff_tgt_graph == graph_id:
@@ -576,7 +585,7 @@ def register_wire_tools(server: FastMCP) -> None:
                 if errors:
                     output["errors"] = errors
                     output["error_count"] = len(errors)
-                return output
+                return bare_ids_in_result(output)
 
             except Exception as e:
                 raise RuntimeError(f"Failed to create wires: {e}")
@@ -592,6 +601,11 @@ def register_wire_tools(server: FastMCP) -> None:
             effective_target_graph = target_graph_id or graph_id
             wire_id = f"w-{uuid4().hex[:12]}"
             inverse_wire_id = f"{wire_id}-inv" if bidirectional else None
+
+            if isinstance(source_block_id, str) and source_block_id.strip():
+                source_block_id = normalize_block_id_for_lookup(source_block_id.strip())
+            if isinstance(target_block_id, str) and target_block_id.strip():
+                target_block_id = normalize_block_id_for_lookup(target_block_id.strip())
 
             try:
                 await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
@@ -643,7 +657,7 @@ def register_wire_tools(server: FastMCP) -> None:
 
                 await _refresh_wire_snapshot(backend_config.base_url, auth, graph_id, wire_id)
 
-                return result
+                return bare_ids_in_result(result)
 
             except Exception as e:
                 raise RuntimeError(f"Failed to create wire: {e}")
@@ -766,7 +780,7 @@ def register_wire_tools(server: FastMCP) -> None:
                 result["restored_wires"] = len(restored)
             if swept:
                 result["swept_tombstones"] = len(swept)
-            return result
+            return bare_ids_in_result(result)
 
         except Exception as e:
             raise RuntimeError(f"Failed to get wires: {e}")
@@ -1018,7 +1032,7 @@ def register_wire_tools(server: FastMCP) -> None:
             if errors:
                 output["errors"] = errors
                 output["error_count"] = len(errors)
-            return output
+            return bare_ids_in_result(output)
 
         except Exception as e:
             raise RuntimeError(f"Failed to delete wires: {e}")

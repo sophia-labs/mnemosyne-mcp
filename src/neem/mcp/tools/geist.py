@@ -38,6 +38,11 @@ from neem.hocuspocus import (
     WorkspaceWriter,
 )
 from neem.hocuspocus.converters import tiptap_xml_to_markdown
+from neem.mcp.tools._id_normalize import (
+    bare_block_id,
+    bare_ids_in_result,
+    normalize_block_id_for_lookup,
+)
 from neem.mcp.tools.decorators import get_home_graph, resolve_home_graph, set_home_graph
 from neem.mcp.tools.hocuspocus import _normalize_timestamp_to_iso
 from neem.mcp.auth import MCPAuthContext, get_current_auth_token, get_hocuspocus_client_kwargs
@@ -1369,7 +1374,7 @@ def register_geist_tools(server: FastMCP) -> None:
                 result["coda"] = coda["text"]
                 result["coda_ejections_remaining"] = coda["ejections_remaining"]
 
-        return result
+        return bare_ids_in_result(result)
 
     @server.tool(
         name="sing",
@@ -1553,7 +1558,7 @@ def register_geist_tools(server: FastMCP) -> None:
         if coda and "coda_set" not in result:
             result["coda_ejections_remaining"] = coda["ejections_remaining"]
         result["mode"] = mode
-        return result
+        return bare_ids_in_result(result)
 
     # ================================================================
     # VALUATION TOOLS
@@ -1707,9 +1712,9 @@ def register_geist_tools(server: FastMCP) -> None:
                 return results[0]
             # Tags-only call (no valuation) — return tag result
             if not valuation_entries and output.get("tags_applied"):
-                return output
+                return bare_ids_in_result(output)
 
-        return output
+        return bare_ids_in_result(output)
 
     @server.tool(
         name="get_block_values",
@@ -1817,7 +1822,7 @@ def register_geist_tools(server: FastMCP) -> None:
         result = await _important_blocks_core(
             graph_id, user_id, auth, limit, valence, folder_doc_ids,
         )
-        return result
+        return bare_ids_in_result(result)
 
     async def _important_blocks_core(
         graph_id: str,
@@ -2472,7 +2477,7 @@ def register_geist_tools(server: FastMCP) -> None:
         result["song"] = song
         result["recall"] = memories
 
-        return result
+        return bare_ids_in_result(result)
 
     # ================================================================
     # CONTEXT BUNDLE — single-call attunement
@@ -2738,7 +2743,7 @@ def register_geist_tools(server: FastMCP) -> None:
             },
         )
 
-        return result
+        return bare_ids_in_result(result)
 
     logger.info("Registered Geist (Sophia Memory) tools: 14 tools")
 
@@ -2875,7 +2880,7 @@ def _parse_verse_lines(verse_text: str) -> list[tuple[str, bool]]:
             result.append((line, True))
         else:
             result.append((line, False))
-    return result
+    return bare_ids_in_result(result)
 
 
 def _interleave_verse_xml(verse_text: str, counterpoints: list[str]) -> str:

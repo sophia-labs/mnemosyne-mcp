@@ -45,6 +45,13 @@ from neem.hocuspocus.document import extract_title_from_xml
 from neem.mcp.auth import MCPAuthContext, get_current_auth_token, get_hocuspocus_client_kwargs
 from neem.mcp.http_client import get_http_client
 from neem.mcp.jobs import RealtimeJobClient
+from neem.mcp.tools._id_normalize import (
+    bare_block_id,
+    bare_block_ids,
+    bare_ids_in_result,
+    normalize_block_id_for_lookup,
+    normalize_document_id_for_lookup,
+)
 from neem.mcp.tools.basic import await_job_completion, submit_job
 from neem.mcp.tools.decorators import clear_home_graph, get_home_graph, resolve_home_graph, set_home_graph
 from neem.mcp.tools.wire_tools import _get_wires_for_document, _get_predicate_short_name
@@ -1813,6 +1820,8 @@ GROUP BY ?docId
         """Get the user's current graph and document IDs."""
         auth = MCPAuthContext.from_context(context)
         token = auth.require_auth()
+        if isinstance(document_id, str) and document_id:
+            document_id = normalize_document_id_for_lookup(document_id)
         user_id = _resolve_user_id(auth, token, user_id)
 
         try:
@@ -1886,7 +1895,7 @@ GROUP BY ?docId
             current_home = get_home_graph(user_id)
             if current_home:
                 result["home_graph"] = current_home
-            return result
+            return bare_ids_in_result(result)
 
         except RuntimeError:
             raise
@@ -1917,6 +1926,8 @@ GROUP BY ?docId
         """Set or clear the session's default graph."""
         auth = MCPAuthContext.from_context(context)
         token = auth.require_auth()
+        if isinstance(document_id, str) and document_id:
+            document_id = normalize_document_id_for_lookup(document_id)
         user_id = _resolve_user_id(auth, token, None)
         if graph_id.strip():
             set_home_graph(user_id, graph_id.strip())
@@ -1955,7 +1966,7 @@ GROUP BY ?docId
                 "active_document_id": active_doc,
                 "session": session_snapshot,
             }
-            return result
+            return bare_ids_in_result(result)
 
         except Exception as e:
             logger.error(
@@ -1997,6 +2008,8 @@ Always returns fresh content — automatically reconnects if the cached channel 
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
+        if isinstance(document_id, str) and document_id:
+            document_id = normalize_document_id_for_lookup(document_id)
 
         if format and format not in ("xml", "markdown", "ids_only"):
             raise ValueError("format must be 'xml', 'markdown', or 'ids_only'")
@@ -2100,7 +2113,7 @@ Always returns fresh content — automatically reconnects if the cached channel 
                     extra_context={"document_id": document_id, "error": str(e)},
                 )
 
-            return result
+            return bare_ids_in_result(result)
 
         except Exception as e:
             logger.error(
@@ -2163,6 +2176,8 @@ Always returns fresh content — automatically reconnects if the cached channel 
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
+        if isinstance(document_id, str) and document_id:
+            document_id = normalize_document_id_for_lookup(document_id)
 
         if limit > 200:
             limit = 200
@@ -2253,7 +2268,7 @@ Always returns fresh content — automatically reconnects if the cached channel 
                 if visible_comments:
                     result["comments"] = visible_comments
 
-            return result
+            return bare_ids_in_result(result)
 
         except Exception as e:
             logger.error(
@@ -2302,6 +2317,8 @@ Always returns fresh content — automatically reconnects if the cached channel 
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
+        if isinstance(document_id, str) and document_id:
+            document_id = normalize_document_id_for_lookup(document_id)
 
         try:
             # 1. Read workspace metadata (direct path with fallback)
@@ -2563,7 +2580,7 @@ LIMIT {top_valued}
             if valuation_summary:
                 result["valuation_summary"] = valuation_summary
 
-            return result
+            return bare_ids_in_result(result)
 
         except Exception as e:
             logger.error(
@@ -2614,6 +2631,8 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         """Write TipTap XML content to a document."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
+        if isinstance(document_id, str) and document_id:
+            document_id = normalize_document_id_for_lookup(document_id)
 
         try:
             # Check readOnly before writing
@@ -2741,7 +2760,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 result["valuations"] = val_result
             if tag_result is not None:
                 result["tags"] = tag_result
-            return result
+            return bare_ids_in_result(result)
 
         except Exception as e:
             logger.error(
@@ -2774,6 +2793,8 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
     ) -> dict:
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
+        if isinstance(document_id, str) and document_id:
+            document_id = normalize_document_id_for_lookup(document_id)
 
         if not document_id:
             raise ValueError("document_id is required")
@@ -2994,7 +3015,7 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
                 cur = parent_of.get(cur)
             result = "/".join(reversed(parts))
             cache[fid] = result
-            return result
+            return bare_ids_in_result(result)
 
         return {fid: _path(fid) for fid in name_of}
 
@@ -3269,7 +3290,7 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
                 )
                 if unfiled > 0:
                     result["unfiled_documents"] = unfiled
-            return result
+            return bare_ids_in_result(result)
 
         except Exception as e:
             logger.error(
@@ -3850,6 +3871,8 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
         """Ingest an artifact into a document via the backend API."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
+        if isinstance(document_id, str) and document_id:
+            document_id = normalize_document_id_for_lookup(document_id)
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required and cannot be empty")
@@ -4036,6 +4059,8 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
         """Move one or more documents to a folder, or to a different graph."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
+        if isinstance(document_id, str) and document_id:
+            document_id = normalize_document_id_for_lookup(document_id)
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required and cannot be empty")
@@ -4078,7 +4103,7 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
             if errors:
                 output["errors"] = errors
                 output["error_count"] = len(errors)
-            return output
+            return bare_ids_in_result(output)
 
         # Same-graph move
         try:
@@ -4131,7 +4156,7 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
             if errors:
                 output["errors"] = errors
                 output["error_count"] = len(errors)
-            return output
+            return bare_ids_in_result(output)
 
         except Exception as e:
             logger.error(
@@ -4217,7 +4242,7 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
             if errors:
                 output["errors"] = errors
                 output["error_count"] = len(errors)
-            return output
+            return bare_ids_in_result(output)
 
         except Exception as e:
             logger.error(
@@ -4256,6 +4281,8 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
         """Get detailed information about a block by its ID."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
+        if isinstance(document_id, str) and document_id:
+            document_id = normalize_document_id_for_lookup(document_id)
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required")
@@ -4265,6 +4292,8 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
             raise ValueError("block_id is required")
         if format is not None and format not in ("markdown", "text"):
             raise ValueError("format must be None, 'markdown', or 'text'")
+
+        block_id = normalize_block_id_for_lookup(block_id.strip())
 
         try:
             # Validate document exists in workspace
@@ -4278,7 +4307,7 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
                 tool_name="get_block",
             )
             reader = DocumentReader(document_doc)
-            block_info = reader.get_block_info(block_id.strip())
+            block_info = reader.get_block_info(block_id)
 
             if block_info is None:
                 raise RuntimeError(f"Block '{block_id}' not found in document '{document_id}'.")
@@ -4316,7 +4345,7 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
                     block_comments = {cid: all_comments[cid] for cid in comment_ids if cid in all_comments}
                     if block_comments:
                         result["comments"] = block_comments
-            return result
+            return bare_ids_in_result(result)
 
         except Exception as e:
             logger.error(
@@ -4368,6 +4397,8 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
             raise RuntimeError("query_blocks is currently disabled")
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
+        if isinstance(document_id, str) and document_id:
+            document_id = normalize_document_id_for_lookup(document_id)
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required")
@@ -4442,7 +4473,7 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
                     query_comments = {cid: all_comments[cid] for cid in query_comment_ids if cid in all_comments}
                     if query_comments:
                         result["comments"] = query_comments
-            return result
+            return bare_ids_in_result(result)
 
         except Exception as e:
             logger.error(
@@ -4489,6 +4520,8 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
         """Update one or more blocks' attributes or content."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
+        if isinstance(document_id, str) and document_id:
+            document_id = normalize_document_id_for_lookup(document_id)
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required")
@@ -4502,9 +4535,14 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
         if updates is not None:
             if not updates:
                 raise ValueError("updates list must not be empty")
+            # Accept both prefixed and bare hex on each update's block_id
+            for u in updates:
+                if isinstance(u, dict) and isinstance(u.get("block_id"), str):
+                    u["block_id"] = normalize_block_id_for_lookup(u["block_id"])
         elif block_id is not None:
             if attributes is None and xml_content is None:
                 raise ValueError("Either attributes or xml_content must be provided")
+            block_id = normalize_block_id_for_lookup(block_id)
             updates = [{"block_id": block_id, "attributes": attributes, "xml_content": xml_content}]
         else:
             raise ValueError("Either 'block_id' (single) or 'updates' (batch) is required")
@@ -4645,7 +4683,7 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
                     r["valuations"] = val_result
                 if tag_result is not None:
                     r["tags"] = tag_result
-                return r
+                return bare_ids_in_result(r)
 
             output = {
                 "success": all(r.get("success") for r in results),
@@ -4657,7 +4695,7 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
                 output["valuations"] = val_result
             if tag_result is not None:
                 output["tags"] = tag_result
-            return output
+            return bare_ids_in_result(output)
 
         except Exception as e:
             logger.error(
@@ -4717,6 +4755,8 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
+        if isinstance(document_id, str) and document_id:
+            document_id = normalize_document_id_for_lookup(document_id)
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required")
@@ -4724,6 +4764,8 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
             raise ValueError("document_id is required")
         if not block_id or not block_id.strip():
             raise ValueError("block_id is required")
+
+        block_id = normalize_block_id_for_lookup(block_id.strip())
 
         # Validate mode: operations XOR find+replace
         has_operations = operations is not None and len(operations) > 0
@@ -4967,6 +5009,8 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
+        if isinstance(document_id, str) and document_id:
+            document_id = normalize_document_id_for_lookup(document_id)
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required")
@@ -4978,6 +5022,9 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
             raise ValueError("Provide either 'block_id' or 'index', not both")
         if position not in ("after", "before"):
             raise ValueError("position must be 'after' or 'before'")
+
+        if isinstance(block_id, str) and block_id:
+            block_id = normalize_block_id_for_lookup(block_id)
 
         try:
             # Validate document exists in workspace
@@ -5072,7 +5119,7 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
                 result["valuations"] = val_result
             if tag_result is not None:
                 result["tags"] = tag_result
-            return result
+            return bare_ids_in_result(result)
 
         except ValueError as ve:
             raise RuntimeError(str(ve))
@@ -5116,12 +5163,12 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
 
         requested_ids: list[str] = []
         if block_id and block_id.strip():
-            requested_ids.append(block_id.strip())
+            requested_ids.append(normalize_block_id_for_lookup(block_id.strip()))
         if block_ids:
             for raw in block_ids:
                 value = str(raw).strip()
                 if value:
-                    requested_ids.append(value)
+                    requested_ids.append(normalize_block_id_for_lookup(value))
 
         deduped_requested: list[str] = []
         seen_requested: set[str] = set()
@@ -5242,6 +5289,8 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
+        if isinstance(document_id, str) and document_id:
+            document_id = normalize_document_id_for_lookup(document_id)
 
         if action not in ("set", "resolve", "delete"):
             raise ValueError("action must be one of: set, resolve, delete")
@@ -5445,6 +5494,8 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
+        if isinstance(document_id, str) and document_id:
+            document_id = normalize_document_id_for_lookup(document_id)
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required")
