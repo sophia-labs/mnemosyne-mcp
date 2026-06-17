@@ -945,6 +945,32 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
             )
             return None, 0, None
 
+    async def _check_document_tombstone(
+        graph_id: str,
+        document_id: str,
+        auth: MCPAuthContext,
+    ) -> bool:
+        # Fail-open: returns False on any non-410 status or any error, so
+        # transient backend trouble can never block legitimate writes.
+        url = f"{backend_config.base_url}/documents/{graph_id}/{document_id}/blob"
+        try:
+            response = await get_http_client().head(
+                url,
+                headers=auth.http_headers(),
+                timeout=httpx.Timeout(_blob_timeout_seconds),
+            )
+            return response.status_code == 410
+        except Exception as exc:
+            logger.debug(
+                "tombstone_check_failed",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "error": str(exc),
+                },
+            )
+            return False
+
     def _record_read_source(tool_name: str, source: str) -> None:
         if source.startswith("http_blob"):
             _bump_read_counter("blob_hit")
@@ -1848,7 +1874,9 @@ GROUP BY ?docId
             "graph_id will use this graph when graph_id is not explicitly provided. "
             "Call this during attunement after get_user_location to avoid passing "
             "graph_id on every subsequent call. Pass a different graph_id to switch. "
-            "Pass empty string to clear the home graph."
+            "Pass empty string to clear the home graph. "
+            "Persists to disk with a 24h TTL, so the home graph survives MCP "
+            "reconnects and Claude Code /compact restarts."
         ),
     )
     async def set_home_graph_tool(
@@ -2531,8 +2559,6 @@ Example comments: {"comment-1": {"text": "Great point!", "author": "Claude"}}
 
 Indentation: Use tab characters at the start of a line to set paragraph indent level (1 tab = indent 1, 2 tabs = indent 2, etc.). Creates visual hierarchy. Tabs inside code fences and on list items are not affected.
 
-Returns block_ids: an ordered list of all block IDs in the written document, enabling immediate block-level wiring without a separate read call.
-
 `await_durable` (default true) forces post-write verification through a fresh document channel rather than the same cached channel.
 
 For modifying parts of an existing document, prefer surgical block tools (edit_block_text, update_blocks, insert_blocks). Use write_document when replacing the full content of a document.
@@ -2559,6 +2585,16 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         try:
             # Check readOnly before writing
             await _assert_document_writable(graph_id, document_id, auth.user_id)
+
+            # Pre-flight tombstone check — refuses tombstoned IDs before any
+            # write attempt. Without this, writes proceed optimistically and
+            # the post-write durability check raises after the round-trip.
+            if await _check_document_tombstone(graph_id, document_id, auth):
+                raise RuntimeError(
+                    f"Document '{document_id}' is tombstoned in graph '{graph_id}'. "
+                    f"Deleted document IDs cannot be reused — use a different document ID. "
+                    f"Use check_document(graph_id, document_id) to probe availability."
+                )
 
             # 1. Write document content and comments (with user context)
             await hp_client.connect_document(graph_id, document_id, user_id=auth.user_id)
@@ -2666,7 +2702,6 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 "graph_id": graph_id,
                 "document_id": document_id,
                 "title": title,
-                "block_ids": block_ids,
                 "durability_checked": await_durable,
             }
             if val_result is not None:
@@ -2685,6 +2720,68 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 },
             )
             raise RuntimeError(f"Failed to write document: {e}")
+
+    @server.tool(
+        name="check_document",
+        title="Check Document Status",
+        description="""Probe whether a document ID is usable before writing to it.
+
+Returns one of:
+- status="exists" with title and read_only — document is present in the workspace
+- status="tombstoned" — document was deleted; ID cannot be reused
+- status="available" — no document with this ID; safe to create
+
+Use this before write_document with a chosen ID to avoid the tombstone-on-write trap (deleted IDs return success-shaped errors only after the write round-trip).""",
+    )
+    @resolve_home_graph
+    async def check_document_tool(
+        graph_id: str | None = None,
+        document_id: str = "",
+        context: Context | None = None,
+    ) -> dict:
+        auth = MCPAuthContext.from_context(context)
+        auth.require_auth()
+
+        if not document_id:
+            raise ValueError("document_id is required")
+
+        if await _check_document_tombstone(graph_id, document_id, auth):
+            return {
+                "graph_id": graph_id,
+                "document_id": document_id,
+                "status": "tombstoned",
+            }
+
+        try:
+            await hp_client.connect_workspace(graph_id, user_id=auth.user_id)
+            ws_channel = hp_client.get_workspace_channel(graph_id, user_id=auth.user_id)
+            if ws_channel is not None:
+                reader = WorkspaceReader(ws_channel.doc)
+                doc_info = reader.get_document(document_id)
+                if isinstance(doc_info, dict):
+                    title = doc_info.get("title") or document_id
+                    return {
+                        "graph_id": graph_id,
+                        "document_id": document_id,
+                        "status": "exists",
+                        "title": title,
+                        "read_only": bool(doc_info.get("readOnly", False)),
+                    }
+        except Exception as exc:
+            logger.debug(
+                "check_document workspace lookup failed",
+                extra_context={
+                    "graph_id": graph_id,
+                    "document_id": document_id,
+                    "error": str(exc),
+                },
+            )
+
+        return {
+            "graph_id": graph_id,
+            "document_id": document_id,
+            "status": "available",
+        }
 
     def _build_workspace_tree(
         snapshot: dict[str, Any],
@@ -2998,7 +3095,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
         recent_days: Optional[float] = None,
         recent_limit: Optional[int] = None,
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         """Get workspace folder structure as a nested tree (or a flat recency view)."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
@@ -3051,7 +3148,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                     recent_result["recent_limit"] = recent_limit
                 if folder_id:
                     recent_result["folder_id"] = folder_id
-                return json.dumps(recent_result)
+                return recent_result
 
             tree = _build_workspace_tree(
                 snapshot,
@@ -3139,7 +3236,7 @@ Read the document first in multi-agent environments (see Write Tool Guidance in 
                 )
                 if unfiled > 0:
                     result["unfiled_documents"] = unfiled
-            return json.dumps(result)
+            return result
 
         except Exception as e:
             logger.error(

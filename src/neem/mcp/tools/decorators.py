@@ -6,7 +6,11 @@ and parameter validation.
 
 from __future__ import annotations
 
+import json
+import os
+import time
 from functools import wraps
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 from mcp.server.fastmcp import Context
@@ -101,13 +105,78 @@ def strip_params(*params_to_strip: str) -> Callable[[F], F]:
 # ---------------------------------------------------------------------------
 # Home graph — session-scoped default graph_id
 # ---------------------------------------------------------------------------
+# Persisted to disk so that the home-graph hint survives MCP server reconnects
+# and Claude Code /compact restarts within a 24-hour TTL. The in-memory dict
+# remains authoritative for hot lookups; disk is only read at module load and
+# written on set/clear.
 
-_home_graphs: dict[str, str] = {}
+_HOME_GRAPH_TTL_SECONDS = 24 * 60 * 60
+
+
+def _home_graph_state_path() -> Path:
+    override = os.environ.get("MNEMOSYNE_MCP_HOME_GRAPH_PATH")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".mnemosyne" / "mcp_home_graphs.json"
+
+
+def _load_persisted_home_graphs() -> dict[str, tuple[str, float]]:
+    path = _home_graph_state_path()
+    try:
+        if not path.exists():
+            return {}
+        raw = json.loads(path.read_text())
+        if not isinstance(raw, dict):
+            return {}
+    except Exception:
+        return {}
+
+    now = time.time()
+    live: dict[str, tuple[str, float]] = {}
+    for user_id, entry in raw.items():
+        if not isinstance(user_id, str) or not isinstance(entry, dict):
+            continue
+        graph_id = entry.get("graph_id")
+        ts = entry.get("ts")
+        if not isinstance(graph_id, str) or not graph_id:
+            continue
+        if not isinstance(ts, (int, float)):
+            continue
+        if now - float(ts) > _HOME_GRAPH_TTL_SECONDS:
+            continue
+        live[user_id] = (graph_id, float(ts))
+    return live
+
+
+def _persist_home_graphs() -> None:
+    path = _home_graph_state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            user_id: {"graph_id": gid, "ts": ts}
+            for user_id, (gid, ts) in _home_graphs_with_ts.items()
+        }
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload))
+        os.replace(tmp_path, path)
+    except Exception:
+        pass
+
+
+_home_graphs_with_ts: dict[str, tuple[str, float]] = _load_persisted_home_graphs()
+_home_graphs: dict[str, str] = {uid: gid for uid, (gid, _ts) in _home_graphs_with_ts.items()}
 
 
 def set_home_graph(user_id: str, graph_id: str) -> None:
-    """Set the session's default graph for a user."""
+    """Set the session's default graph for a user.
+
+    Persists to disk with a 24h TTL so the home-graph hint survives MCP
+    reconnects and Claude Code /compact restarts.
+    """
+    now = time.time()
     _home_graphs[user_id] = graph_id
+    _home_graphs_with_ts[user_id] = (graph_id, now)
+    _persist_home_graphs()
 
 
 def get_home_graph(user_id: str) -> str | None:
@@ -118,6 +187,8 @@ def get_home_graph(user_id: str) -> str | None:
 def clear_home_graph(user_id: str) -> None:
     """Clear the session's default graph for a user."""
     _home_graphs.pop(user_id, None)
+    _home_graphs_with_ts.pop(user_id, None)
+    _persist_home_graphs()
 
 
 def resolve_home_graph(func: F) -> F:
@@ -149,7 +220,8 @@ def resolve_home_graph(func: F) -> F:
             if not kwargs.get("graph_id") or not str(kwargs.get("graph_id", "")).strip():
                 raise ValueError(
                     "graph_id is required. Either pass it explicitly or set a home graph "
-                    "via set_home_graph(graph_id='your-graph-id')."
+                    "via set_home_graph(graph_id='your-graph-id'). Home graph is persisted "
+                    "for 24h and survives MCP reconnects."
                 )
         return await func(*args, **kwargs)
 

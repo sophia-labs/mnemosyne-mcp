@@ -29,6 +29,7 @@ def test_chatgpt_demo_profile_exposes_only_expected_tools(_demo_env: None) -> No
         "search_blocks",
         "read_document",
         "document_digest",
+        "check_document",
     }
 
 
@@ -161,6 +162,7 @@ def test_chatgpt_oauth_defaults_to_demo_profile_when_mcp_profile_missing(
         "search_blocks",
         "read_document",
         "document_digest",
+        "check_document",
         "write_document",
         "insert_blocks",
         "update_blocks",

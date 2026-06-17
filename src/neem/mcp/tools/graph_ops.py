@@ -161,7 +161,7 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         sparql: str = "",
         result_format: str = "json",
         context: Context | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         """Execute a SPARQL SELECT/CONSTRUCT query against a specific graph."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
@@ -228,9 +228,9 @@ def register_graph_ops_tools(server: FastMCP) -> None:
         # Extract query results from job output
         query_result = _extract_query_result(result)
         if query_result is not None:
-            return _render_json({"results": query_result})
+            return {"results": query_result}
 
-        return _render_json({"success": True, **result})
+        return {"success": True, **result}
 
     @server.tool(
         name="sparql_update",

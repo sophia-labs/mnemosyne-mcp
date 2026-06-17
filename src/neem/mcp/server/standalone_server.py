@@ -24,7 +24,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
 from mcp.types import ToolAnnotations
-from pydantic import ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError as PydanticValidationError
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -75,6 +75,7 @@ CHATGPT_DEMO_READ_TOOLS: frozenset[str] = frozenset({
     "read_blocks",
     "get_block",
     "query_blocks",
+    "check_document",
 })
 CHATGPT_DEMO_WRITE_TOOLS: frozenset[str] = frozenset({
     "write_document",
@@ -110,18 +111,105 @@ def _chatgpt_oauth_auth_server_url() -> str:
     return value
 
 
+def _levenshtein(a: str, b: str) -> int:
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        curr = [i]
+        for j, cb in enumerate(b, start=1):
+            cost = 0 if ca == cb else 1
+            curr.append(min(curr[-1] + 1, prev[j] + 1, prev[j - 1] + cost))
+        prev = curr
+    return prev[-1]
+
+
+def _nearest_field_name(target: str, candidates: list[str]) -> str | None:
+    if not candidates:
+        return None
+    target_lower = target.lower()
+    best: tuple[int, str] | None = None
+    for c in candidates:
+        d = _levenshtein(target_lower, c.lower())
+        if best is None or d < best[0]:
+            best = (d, c)
+    if best and best[0] <= max(2, len(target) // 2):
+        return best[1]
+    return None
+
+
+def _format_validation_error_with_field_hints(
+    cls: type, original: PydanticValidationError
+) -> str | None:
+    """Build an enhanced message for extra_forbidden errors; return None if not applicable."""
+    errors = original.errors()
+    permitted = sorted(getattr(cls, "model_fields", {}).keys())
+    extras: list[tuple[str, str | None]] = []
+    other_errors: list[str] = []
+
+    for err in errors:
+        if err.get("type") == "extra_forbidden":
+            loc = err.get("loc", ())
+            if loc and isinstance(loc[0], str):
+                bad = loc[0]
+                extras.append((bad, _nearest_field_name(bad, permitted)))
+        else:
+            msg = err.get("msg", "")
+            loc = ".".join(str(p) for p in err.get("loc", ()))
+            other_errors.append(f"{loc}: {msg}" if loc else msg)
+
+    if not extras:
+        return None
+
+    parts: list[str] = []
+    for bad, suggestion in extras:
+        msg = f"Unknown field '{bad}'."
+        if suggestion:
+            msg += f" Did you mean '{suggestion}'?"
+        parts.append(msg)
+    permitted_str = ", ".join(permitted) if permitted else "(none)"
+    enhanced = f"{' '.join(parts)} Permitted fields: [{permitted_str}]."
+    if other_errors:
+        enhanced += " Other errors: " + "; ".join(other_errors)
+    return enhanced
+
+
 def _enforce_strict_tool_argument_validation() -> None:
-    """Fail closed on unknown MCP tool arguments.
+    """Fail closed on unknown MCP tool arguments, with field-name hints on rejection.
 
     FastMCP argument models default to ignoring extra fields, which can silently
     drop misspelled or stale parameter names (e.g., after tool schema changes).
     Override ArgModelBase to forbid extras so callers get explicit validation
     errors instead of accidental fallback behavior.
+
+    Also wraps model_validate so extra_forbidden errors include the permitted
+    field list and a Levenshtein-nearest suggestion — eliminating the kwarg-
+    guessing cascade where the agent cycles 3-4 wrong field names.
     """
     ArgModelBase.model_config = ConfigDict(
         arbitrary_types_allowed=True,
         extra="forbid",
     )
+
+    if getattr(ArgModelBase, "_extra_forbidden_handler_installed", False):
+        return
+
+    _base_validate_func = BaseModel.model_validate.__func__
+
+    @classmethod
+    def _model_validate_with_field_hints(cls, *args, **kwargs):
+        try:
+            return _base_validate_func(cls, *args, **kwargs)
+        except PydanticValidationError as e:
+            hint = _format_validation_error_with_field_hints(cls, e)
+            if hint:
+                raise ValueError(hint) from e
+            raise
+
+    ArgModelBase.model_validate = _model_validate_with_field_hints
+    ArgModelBase._extra_forbidden_handler_installed = True
 
 
 def _protected_resource_metadata_path(mount_path: str) -> str:
@@ -486,6 +574,7 @@ ANGEL_TOOLS: frozenset[str] = frozenset({
     "query_blocks",
     "search_documents",
     "search_blocks",
+    "check_document",
     # History
     "get_document_history",
     "read_document_at_snapshot",
@@ -889,6 +978,31 @@ def _register_chatgpt_demo_tools(mcp_server: FastMCP) -> None:
         )
         if not isinstance(result, dict):
             raise RuntimeError("query_blocks returned unsupported payload")
+        return result
+
+    @mcp_server.tool(
+        name="check_document",
+        title="Check Document Status",
+        description=(
+            "Probe whether a document ID is usable before writing to it. "
+            "Returns status=exists | tombstoned | available so the caller "
+            "can avoid the tombstone-on-write trap."
+        ),
+        annotations=read_annotations,
+        meta=meta,
+        structured_output=True,
+    )
+    async def chatgpt_check_document_tool(
+        document_id: str,
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        result = await original_fns["check_document"](
+            graph_id=demo_graph_id,
+            document_id=document_id,
+            context=context,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("check_document returned unsupported payload")
         return result
 
     if _is_chatgpt_oauth_mode():
