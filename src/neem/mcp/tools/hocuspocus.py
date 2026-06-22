@@ -1059,6 +1059,28 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
         _record_read_source(tool_name, "websocket")
         return channel.doc, "websocket"
 
+    async def _probe_doc_integration(doc: pycrdt.Doc) -> None:
+        # Force integration of the content fragment so subsequent reader calls
+        # don't hit pycrdt's "Not integrated in a document yet" race. If the
+        # integration hasn't settled yet, sleep 500ms and probe once more.
+        try:
+            fragment = doc.get("content", type=pycrdt.XmlFragment)
+            _ = len(list(fragment.children))
+        except RuntimeError as exc:
+            if "Not integrated" not in str(exc):
+                return
+            logger.warning(
+                "ydoc_not_integrated_retry",
+                extra_context={"error": str(exc)},
+            )
+            await asyncio.sleep(0.5)
+            try:
+                fragment = doc.get("content", type=pycrdt.XmlFragment)
+                _ = len(list(fragment.children))
+            except RuntimeError:
+                # Let downstream surface the real error with full context.
+                pass
+
     async def _load_document_doc_for_read(
         graph_id: str,
         document_id: str,
@@ -1076,6 +1098,7 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
                 doc = _decode_ydoc(raw, label=f"http blob document {document_id}")
                 source = f"http_blob:{blob_source}" if blob_source else "http_blob"
                 _record_read_source(tool_name, source)
+                await _probe_doc_integration(doc)
                 return doc, source
 
             if status_code == 410:
@@ -1094,6 +1117,7 @@ def register_hocuspocus_tools(server: FastMCP) -> None:
         if channel is None:
             raise RuntimeError(f"Document channel not found: {graph_id}/{document_id}")
         _record_read_source(tool_name, "websocket")
+        await _probe_doc_integration(channel.doc)
         return channel.doc, "websocket"
 
     logger.info(
@@ -1820,9 +1844,18 @@ GROUP BY ?docId
         """Get the user's current graph and document IDs."""
         auth = MCPAuthContext.from_context(context)
         token = auth.require_auth()
-        if isinstance(document_id, str) and document_id:
-            document_id = normalize_document_id_for_lookup(document_id)
         user_id = _resolve_user_id(auth, token, user_id)
+
+        def _fallback_location(reason: str) -> dict:
+            # Soft-fall so attunement doesn't block when no Garden tab is open.
+            # Prefer the agent's persisted home graph; if none, drop to "default".
+            home = get_home_graph(user_id)
+            return {
+                "graph_id": home or "default",
+                "document_id": None,
+                "source": reason,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
 
         try:
             # Try REST endpoint first — reads from in-memory session on the server
@@ -1840,12 +1873,7 @@ GROUP BY ?docId
                             "session_source": rest_source,
                         },
                     )
-                    raise RuntimeError(
-                        f"No active graph or document found in session for user '{user_id}' "
-                        f"(session loaded from {rest_source}). "
-                        f"The user may not have a browser tab open, or hasn't navigated "
-                        f"to a document yet. Auth source: {auth.source}"
-                    )
+                    return _fallback_location(f"fallback_empty_session:{rest_source}")
                 location["timestamp"] = datetime.now(timezone.utc).isoformat()
                 return location
 
@@ -1868,7 +1896,11 @@ GROUP BY ?docId
                         )
                         await asyncio.sleep(1.0)
             if ws_error is not None:
-                raise ws_error
+                logger.warning(
+                    "user_location_ws_unreachable",
+                    extra_context={"user_id": user_id, "error": str(ws_error)},
+                )
+                return _fallback_location("fallback_no_local_api")
 
             graph_id = hp_client.get_active_graph_id()
             document_id = hp_client.get_active_document_id()
@@ -1881,11 +1913,7 @@ GROUP BY ?docId
                         "auth_source": auth.source,
                     },
                 )
-                raise RuntimeError(
-                    f"No active session found for user '{user_id}'. "
-                    f"The user may not have a browser tab open, or the session "
-                    f"has not synced yet. Auth source: {auth.source}"
-                )
+                return _fallback_location("fallback_no_active_session")
 
             result = {
                 "graph_id": graph_id,
@@ -1897,14 +1925,12 @@ GROUP BY ?docId
                 result["home_graph"] = current_home
             return bare_ids_in_result(result)
 
-        except RuntimeError:
-            raise
         except Exception as e:
             logger.error(
                 "Failed to get user location",
                 extra_context={"error": str(e), "user_id": user_id, "auth_source": auth.source},
             )
-            raise RuntimeError(f"Failed to get user location: {e}")
+            return _fallback_location(f"fallback_error:{type(e).__name__}")
 
     @server.tool(
         name="set_home_graph",
@@ -1926,8 +1952,6 @@ GROUP BY ?docId
         """Set or clear the session's default graph."""
         auth = MCPAuthContext.from_context(context)
         token = auth.require_auth()
-        if isinstance(document_id, str) and document_id:
-            document_id = normalize_document_id_for_lookup(document_id)
         user_id = _resolve_user_id(auth, token, None)
         if graph_id.strip():
             set_home_graph(user_id, graph_id.strip())
@@ -1978,12 +2002,17 @@ GROUP BY ?docId
     @server.tool(
         name="read_document",
         title="Read Document Content",
-        description="""Reads document content with wire counts. Supports multiple output formats.
+        description="""Reads a FULL document — content + wire counts + timestamps. Returns the whole thing in one shot; for partial reads use `read_blocks` (which has offset/limit/jump-to-block_id pagination) or `query_blocks` (for filtered block ID lookup).
 
 Formats (set via 'format' parameter):
 - default (None): TipTap XML with full formatting and data-block-id attributes on every block. Use this when you need block IDs for surgical editing (edit_block_text, update_blocks, insert_blocks, delete_blocks) or block-level wire connections.
 - 'markdown': Clean Markdown. Use this when you just need to read/understand a document's content without editing it. Much more compact than XML.
-- 'ids_only': Returns just the ordered list of block IDs and count, no content. Use this when you already know the content but need block IDs for wiring or editing.
+- 'ids_only': Returns just the ordered list of block IDs and count, no content. Use this when you already know the content but need block IDs for wiring or editing — prefer `query_blocks` if you also want to filter by block type or text.
+
+When to reach for read_document vs read_blocks vs query_blocks:
+- Want the whole document at once → read_document
+- Want a window of blocks (offset/limit/anchor) → read_blocks
+- Want block IDs filtered by type / heading / text → query_blocks
 
 Also returns wire counts: document-level (outgoing, incoming, total) and block-level (which blocks have wires attached). Use get_wires for full wire details.
 Also returns `updated_at` (last-modified timestamp). If unavailable, it falls back to `created_at`.
@@ -2004,7 +2033,7 @@ Always returns fresh content — automatically reconnects if the cached channel 
         Args:
             graph_id: The graph containing the document
             document_id: The document to read
-            format: Output format - None/"xml" (default, includes block IDs) or "markdown" (compact, readable)
+            format: Output format — "xml" (default, includes block IDs), "markdown" (compact, readable), or "ids_only" (just the block ID list).
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
@@ -3818,9 +3847,18 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
                 timeout=httpx.Timeout(60.0),
             )
             if resp.status_code != 201:
-                raise RuntimeError(
-                    f"Backend returned {resp.status_code}: {resp.text[:300]}"
+                # Surface enough context to correlate with backend logs when the
+                # body is just a generic code like MNEMO.INTERNAL.
+                trace_id = (
+                    resp.headers.get("X-Request-ID")
+                    or resp.headers.get("X-Trace-ID")
+                    or resp.headers.get("X-Amzn-Trace-Id")
                 )
+                detail = resp.text[:1000].strip() or "(empty body)"
+                msg = f"Backend returned {resp.status_code} at {url}: {detail}"
+                if trace_id:
+                    msg += f" (trace_id: {trace_id})"
+                raise RuntimeError(msg)
             result = resp.json()
 
             # New upload endpoint returns documentId (auto-ingested).
@@ -3871,8 +3909,6 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
         """Ingest an artifact into a document via the backend API."""
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
-        if isinstance(document_id, str) and document_id:
-            document_id = normalize_document_id_for_lookup(document_id)
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required and cannot be empty")
@@ -5494,8 +5530,6 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
         """
         auth = MCPAuthContext.from_context(context)
         auth.require_auth()
-        if isinstance(document_id, str) and document_id:
-            document_id = normalize_document_id_for_lookup(document_id)
 
         if not graph_id or not graph_id.strip():
             raise ValueError("graph_id is required")
