@@ -184,6 +184,46 @@ def _strip_markdown_wrappers(text: str) -> str:
     return out
 
 
+# Typographic-punctuation fold map. NFKC does NOT canonicalize these to ASCII
+# (each smart quote is its own canonical compatibility form), so add an
+# explicit pass for the cases agents hit most when copying from prose:
+# curly quotes, en/em/minus dashes, and ellipsis. Apply this fold BEFORE the
+# whitespace-collapse pass so it composes with both candidate generations.
+_PUNCT_FOLD = str.maketrans({
+    "‘": "'",  # LEFT SINGLE QUOTATION MARK
+    "’": "'",  # RIGHT SINGLE QUOTATION MARK (also typographic apostrophe)
+    "‚": "'",  # SINGLE LOW-9 QUOTATION MARK
+    "‛": "'",  # SINGLE HIGH-REVERSED-9 QUOTATION MARK
+    "“": '"',  # LEFT DOUBLE QUOTATION MARK
+    "”": '"',  # RIGHT DOUBLE QUOTATION MARK
+    "„": '"',  # DOUBLE LOW-9 QUOTATION MARK
+    "‟": '"',  # DOUBLE HIGH-REVERSED-9 QUOTATION MARK
+    "′": "'",  # PRIME
+    "″": '"',  # DOUBLE PRIME
+    "–": "-",  # EN DASH
+    "—": "-",  # EM DASH
+    "−": "-",  # MINUS SIGN
+    "…": "...",  # HORIZONTAL ELLIPSIS — translate() collapses to 3 chars
+    " ": " ",  # NO-BREAK SPACE
+})
+
+
+def _fold_punctuation(value: str) -> str:
+    return value.translate(_PUNCT_FOLD)
+
+
+# Offset-stable variant for haystack folding. _PUNCT_FOLD includes ellipsis
+# (1 codepoint → 3 chars), which would shift char offsets and break
+# projection back to the original. _PUNCT_FOLD_1TO1 is _PUNCT_FOLD minus
+# ellipsis — every entry is single-codepoint-to-single-codepoint, so
+# character offsets stay aligned with the original.
+_PUNCT_FOLD_1TO1 = {k: v for k, v in _PUNCT_FOLD.items() if isinstance(v, int) or (isinstance(v, str) and len(v) == 1)}
+
+
+def _fold_punctuation_stable(value: str) -> str:
+    return value.translate(_PUNCT_FOLD_1TO1)
+
+
 def _build_find_candidates(requested_find: str) -> list[str]:
     candidates: list[str] = []
     seen: set[str] = set()
@@ -202,13 +242,21 @@ def _build_find_candidates(requested_find: str) -> list[str]:
     push(unicodedata.normalize("NFC", raw))
     push(unicodedata.normalize("NFKC", raw))
 
+    # Typographic punctuation fold — smart quotes, en/em dashes, ellipsis.
+    folded = _fold_punctuation(raw)
+    push(folded)
+    push(_fold_punctuation(unicodedata.normalize("NFKC", raw)))
+
     md_stripped = _strip_markdown_wrappers(raw)
     push(md_stripped)
     push(unicodedata.normalize("NFKC", md_stripped))
+    push(_fold_punctuation(md_stripped))
 
     push(_collapse_ws(raw))
+    push(_collapse_ws(folded))
     push(_collapse_ws(md_stripped))
     push(_collapse_ws(unicodedata.normalize("NFKC", md_stripped)))
+    push(_collapse_ws(_fold_punctuation(md_stripped)))
     return candidates
 
 
@@ -235,6 +283,17 @@ def _find_positions_with_auto_match(
         positions = find_all(plain_text, candidate)
         if positions:
             return [(pos, len(candidate)) for pos in positions], candidate
+
+    # Pass 1b: fold typographic punctuation in the HAYSTACK using the
+    # offset-stable 1:1 map (smart quotes, en/em dashes, NBSP — NOT ellipsis,
+    # which would shift offsets). Lets agents who copy ASCII text into find
+    # still match against prose that uses curly punctuation.
+    folded_haystack = _fold_punctuation_stable(plain_text)
+    if folded_haystack != plain_text:
+        for candidate in candidates:
+            positions = find_all(folded_haystack, candidate)
+            if positions:
+                return [(pos, len(candidate)) for pos in positions], candidate
 
     # Pass 2: whitespace-collapsed match projected back to original offsets.
     collapsed_haystack, index_map = _collapse_ws_with_map(plain_text)
@@ -268,6 +327,60 @@ def _find_positions_with_auto_match(
             return spans, normalized
 
     return [], requested_find
+
+
+def _closest_substring_hint(
+    plain_text: str,
+    requested_find: str,
+    *,
+    window_chars: int = 50,
+) -> Optional[dict[str, Any]]:
+    """Return a small window around the longest-matching subsequence.
+
+    When find fails, this surfaces the agent's typo direction: instead of
+    dumping the whole block, point at the most similar slice. Uses
+    difflib.SequenceMatcher.find_longest_match to find the longest
+    contiguous overlap between requested_find and plain_text, then returns
+    that span plus ~window_chars of surrounding context.
+    """
+    if not plain_text or not requested_find:
+        return None
+
+    # Build a candidate that gives matching the best shot — fold typographic
+    # punctuation and collapse whitespace on both sides. The substring offset
+    # returned by SequenceMatcher is on the FOLDED text, but the returned
+    # snippet comes from the ORIGINAL haystack at the equivalent offset, so
+    # the agent sees text that matches what they'll see on read.
+    haystack = _fold_punctuation(plain_text)
+    needle = _fold_punctuation(requested_find).strip()
+    if not needle:
+        return None
+
+    from difflib import SequenceMatcher
+
+    matcher = SequenceMatcher(None, haystack, needle, autojunk=False)
+    match = matcher.find_longest_match(0, len(haystack), 0, len(needle))
+    if match.size == 0:
+        return None
+
+    # Project to the original plain_text. Folding is char-for-char (smart
+    # quotes / dashes are all 1-codepoint single replacements; ellipsis
+    # expands so we can't trust offsets when it appears). Fall back to a
+    # length-prefix match when haystack and plain_text differ in length.
+    same_length = len(haystack) == len(plain_text)
+    span_start = match.a if same_length else min(match.a, max(0, len(plain_text) - 1))
+    snippet_start = max(0, span_start - window_chars // 2)
+    snippet_end = min(len(plain_text), span_start + match.size + window_chars // 2)
+    snippet = plain_text[snippet_start:snippet_end]
+    matched_chars = haystack[match.a : match.a + match.size]
+
+    return {
+        "snippet": snippet,
+        "snippet_offset": snippet_start,
+        "matched_substring": matched_chars,
+        "matched_length": match.size,
+        "requested_length": len(requested_find),
+    }
 
 
 class _EditMatchError(ValueError):
@@ -4857,16 +4970,20 @@ Use this before write_document with a chosen ID to avoid the tombstone-on-write 
                         )
 
                         if not matches:
+                            diagnostics: dict[str, Any] = {
+                                "requested_find": find,
+                                "normalized_candidates": _build_find_candidates(find),  # type: ignore[arg-type]
+                                "block_text_preview": plain_text[:400],
+                                "block_text_length": len(plain_text),
+                                "occurrence": occurrence,
+                            }
+                            closest = _closest_substring_hint(plain_text, find)  # type: ignore[arg-type]
+                            if closest is not None:
+                                diagnostics["closest_substring"] = closest
                             raise _EditMatchError(
                                 f"Text {find!r} not found in block {block_id_clean}",
                                 code="no_match",
-                                diagnostics={
-                                    "requested_find": find,
-                                    "normalized_candidates": _build_find_candidates(find),  # type: ignore[arg-type]
-                                    "block_text_preview": plain_text[:400],
-                                    "block_text_length": len(plain_text),
-                                    "occurrence": occurrence,
-                                },
+                                diagnostics=diagnostics,
                             )
 
                         # Select which occurrences to replace

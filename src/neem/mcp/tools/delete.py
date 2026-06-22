@@ -32,17 +32,19 @@ def register_delete_tool(server: FastMCP) -> None:
         name="delete",
         title="Delete",
         description=(
-            "Delete resources from the knowledge graph. Pass `type` to specify what to delete.\n\n"
-            "**Types:**\n"
-            "- `documents`: Delete document(s). Pass `document_id` (single) or `document_ids` (batch). "
+            "Polymorphic delete. Required: `type` ∈ {documents, blocks, folder, wires, graph}.\n\n"
+            "**Usage by type:**\n"
+            "- `type='documents'` — `document_id` (single) OR `document_ids` (batch). "
             "`hard=true` (default) permanently deletes; `hard=false` removes from workspace only.\n"
-            "- `blocks`: Delete block(s) within a document. Pass `document_id` + `block_id` or `block_ids`. "
+            "- `type='blocks'` — `document_id` + (`block_id` OR `block_ids`). "
             "`cascade=true` deletes indent-children too. Read the document first.\n"
-            "- `folder`: Delete a folder. Pass `folder_id`. `cascade=true` deletes all contents. "
+            "- `type='folder'` — `folder_id`. `cascade=true` deletes all contents. "
             "`hard=true` (default) permanently deletes.\n"
-            "- `wires`: Delete semantic wires. By ID: `wire_id` or `wire_ids`. "
+            "- `type='wires'` — by ID: `wire_id` OR `wire_ids`. "
             "By document: `document_id`. By block: `document_id` + `block_id`.\n"
-            "- `graph`: Delete an entire graph. `hard=true` permanently deletes (cannot be undone)."
+            "- `type='graph'` — `graph_id`. `hard=true` permanently deletes the entire graph "
+            "(cannot be undone).\n\n"
+            "Type-irrelevant fields are ignored. Default `hard=true` and `cascade=false`."
         ),
     )
     @resolve_home_graph
