@@ -95,9 +95,23 @@ def normalize_block_id_for_lookup(value: Any) -> Any:
 
 # Keys whose values are block IDs in the response shape and should be stripped
 # of the `block-` prefix before serialization. List keys whose values are lists
-# of block IDs go in `_BLOCK_ID_LIST_KEYS`.
-_BLOCK_ID_SINGULAR_KEYS = frozenset({"block_id", "blockId"})
+# of block IDs go in `_BLOCK_ID_LIST_KEYS`. Includes wire-snapshot field names
+# (sourceBlockId / targetBlockId) so wire payloads round-trip through the same
+# bare-hex convention as everything else.
+_BLOCK_ID_SINGULAR_KEYS = frozenset({
+    "block_id",
+    "blockId",
+    "sourceBlockId",
+    "targetBlockId",
+    "source_block_id",
+    "target_block_id",
+})
 _BLOCK_ID_LIST_KEYS = frozenset({"block_ids", "blockIds"})
+# Keys whose VALUES are dicts whose KEYS are block IDs (e.g. read_document's
+# wires.by_block: {"block-abc": count}). The walker can't rewrite keys
+# anywhere it pleases, but it can target the specific containers where this
+# convention is documented.
+_BLOCK_ID_KEYED_DICT_KEYS = frozenset({"by_block", "byBlock"})
 
 
 def bare_ids_in_result(obj: Any) -> Any:
@@ -107,10 +121,13 @@ def bare_ids_in_result(obj: Any) -> Any:
     chainable convenience. Safe to apply at the return boundary of any
     tool that may emit block IDs.
 
-    Only acts on keys named `block_id` / `block_ids` (and JSON-style
-    camelCase variants). Does NOT touch the canonical `id` key, since
-    that can mean many things; tools that want to use `id` for blocks
-    should pass through `bare_block_id` at the construction site.
+    Handles three shapes:
+    - `block_id` / `sourceBlockId` / `targetBlockId` etc. as singular values
+    - `block_ids` / `blockIds` as list values
+    - `by_block` / `byBlock` as a dict whose KEYS are block IDs
+    Does NOT touch the canonical `id` key, since that can mean many things;
+    tools that want to use `id` for blocks should pass through
+    `bare_block_id` at the construction site.
     """
     if isinstance(obj, dict):
         for k, v in list(obj.items()):
@@ -120,6 +137,9 @@ def bare_ids_in_result(obj: Any) -> Any:
             elif k in _BLOCK_ID_LIST_KEYS:
                 if isinstance(v, list):
                     obj[k] = [bare_block_id(x) if isinstance(x, str) else x for x in v]
+            elif k in _BLOCK_ID_KEYED_DICT_KEYS:
+                if isinstance(v, dict):
+                    obj[k] = {bare_block_id(kk) if isinstance(kk, str) else kk: vv for kk, vv in v.items()}
             elif isinstance(v, (dict, list)):
                 bare_ids_in_result(v)
     elif isinstance(obj, list):

@@ -127,3 +127,53 @@ def test_bare_ids_in_result_handles_empty_input() -> None:
     assert bare_ids_in_result({}) == {}
     assert bare_ids_in_result([]) == []
     assert bare_ids_in_result(None) is None
+
+
+# Wire-shape coverage — epsilon's #3 finding
+
+
+def test_bare_ids_in_result_strips_source_and_target_block_id() -> None:
+    """get_wires/traverse_wires emit sourceBlockId/targetBlockId; walker must
+    strip those just like block_id."""
+    out = bare_ids_in_result({
+        "sourceBlockId": "block-aaa",
+        "targetBlockId": "block-bbb",
+        "predicate": "supports",
+    })
+    assert out["sourceBlockId"] == "aaa"
+    assert out["targetBlockId"] == "bbb"
+    assert out["predicate"] == "supports"
+
+
+def test_bare_ids_in_result_strips_snake_case_wire_block_ids() -> None:
+    out = bare_ids_in_result({
+        "source_block_id": "block-aaa",
+        "target_block_id": "block-bbb",
+    })
+    assert out["source_block_id"] == "aaa"
+    assert out["target_block_id"] == "bbb"
+
+
+def test_bare_ids_in_result_strips_by_block_dict_keys() -> None:
+    """read_document().wires.by_block has block IDs as dict KEYS — these
+    require key rewriting since the walker can't recurse through them."""
+    out = bare_ids_in_result({
+        "wires": {
+            "outgoing": 2,
+            "incoming": 1,
+            "by_block": {"block-abc": 2, "block-def": 1},
+        },
+    })
+    assert out["wires"]["by_block"] == {"abc": 2, "def": 1}
+
+
+def test_bare_ids_in_result_strips_nested_wire_blocks() -> None:
+    out = bare_ids_in_result({
+        "wires": [
+            {"id": "w-1", "sourceBlockId": "block-x", "targetBlockId": "block-y"},
+            {"id": "w-2", "sourceBlockId": "block-z"},
+        ],
+    })
+    assert out["wires"][0]["sourceBlockId"] == "x"
+    assert out["wires"][0]["targetBlockId"] == "y"
+    assert out["wires"][1]["sourceBlockId"] == "z"

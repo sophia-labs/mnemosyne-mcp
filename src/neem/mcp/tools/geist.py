@@ -1640,9 +1640,17 @@ def register_geist_tools(server: FastMCP) -> None:
         )
 
         # Group raw entries by document so we can fire side-effects per-doc.
+        # Block IDs must reach salience in the prefixed form (block-<hex>) so
+        # the backend constructs the canonical RDF subject — sending bare hex
+        # forks the valuation namespace (#block-abc vs #block-block-abc).
+        # Agents copying IDs from read_document / get_important_blocks see
+        # bare hex post-cutover, so normalize on the way in.
         tag_entries_by_doc: dict[str, list[dict]] = {}
         valuation_entries: list[dict] = []
         for e in entries_input:
+            raw_bid = e.get("block_id")
+            if isinstance(raw_bid, str) and raw_bid:
+                e["block_id"] = normalize_block_id_for_lookup(raw_bid)
             entry_tags = e.pop("tags", None)
             if entry_tags and isinstance(entry_tags, list):
                 doc_id = e.get("document_id", "") or ""
@@ -1747,7 +1755,10 @@ def register_geist_tools(server: FastMCP) -> None:
         if document_id:
             params["document_id"] = document_id.strip()
         if block_id:
-            params["block_id"] = block_id.strip()
+            # Salience constructs #block-<id> server-side, so the prefixed
+            # form must reach the backend even if the caller passes bare hex
+            # (which is now the default output shape).
+            params["block_id"] = normalize_block_id_for_lookup(block_id.strip())
         if min_score is not None:
             params["min_score"] = min_score
         if valence:

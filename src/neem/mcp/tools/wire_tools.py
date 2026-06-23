@@ -912,10 +912,10 @@ def register_wire_tools(server: FastMCP) -> None:
                         }
                         queue.append((other_id, depth + 1))
 
-            return {
+            return bare_ids_in_result({
                 "nodes": list(nodes.values()),
                 "edges": edges,
-            }
+            })
 
         except Exception as e:
             raise RuntimeError(f"Failed to traverse wires: {e}")
@@ -974,7 +974,10 @@ def register_wire_tools(server: FastMCP) -> None:
             # Mode: delete by document/block match
             if has_doc:
                 doc_id = document_id.strip()
-                blk_id = block_id.strip() if block_id else None
+                # Workspace comparison against sourceBlockId/targetBlockId is
+                # exact-string; the CRDT stores the prefixed form. Accept bare
+                # hex on the way in so the new output convention round-trips.
+                blk_id = normalize_block_id_for_lookup(block_id.strip()) if block_id else None
                 deleted: list[str] = []
 
                 def _do_delete_matching(doc: pycrdt.Doc) -> None:
