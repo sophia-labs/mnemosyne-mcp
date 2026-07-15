@@ -29,6 +29,45 @@ from neem.utils.logging import LoggerFactory
 
 logger = LoggerFactory.get_logger("hocuspocus.workspace")
 
+_DOC_PREFIX = "doc-"
+
+
+def _document_id_candidates(doc_id: str) -> list[str]:
+    """Ordered candidate keys to try when looking up a document entry.
+
+    Document navigation entries are keyed by whatever ID form was used at
+    creation time — bare UUID, `doc-<uuid>`, or human slug — with no fixed
+    rule across documents. There is no way to know which form is canonical
+    without checking the actual keyspace, so lookups try the ID exactly as
+    given first, then fall back to the alternate doc-<uuid> / <uuid> form.
+    Mirrors the (deliberately inert) input-tolerance helper in
+    neem.mcp.tools._id_normalize — kept local here since this is the module
+    that actually holds the keyspace to resolve against.
+    """
+    candidates = [doc_id]
+    if doc_id.startswith(_DOC_PREFIX):
+        tail = doc_id[len(_DOC_PREFIX):]
+        if len(tail) == 36 and tail.count("-") == 4:
+            candidates.append(tail)
+    else:
+        candidates.append(f"{_DOC_PREFIX}{doc_id}")
+    return candidates
+
+
+def _resolve_document_key(documents: Any, doc_id: str) -> str | None:
+    """Return the actual key in `documents` that `doc_id` refers to.
+
+    Tries `doc_id` exactly as given first, then the alternate doc-<uuid> /
+    <uuid> form (see `_document_id_candidates`). Returns None if no
+    candidate is present in `documents`.
+    """
+    if not isinstance(doc_id, str) or not doc_id:
+        return None
+    for candidate in _document_id_candidates(doc_id):
+        if candidate in documents:
+            return candidate
+    return None
+
 # Sentinel for "not provided" (distinct from None which means "set to null")
 _UNSET = object()
 
@@ -106,7 +145,8 @@ class WorkspaceWriter:
         """
         now = time.time() * 1000  # Milliseconds for consistency with frontend
 
-        existing = self._documents.get(doc_id)
+        existing_key = _resolve_document_key(self._documents, doc_id)
+        existing = self._documents.get(existing_key) if existing_key is not None else None
 
         if isinstance(existing, pycrdt.Map):
             # Update existing document
@@ -205,12 +245,13 @@ class WorkspaceWriter:
         Returns:
             True if the document was removed, False if it didn't exist.
         """
-        if doc_id in self._documents:
-            deleted_wires = self._delete_wires_for_document(doc_id)
-            del self._documents[doc_id]
+        key = _resolve_document_key(self._documents, doc_id)
+        if key is not None:
+            deleted_wires = self._delete_wires_for_document(key)
+            del self._documents[key]
             logger.debug(
                 "Deleted document from workspace",
-                extra_context={"doc_id": doc_id, "deleted_wires": deleted_wires},
+                extra_context={"doc_id": key, "deleted_wires": deleted_wires},
             )
             return True
         return False
@@ -218,13 +259,19 @@ class WorkspaceWriter:
     def get_document(self, doc_id: str) -> dict[str, Any] | None:
         """Get a document entry from workspace navigation.
 
+        Tries `doc_id` exactly as given first, then falls back to the
+        alternate `doc-<uuid>` / `<uuid>` form — entries are keyed however
+        they were created, and callers shouldn't need to guess which form
+        applies (see `_document_id_candidates`).
+
         Args:
             doc_id: The document ID
 
         Returns:
             Document data dict or None if not found.
         """
-        return _entry_to_dict(self._documents.get(doc_id))
+        key = _resolve_document_key(self._documents, doc_id)
+        return _entry_to_dict(self._documents.get(key)) if key is not None else None
 
     def document_exists(self, doc_id: str) -> bool:
         """Check if a document exists in workspace navigation.
@@ -235,7 +282,7 @@ class WorkspaceWriter:
         Returns:
             True if document exists in workspace.
         """
-        return doc_id in self._documents
+        return _resolve_document_key(self._documents, doc_id) is not None
 
     def update_document(
         self,
@@ -256,7 +303,8 @@ class WorkspaceWriter:
         Returns:
             True if document was updated, False if not found.
         """
-        doc_map = self._documents.get(doc_id)
+        key = _resolve_document_key(self._documents, doc_id)
+        doc_map = self._documents.get(key) if key is not None else None
         if not isinstance(doc_map, pycrdt.Map):
             return False
 
@@ -813,13 +861,19 @@ class WorkspaceReader:
     def get_document(self, doc_id: str) -> dict[str, Any] | None:
         """Get a document entry from workspace navigation.
 
+        Tries `doc_id` exactly as given first, then falls back to the
+        alternate `doc-<uuid>` / `<uuid>` form — entries are keyed however
+        they were created, and callers shouldn't need to guess which form
+        applies (see `_document_id_candidates`).
+
         Args:
             doc_id: The document ID
 
         Returns:
             Document data dict or None if not found.
         """
-        return _entry_to_dict(self._documents.get(doc_id))
+        key = _resolve_document_key(self._documents, doc_id)
+        return _entry_to_dict(self._documents.get(key)) if key is not None else None
 
     def get_children_of(self, parent_id: str | None) -> list[tuple[str, str, dict[str, Any]]]:
         """Get all entities that have this parent.

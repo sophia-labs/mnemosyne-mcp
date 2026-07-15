@@ -65,26 +65,29 @@ def bare_document_id(value: Any) -> Any:
 
 
 def normalize_document_id_for_lookup(value: Any) -> Any:
-    """Accept either `doc-<uuid>` or `<uuid>` from callers.
+    """Pass a document ID through unchanged.
 
-    The CRDT layer stores some documents under slugs (e.g. `agent-delta`,
-    `garden-design-antinomies`) and others under UUID-prefixed names
-    (`doc-<uuid>`). Workspace lookups expect whichever form was used at
-    creation time, so we don't unconditionally strip `doc-` — we only
-    strip it if the remaining tail looks like a UUID-shaped string.
+    Historically (P1 #13) this stripped a leading `doc-` prefix whenever the
+    remaining tail looked UUID-shaped, on the theory that the bare form was
+    "the canonical form most likely to match a workspace entry." That theory
+    was wrong: workspace document entries are keyed by whatever ID form was
+    used at creation time — bare UUID, `doc-<uuid>`, or slug — with no fixed
+    rule across documents. Documents created via the web UI are commonly
+    keyed by the full `doc-<uuid>` form, so unconditionally stripping the
+    prefix corrupted an already-correct, already-canonical ID into one that
+    matched nothing — every such document read as "not found" even though
+    get_workspace / search_documents / get_user_location all report it as
+    existing under the prefixed ID. That silently broke read_document and
+    every other document_id-taking tool for any document created with a
+    `doc-`-prefixed ID (bug reported informally several times over the
+    prior month; root-caused 2026-07-15).
 
-    Returns the canonical form most likely to match a workspace entry.
-    Currently a pass-through for slug-shaped IDs; strips `doc-` only when
-    the remainder is plausibly a UUID. Callers should treat the result
-    as a hint, not a guarantee — workspace lookup remains authoritative.
+    Callers should pass document_id through exactly as returned by other
+    tools. Tolerance for the (rarer) case of a caller supplying the "wrong"
+    form now lives at the actual lookup point, where the real keyspace is
+    known — see `neem.hocuspocus.workspace.WorkspaceReader.get_document`,
+    which tries both forms against the live workspace map.
     """
-    if not isinstance(value, str) or not value:
-        return value
-    if value.startswith(_DOC_PREFIX):
-        tail = value[len(_DOC_PREFIX):]
-        # UUID-shaped: 8-4-4-4-12 hex with dashes, total 36 chars
-        if len(tail) == 36 and tail.count("-") == 4:
-            return tail
     return value
 
 

@@ -25,6 +25,7 @@ import pycrdt
 from mcp.server.fastmcp import Context, FastMCP
 
 from neem.hocuspocus import HocuspocusClient, DocumentReader, DocumentWriter, WorkspaceWriter, WorkspaceReader
+from neem.hocuspocus.workspace import _resolve_document_key
 from neem.hocuspocus.converters import (
     PendingTag,
     PendingValuation,
@@ -1412,7 +1413,7 @@ GROUP BY ?docId
             )
             snapshot = _workspace_snapshot_from_doc(workspace_doc)
             docs = snapshot.get("documents") or {}
-            if document_id in docs:
+            if _resolve_document_key(docs, document_id) is not None:
                 return
 
             available = []
@@ -1441,7 +1442,7 @@ GROUP BY ?docId
         def _exists_in_snapshot() -> tuple[bool, list[str]]:
             snapshot = hp_client.get_workspace_snapshot(graph_id, user_id=user_id)
             docs = snapshot.get("documents") or {}
-            return (document_id in docs), list(docs.keys())
+            return (_resolve_document_key(docs, document_id) is not None), list(docs.keys())
 
         await hp_client.connect_workspace(graph_id, user_id=user_id)
         ws_channel = hp_client.get_workspace_channel(graph_id, user_id=user_id)

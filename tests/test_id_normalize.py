@@ -61,12 +61,22 @@ def test_normalize_block_id_for_lookup_accepts_both_forms() -> None:
     assert normalize_block_id_for_lookup("block-abc") == "block-abc"
 
 
-# Document ID input tolerance
+# Document ID — no-op pass-through (P1 #13 regression, root-caused 2026-07-15)
+#
+# This used to strip a leading `doc-` prefix whenever the tail looked
+# UUID-shaped, on the theory that the bare form was "the canonical form
+# most likely to match a workspace entry." That was false: documents
+# created via the web UI are commonly keyed by the full `doc-<uuid>` form,
+# so the strip corrupted an already-correct ID into one that matched
+# nothing, and every such document silently became unreadable via
+# read_document/read_blocks/document_digest/etc. Tolerance for callers
+# supplying the "wrong" form now lives at the actual lookup point (see
+# test_workspace_reader_compat.py), where the real keyspace is known.
 
 
-def test_normalize_document_id_strips_doc_prefix_on_uuid() -> None:
+def test_normalize_document_id_leaves_doc_prefixed_uuid_unchanged() -> None:
     uuid = "550e8400-e29b-41d4-a716-446655440000"
-    assert normalize_document_id_for_lookup(f"doc-{uuid}") == uuid
+    assert normalize_document_id_for_lookup(f"doc-{uuid}") == f"doc-{uuid}"
 
 
 def test_normalize_document_id_passes_slug_unchanged() -> None:
@@ -74,9 +84,12 @@ def test_normalize_document_id_passes_slug_unchanged() -> None:
     assert normalize_document_id_for_lookup("agent-delta") == "agent-delta"
 
 
+def test_normalize_document_id_passes_bare_uuid_unchanged() -> None:
+    uuid = "550e8400-e29b-41d4-a716-446655440000"
+    assert normalize_document_id_for_lookup(uuid) == uuid
+
+
 def test_normalize_document_id_keeps_doc_prefix_on_non_uuid() -> None:
-    # If the tail isn't UUID-shaped, leave the doc- prefix intact so workspace
-    # lookup still has the canonical form.
     assert normalize_document_id_for_lookup("doc-garden") == "doc-garden"
 
 

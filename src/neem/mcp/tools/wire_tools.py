@@ -20,6 +20,7 @@ import pycrdt
 from mcp.server.fastmcp import Context, FastMCP
 
 from neem.hocuspocus import HocuspocusClient, WorkspaceReader, WorkspaceWriter
+from neem.hocuspocus.workspace import _resolve_document_key
 from neem.mcp.auth import MCPAuthContext, get_current_auth_token, get_hocuspocus_client_kwargs
 from neem.mcp.tools._id_normalize import (
     bare_block_id,
@@ -381,7 +382,7 @@ def register_wire_tools(server: FastMCP) -> None:
             return channel
 
         docs = (hp_client.get_workspace_snapshot(graph_id, user_id=user_id).get("documents") or {})
-        if document_id in docs:
+        if _resolve_document_key(docs, document_id) is not None:
             raise RuntimeError(
                 f"Document '{document_id}' appears in workspace snapshot for graph '{graph_id}', "
                 "but is not visible via channel reader (transient sync divergence). "
